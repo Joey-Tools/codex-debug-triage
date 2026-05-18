@@ -1,0 +1,4 @@
+interface:
+  display_name: "Bug Triage Playbook"
+  short_description: "Investigate logs, regressions, and root-cause hypotheses."
+  default_prompt: "Use $bug-triage-playbook to structure root-cause analysis from logs, failures, or regressions."
