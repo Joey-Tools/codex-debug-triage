@@ -173,7 +173,7 @@ class JenkinsArtifactProbeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             workspace = Path(temp_dir) / "workspace"
             workspace.mkdir()
-            outside = Path(temp_dir) / "outside" / "run.consoleText"
+            outside = Path("/var/tmp/codex-debug-triage-outside/run.consoleText")
             os.chdir(workspace)
             try:
                 with self.assertRaisesRegex(
