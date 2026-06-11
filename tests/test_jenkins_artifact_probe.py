@@ -411,5 +411,27 @@ class JenkinsArtifactProbeTests(unittest.TestCase):
         self.assertEqual(buffer.getvalue().splitlines(), ["line1", "line2"])
 
 
+class BugTriageDocumentationTests(unittest.TestCase):
+    def test_skill_warns_against_wide_local_artifact_reads(self) -> None:
+        skill = (
+            REPO_ROOT / "skills/bug-triage-playbook/SKILL.md"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("Do not run raw `rg -n` across `.codex-tmp`", skill)
+        self.assertIn("release API responses or HTML/manual pages", skill)
+        self.assertIn("`rg -l`, `rg --count`, or selected JSON keys", skill)
+
+    def test_jenkins_recipe_budgets_local_artifact_reads(self) -> None:
+        recipe = (
+            REPO_ROOT
+            / "skills/bug-triage-playbook/references/jenkins-artifact-recipes.md"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("## 3. Budget Local Artifact Reads", recipe)
+        self.assertIn("Do not run raw `rg -n` across `.codex-tmp`", recipe)
+        self.assertIn("Use `rg -l` / `rg --count` first", recipe)
+        self.assertIn("fetch to disk and extract selected fields", recipe)
+
+
 if __name__ == "__main__":
     unittest.main()

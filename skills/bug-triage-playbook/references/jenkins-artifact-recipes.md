@@ -4,8 +4,8 @@ Use these recipes when the repeated work is:
 
 - verify auth and approval before touching the real artifact
 - probe or fetch a Jenkins console, API payload, or archive without a shell wrapper
-- list likely log members inside a zip
-- extract one member and filter to the key lines
+- list likely log members or local files before printing matches
+- extract one member or inspect one local file and filter to the key lines
 
 Prefer direct argv helper forms for approval-sensitive remote steps so prefix rules can match stable command families. Use the installed personal-skill path under the current user's `$HOME`, for example `$HOME/.codex/skills/bug-triage-playbook/scripts/jenkins_artifact_probe.py`, as the recurring target; the repo mirror under `personal_codex/` is for authoring and sync, not the default runtime command example.
 
@@ -115,7 +115,29 @@ Use the same pattern for `show-url` when you want direct stdout output:
 Avoid embedding the whole flow inside `bash -lc` unless shell syntax is essential. Split remote helper fetches from local `tail`, `rg`, `python3`, or `jq` inspection.
 If you need multiple local passes over a `*view*` URL or another shell-sensitive endpoint, prefer `fetch-url` first and then inspect the saved local file.
 
-## 3. List Candidate Members
+## 3. Budget Local Artifact Reads
+
+Once the remote artifact or related archive has been fetched locally, do not switch to broad line-producing searches over the whole artifact tree. Start with cheap orientation:
+
+```bash
+find "$tmp_dir" -type f -print | sed -n '1,80p'
+wc -l "$tmp_dir/run.consoleText"
+rg -l -i 'ASSERT|ERROR|FAIL|Exception|Traceback|timeout' "$tmp_dir" | head -n 40
+rg --count -i 'ASSERT|ERROR|FAIL|Exception|Traceback|timeout' "$tmp_dir" | head -n 40
+```
+
+Then print only one exact source at a time:
+
+```bash
+rg -n -i 'ASSERT|ERROR|FAIL|Exception|Traceback|timeout' "$tmp_dir/run.consoleText" | head -n 80
+sed -n '420,470p' "$tmp_dir/run.consoleText"
+```
+
+Do not run raw `rg -n` across `.codex-tmp`, unpacked archives, `raw/` log trees, or broad source/documentation directories. Patterns such as `rg -n 'needle' .codex-tmp/av1-*` or `rg -n 'job|jenkins|create' .codex-tmp ...` can print tens of thousands of retained lines. Use `rg -l` / `rg --count` first, then read one exact file, member, symbol, or line window.
+
+For large JSON, release metadata, or HTML/manual pages, avoid printing the full response. Prefer a helper `show-url` with `--head`, `--tail`, or `--grep`, or fetch to disk and extract selected fields with `jq` / a short parser before deciding whether a larger read is justified.
+
+## 4. List Candidate Members
 
 List all members:
 
@@ -131,7 +153,7 @@ python3 "$HOME/.codex/skills/bug-triage-playbook/scripts/jenkins_artifact_probe.
   --match 'console|mqe|error|fail|log'
 ```
 
-## 4. Extract And Filter The Key Lines
+## 5. Extract And Filter The Key Lines
 
 Show a known member:
 
@@ -160,7 +182,7 @@ If the artifact is already a plain text file, keep filtering direct and narrow:
 rg -n -i 'ASSERT|ERROR|FAIL|Exception|Traceback|timeout' "$tmp_dir/run.consoleText" | head -n 80
 ```
 
-## 5. Report The Smallest Decisive Evidence
+## 6. Report The Smallest Decisive Evidence
 
 Do not paste the whole console or whole extracted file by default.
 Prefer:

@@ -34,6 +34,8 @@ The goal is to turn logs, traces, failing tests, or behavioral regressions into 
 - Raw `curl` is a fallback only when the helper cannot express the needed HTTP behavior, such as custom headers or cookies, TLS or redirect debugging, or another protocol detail the helper does not cover yet. If you fall back to `curl`, say exactly why the helper was insufficient.
 - When the same Jenkins or remote archive inspection pattern starts repeating, keep approval-sensitive remote steps on the helper path and use `references/jenkins-artifact-recipes.md` plus `scripts/jenkins_artifact_probe.py` for the repetitive local archive-inspection part instead of rebuilding the same shell chain each turn.
 - When local inspection needs large fetched artifacts or extracted files, prefer a task-scoped temp directory instead of fixed `/tmp/run.*` paths, and clean it up before finishing unless the user asked to keep it.
+- When inspecting large fetched logs, API payloads, release metadata, manuals, or `.codex-tmp` artifact trees, keep the first local pass bounded: get file sizes, line counts, `rg -l`, `rg --count`, or selected JSON keys before printing matching lines. Then inspect one exact file, member, or small line window.
+- Do not run raw `rg -n` across `.codex-tmp`, unpacked archive trees, or broad log/source trees, and do not print full release API responses or HTML/manual pages when selected fields, `--head`, `--tail`, `--grep`, or a small exact `sed` window would answer the question.
 - If the artifact path is blocked by missing approval, auth, or environment variables, surface that exact blocker early instead of half-switching to local guesses.
 - If access fails, report that explicitly and request the smallest missing credential, export, or approval instead of speculating from stale evidence.
 
@@ -66,6 +68,7 @@ The goal is to turn logs, traces, failing tests, or behavioral regressions into 
 - Keep the hypothesis set small; too many branches usually means the evidence was not normalized first.
 - When the evidence is inconclusive, say what remains uncertain and what single check would reduce uncertainty fastest.
 - Do not default to raw `curl` for repeated Jenkins text or JSON fetches when the helper already covers the remote step.
+- Do not let local artifact mining become the new wide read: avoid path-wide `rg -n`, full API/manual dumps, and broad log windows over fetched Jenkins artifacts.
 - Do not absorb tracker metadata lookup into this skill when `cisco-trackers-lookup` already covers that read-only tracker step.
 - If the repository already has a stronger debugging playbook, follow the repo over this skill.
 - Separate "could not access the requested artifact" from "artifact inspected and evidence was inconclusive"; these are different outcomes.
