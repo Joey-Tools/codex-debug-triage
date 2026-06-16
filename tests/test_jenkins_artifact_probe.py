@@ -421,6 +421,19 @@ class BugTriageDocumentationTests(unittest.TestCase):
         self.assertIn("release API responses or HTML/manual pages", skill)
         self.assertIn("`rg -l`, `rg --count`, or selected JSON keys", skill)
 
+    def test_skill_budgets_github_actions_and_remote_runner_logs(self) -> None:
+        skill = (
+            REPO_ROOT / "skills/bug-triage-playbook/SKILL.md"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("For GitHub Actions triage through `gh`", skill)
+        self.assertIn("write it to a task-scoped file before inspection", skill)
+        self.assertIn("`gh run view --log-failed`", skill)
+        self.assertIn("`gh api .../logs`", skill)
+        self.assertIn("For remote runner diagnostics", skill)
+        self.assertIn("macOS `launchctl print gui/<uid>`", skill)
+        self.assertIn("Avoid dumping entire launchd trees", skill)
+
     def test_jenkins_recipe_budgets_local_artifact_reads(self) -> None:
         recipe = (
             REPO_ROOT
