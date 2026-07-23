@@ -659,6 +659,66 @@ class ArchiveTriageTests(unittest.TestCase):
                 self.assertIn(f"type={error_type}", error_text)
                 self.assertIn(detail, error_text)
 
+    def test_unrelated_bounded_unicode_member_does_not_block_selection(self) -> None:
+        unicode_name = f"logs/{'测' * 100}.log"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            archive_path = Path(temp_dir) / "unicode-name.zip"
+            with zipfile.ZipFile(archive_path, "w") as archive:
+                archive.writestr(unicode_name, "unrelated\n")
+                archive.writestr("logs/selected.log", "selected\n")
+
+            list_stdout = io.StringIO()
+            list_stderr = io.StringIO()
+            with redirect_stdout(list_stdout), redirect_stderr(list_stderr):
+                list_rc = MODULE.cmd_zip_list(self._list_args(archive_path))
+
+            show_stdout = io.StringIO()
+            show_stderr = io.StringIO()
+            with redirect_stdout(show_stdout), redirect_stderr(show_stderr):
+                show_rc = MODULE.cmd_zip_show(
+                    self._show_args(
+                        archive_path,
+                        member="logs/selected.log",
+                    )
+                )
+
+        self.assertEqual(list_rc, 0, list_stderr.getvalue())
+        self.assertIn('"ordinal":1', list_stdout.getvalue())
+        self.assertEqual(show_rc, 0, show_stderr.getvalue())
+        self.assertIn("selected", show_stdout.getvalue())
+
+    def test_bzip2_member_preserves_non_decompressor_os_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            archive_path = Path(temp_dir) / "bzip2-io-error.zip"
+            with zipfile.ZipFile(archive_path, "w") as archive:
+                archive.writestr(
+                    "logs/bzip2.log",
+                    "content\n",
+                    compress_type=zipfile.ZIP_BZIP2,
+                )
+
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with mock.patch.object(
+                MODULE.zipfile.ZipFile,
+                "open",
+                side_effect=OSError(5, "Input/output error"),
+            ):
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    rc = MODULE.cmd_zip_show(
+                        self._show_args(
+                            archive_path,
+                            member="logs/bzip2.log",
+                        )
+                    )
+
+        self.assertEqual(rc, 1)
+        self.assertEqual(stdout.getvalue(), "")
+        error_text = stderr.getvalue()
+        self.assertIn("type=OSError", error_text)
+        self.assertIn("Input/output error", error_text)
+        self.assertNotIn("invalid BZIP2 stream", error_text)
+
     def test_zipfile_member_error_detail_is_bounded_and_single_line(
         self,
     ) -> None:

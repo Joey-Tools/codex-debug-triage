@@ -42,7 +42,6 @@ DEFAULT_MAX_INPUT_LINE_CHARS = 128 * 1024
 DEFAULT_MAX_OUTPUT_LINES = 200
 DEFAULT_MAX_OUTPUT_CHARS = 64 * 1024
 DEFAULT_CANDIDATE_REPORT_LIMIT = 20
-DEFAULT_MAX_MEMBER_NAME_CHARS = 512
 DEFAULT_MAX_RAW_MEMBER_NAME_BYTES = 512
 DEFAULT_MAX_MEMBER_IDENTITY_CHARS = 1_536
 DEFAULT_MAX_ERROR_DETAIL_CHARS = 1_024
@@ -429,7 +428,6 @@ def _read_central_directory_identities(
             decoded_name=decoded_name,
             flag_bits=flag_bits,
         )
-        _render_member_identity(identity)
         identities.append(identity)
         cursor += record_size
     if cursor != central_end:
@@ -505,7 +503,6 @@ def _preflight_central_directory(
 
 
 def _render_member_identity(identity: CentralDirectoryIdentity) -> str:
-    _escape_member_name(identity.decoded_name)
     rendered = json.dumps(
         {
             "flag_bits": identity.flag_bits,
@@ -581,18 +578,6 @@ def _find_members(
         if candidate == compare:
             matches.append(member)
     return matches
-
-
-def _escape_member_name(name: str) -> str:
-    """Return one reversible, single-line JSON representation."""
-
-    escaped_name = json.dumps(name, ensure_ascii=True)
-    if len(escaped_name) > DEFAULT_MAX_MEMBER_NAME_CHARS:
-        raise ArtifactLimitError(
-            "escaped member name exceeds max characters: "
-            f"{len(escaped_name)} > {DEFAULT_MAX_MEMBER_NAME_CHARS}"
-        )
-    return escaped_name
 
 
 def _validate_member_budget(
@@ -786,7 +771,11 @@ def _bounded_member_error(
     elif LzmaError is not None and isinstance(error, LzmaError):
         error_type = "lzma.LZMAError"
         detail_text = "invalid LZMA stream"
-    elif member.info.compress_type == zipfile.ZIP_BZIP2 and isinstance(error, OSError):
+    elif (
+        member.info.compress_type == zipfile.ZIP_BZIP2
+        and isinstance(error, OSError)
+        and str(error) == "Invalid data stream"
+    ):
         error_type = "OSError"
         detail_text = "invalid BZIP2 stream"
     else:
