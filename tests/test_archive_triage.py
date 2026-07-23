@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import base64
 import importlib.util
 import io
@@ -36,6 +37,22 @@ class ArchiveTriageTests(unittest.TestCase):
             archive.writestr("logs/worker.log", "ready\ntimeout waiting\ndone\n")
             archive.writestr("metadata.json", '{"result": "failed"}\n')
         return archive_path
+
+    def _make_prefixed_zip64_archive(self, directory: Path) -> tuple[Path, bytes]:
+        archive_path = directory / "prefixed-zip64.zip"
+        with mock.patch.object(zipfile, "ZIP_FILECOUNT_LIMIT", 0):
+            with zipfile.ZipFile(archive_path, "w", allowZip64=True) as archive:
+                archive.writestr(
+                    "logs/zip64.log",
+                    "zip64\n",
+                    compress_type=zipfile.ZIP_DEFLATED,
+                )
+        archive_bytes = archive_path.read_bytes()
+        self.assertIn(MODULE.ZIP64_EOCD_SIGNATURE, archive_bytes)
+        self.assertIn(MODULE.ZIP64_LOCATOR_SIGNATURE, archive_bytes)
+        prefix = b"prefixed-container-data"
+        archive_path.write_bytes(prefix + archive_bytes)
+        return archive_path, prefix
 
     def _corrupt_member_payload_tail(
         self,
@@ -557,6 +574,74 @@ class ArchiveTriageTests(unittest.TestCase):
                         MODULE.DEFAULT_MAX_CENTRAL_DIRECTORY_BYTES
                     ),
                 )
+
+    def test_prefixed_forced_zip64_archive_is_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            archive_path, _ = self._make_prefixed_zip64_archive(Path(temp_dir))
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                rc = MODULE.cmd_zip_show(
+                    self._show_args(
+                        archive_path,
+                        member="logs/zip64.log",
+                    )
+                )
+
+        self.assertEqual(rc, 0, stderr.getvalue())
+        self.assertIn("zip64", stdout.getvalue())
+
+    def test_prefixed_zip64_rejects_tampered_locator_offsets(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            archive_path, prefix = self._make_prefixed_zip64_archive(Path(temp_dir))
+            original = archive_path.read_bytes()
+            locator_offset = original.rfind(MODULE.ZIP64_LOCATOR_SIGNATURE)
+            self.assertGreaterEqual(locator_offset, 0)
+            logical_zip64_offset = struct.unpack_from(
+                "<Q",
+                original,
+                locator_offset + 8,
+            )[0]
+            physical_zip64_offset = locator_offset - MODULE.ZIP64_EOCD_MIN_SIZE
+            cases = {
+                "inconsistent": logical_zip64_offset + 1,
+                "beyond-physical": physical_zip64_offset + 1,
+            }
+            self.assertGreater(len(prefix), 1)
+            for label, tampered_offset in cases.items():
+                with self.subTest(case=label):
+                    data = bytearray(original)
+                    struct.pack_into(
+                        "<Q",
+                        data,
+                        locator_offset + 8,
+                        tampered_offset,
+                    )
+                    candidate = Path(temp_dir) / f"{label}.zip"
+                    candidate.write_bytes(data)
+                    stderr = io.StringIO()
+                    with redirect_stderr(stderr):
+                        rc = MODULE.cmd_zip_list(self._list_args(candidate))
+
+                    self.assertEqual(rc, 1)
+                    self.assertIn("ZIP64", stderr.getvalue())
+
+    def test_python39_static_compatibility_has_no_strict_zip(self) -> None:
+        source = SCRIPT_PATH.read_text(encoding="utf-8")
+        tree = ast.parse(
+            source,
+            filename=str(SCRIPT_PATH),
+            feature_version=9,
+        )
+        strict_zip_calls = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "zip"
+            and any(keyword.arg == "strict" for keyword in node.keywords)
+        ]
+        self.assertEqual(strict_zip_calls, [])
 
     def test_zip_list_rejects_archive_over_file_byte_cap(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -486,19 +486,25 @@ def _read_zip64_directory_metadata(
     if disk_number != 0 or total_disks != 1:
         raise zipfile.BadZipFile("multi-disk ZIP archives are unsupported")
 
+    physical_zip64_offset = locator_offset - ZIP64_EOCD_MIN_SIZE
     record = _read_exact_at(
         stream,
-        zip64_offset,
+        physical_zip64_offset,
         ZIP64_EOCD_MIN_SIZE,
     )
     fields = struct.unpack("<4sQ2H2L4Q", record)
     if fields[0] != ZIP64_EOCD_SIGNATURE:
         raise zipfile.BadZipFile("ZIP64 end-of-directory record not found")
     record_size = fields[1]
-    if record_size < ZIP64_EOCD_MIN_SIZE - 12:
-        raise zipfile.BadZipFile("invalid ZIP64 end-of-directory size")
-    if zip64_offset + 12 + record_size > locator_offset:
-        raise zipfile.BadZipFile("overlapping ZIP64 directory records")
+    if record_size != ZIP64_EOCD_MIN_SIZE - 12:
+        raise zipfile.BadZipFile(
+            "ZIP64 extensible end-of-directory data is unsupported"
+        )
+    if zip64_offset > physical_zip64_offset:
+        raise zipfile.BadZipFile(
+            "ZIP64 locator points beyond the physical end-of-directory record"
+        )
+    concatenation_offset = physical_zip64_offset - zip64_offset
 
     disk_number = fields[4]
     central_disk = fields[5]
@@ -509,7 +515,38 @@ def _read_zip64_directory_metadata(
         raise zipfile.BadZipFile("multi-disk ZIP archives are unsupported")
     if entries_on_disk != total_entries:
         raise zipfile.BadZipFile("inconsistent ZIP64 member counts")
-    return total_entries, central_size, fields[9], zip64_offset
+    logical_central_offset = fields[9]
+    physical_central_start = logical_central_offset + concatenation_offset
+    if (
+        physical_central_start < 0
+        or physical_central_start + central_size != physical_zip64_offset
+    ):
+        raise zipfile.BadZipFile(
+            "inconsistent ZIP64 locator and central-directory offsets"
+        )
+    return (
+        total_entries,
+        central_size,
+        physical_central_start,
+        physical_zip64_offset,
+    )
+
+
+def _has_zip64_locator(
+    stream: io.BufferedReader,
+    eocd_offset: int,
+) -> bool:
+    locator_offset = eocd_offset - ZIP64_LOCATOR_SIZE
+    if locator_offset < 0:
+        return False
+    return (
+        _read_exact_at(
+            stream,
+            locator_offset,
+            len(ZIP64_LOCATOR_SIGNATURE),
+        )
+        == ZIP64_LOCATOR_SIGNATURE
+    )
 
 
 def _decode_central_directory_name(
@@ -620,7 +657,7 @@ def _preflight_central_directory(
         central_size,
         central_offset,
     ) = eocd
-    uses_zip64 = (
+    uses_zip64_sentinel = (
         disk_number == 0xFFFF
         or central_disk == 0xFFFF
         or entries_on_disk == 0xFFFF
@@ -628,11 +665,15 @@ def _preflight_central_directory(
         or central_size == 0xFFFFFFFF
         or central_offset == 0xFFFFFFFF
     )
+    uses_zip64 = uses_zip64_sentinel or _has_zip64_locator(
+        stream,
+        eocd_offset,
+    )
     if uses_zip64:
         (
             total_entries,
             central_size,
-            central_offset,
+            central_start,
             central_end,
         ) = _read_zip64_directory_metadata(stream, eocd_offset)
     else:
@@ -641,6 +682,7 @@ def _preflight_central_directory(
         if entries_on_disk != total_entries:
             raise zipfile.BadZipFile("inconsistent ZIP member counts")
         central_end = eocd_offset
+        central_start = central_end - central_size
 
     if total_entries > max_archive_members:
         raise ArtifactLimitError(
@@ -652,10 +694,9 @@ def _preflight_central_directory(
             "central directory exceeds max bytes: "
             f"{central_size} > {max_central_directory_bytes}"
         )
-    central_start = central_end - central_size
     if central_start < 0:
         raise zipfile.BadZipFile("central directory starts before the archive")
-    if central_offset > central_start:
+    if not uses_zip64 and central_offset > central_start:
         raise zipfile.BadZipFile("invalid central-directory offset")
 
     identities = _read_central_directory_identities(
@@ -728,7 +769,7 @@ def _validated_members(
     }
 
     members = []
-    for info, identity in zip(infos, directory.identities, strict=True):
+    for info, identity in zip(infos, directory.identities):
         if info.orig_filename != identity.decoded_name:
             raise zipfile.BadZipFile(
                 "ZipInfo and central-directory names differ: "
