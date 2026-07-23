@@ -145,6 +145,98 @@ class ArchiveTriageTests(unittest.TestCase):
         data[central_name_offset + byte_index] = replacement
         archive_path.write_bytes(data)
 
+    def _replace_member_raw_name(
+        self,
+        archive_path: Path,
+        *,
+        ordinal: int,
+        raw_name: bytes,
+        flag_bits: int,
+    ) -> None:
+        with zipfile.ZipFile(archive_path) as archive:
+            info = archive.infolist()[ordinal - 1]
+
+        data = bytearray(archive_path.read_bytes())
+        local_name_length = struct.unpack_from(
+            "<H",
+            data,
+            info.header_offset + 26,
+        )[0]
+        self.assertEqual(len(raw_name), local_name_length)
+        struct.pack_into("<H", data, info.header_offset + 6, flag_bits)
+        local_name_offset = info.header_offset + MODULE.LOCAL_FILE_HEADER_SIZE
+        data[local_name_offset : local_name_offset + local_name_length] = raw_name
+
+        central_offset, central_name_offset, central_name_length = (
+            self._central_directory_records(data)[ordinal - 1]
+        )
+        self.assertEqual(central_name_length, local_name_length)
+        struct.pack_into("<H", data, central_offset + 8, flag_bits)
+        data[central_name_offset : central_name_offset + central_name_length] = raw_name
+        archive_path.write_bytes(data)
+
+    def _replace_declared_file_size(
+        self,
+        archive_path: Path,
+        *,
+        ordinal: int,
+        file_size: int,
+    ) -> None:
+        with zipfile.ZipFile(archive_path) as archive:
+            info = archive.infolist()[ordinal - 1]
+
+        data = bytearray(archive_path.read_bytes())
+        struct.pack_into("<L", data, info.header_offset + 22, file_size)
+        central_offset = self._central_directory_records(data)[ordinal - 1][0]
+        struct.pack_into("<L", data, central_offset + 24, file_size)
+        archive_path.write_bytes(data)
+
+    def _append_to_member_compressed_span(
+        self,
+        archive_path: Path,
+        *,
+        ordinal: int,
+        trailing: bytes,
+    ) -> None:
+        with zipfile.ZipFile(archive_path) as archive:
+            info = archive.infolist()[ordinal - 1]
+
+        data = bytearray(archive_path.read_bytes())
+        local_name_length, local_extra_length = struct.unpack_from(
+            "<HH",
+            data,
+            info.header_offset + 26,
+        )
+        payload_start = (
+            info.header_offset
+            + MODULE.LOCAL_FILE_HEADER_SIZE
+            + local_name_length
+            + local_extra_length
+        )
+        payload_end = payload_start + info.compress_size
+        original_eocd = data.rfind(MODULE.EOCD_SIGNATURE)
+        self.assertGreaterEqual(original_eocd, 0)
+        original_central_start = struct.unpack_from("<L", data, original_eocd + 16)[0]
+        self.assertEqual(payload_end, original_central_start)
+        data[payload_end:payload_end] = trailing
+
+        new_eocd = original_eocd + len(trailing)
+        new_central_start = original_central_start + len(trailing)
+        struct.pack_into("<L", data, new_eocd + 16, new_central_start)
+        struct.pack_into(
+            "<L",
+            data,
+            info.header_offset + 18,
+            info.compress_size + len(trailing),
+        )
+        struct.pack_into(
+            "<L",
+            data,
+            new_central_start + 20,
+            info.compress_size + len(trailing),
+        )
+        archive_path.write_bytes(data)
+
     def _parse_identity(self, rendered: str) -> dict[str, object]:
         identity = json.loads(rendered)
         self.assertEqual(
@@ -554,6 +646,142 @@ class ArchiveTriageTests(unittest.TestCase):
         self.assertEqual(stdout.getvalue(), "")
         self.assertIn("Bad CRC-32", stderr.getvalue())
 
+    def test_zip_show_rejects_trailing_deflate_data(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            archive_path = Path(temp_dir) / "deflate-trailing.zip"
+            with zipfile.ZipFile(archive_path, "w") as archive:
+                archive.writestr(
+                    "logs/deflate.log",
+                    "first\n" + ("line\n" * 100),
+                    compress_type=zipfile.ZIP_DEFLATED,
+                )
+            self._append_to_member_compressed_span(
+                archive_path,
+                ordinal=1,
+                trailing=b"\0",
+            )
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                rc = MODULE.cmd_zip_show(
+                    self._show_args(
+                        archive_path,
+                        member="logs/deflate.log",
+                        head=1,
+                    )
+                )
+
+        self.assertEqual(rc, 1)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("trailing compressed data", stderr.getvalue())
+
+    def test_zip_show_validates_data_descriptor_before_output(self) -> None:
+        class NonSeekableBuffer(io.BytesIO):
+            def seekable(self) -> bool:
+                return False
+
+            def seek(self, *args: object, **kwargs: object) -> int:
+                raise OSError("stream is not seekable")
+
+        archive_buffer = NonSeekableBuffer()
+        with zipfile.ZipFile(archive_buffer, "w") as archive:
+            archive.writestr(
+                "logs/descriptor.log",
+                "descriptor\n",
+                compress_type=zipfile.ZIP_DEFLATED,
+            )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            archive_path = Path(temp_dir) / "descriptor.zip"
+            archive_path.write_bytes(archive_buffer.getvalue())
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                rc = MODULE.cmd_zip_show(
+                    self._show_args(
+                        archive_path,
+                        member="logs/descriptor.log",
+                    )
+                )
+
+        self.assertEqual(rc, 0, stderr.getvalue())
+        self.assertIn("descriptor", stdout.getvalue())
+
+    def test_member_payload_cannot_overlap_next_local_record(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            archive_path = Path(temp_dir) / "overlap.zip"
+            with zipfile.ZipFile(archive_path, "w") as archive:
+                archive.writestr("logs/one.log", b"one\n")
+                archive.writestr("logs/two.log", b"two\n")
+            with zipfile.ZipFile(archive_path) as archive:
+                first = archive.infolist()[0]
+
+            data = bytearray(archive_path.read_bytes())
+            central_offset = self._central_directory_records(data)[0][0]
+            forged_size = first.compress_size + 1
+            struct.pack_into("<L", data, first.header_offset + 18, forged_size)
+            struct.pack_into("<L", data, first.header_offset + 22, forged_size)
+            struct.pack_into("<L", data, central_offset + 20, forged_size)
+            struct.pack_into("<L", data, central_offset + 24, forged_size)
+            archive_path.write_bytes(data)
+
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                rc = MODULE.cmd_zip_show(
+                    self._show_args(
+                        archive_path,
+                        member="logs/one.log",
+                    )
+                )
+
+        self.assertEqual(rc, 1)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("member payload exceeds the local-data region", stderr.getvalue())
+
+    def test_actual_byte_cap_limits_each_reader_request(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            archive_path = Path(temp_dir) / "read-limit.zip"
+            with zipfile.ZipFile(archive_path, "w") as archive:
+                archive.writestr("logs/large.log", b"A" * (1024 * 1024))
+            self._replace_declared_file_size(
+                archive_path,
+                ordinal=1,
+                file_size=1,
+            )
+
+            read_limits = []
+            real_read_stored = MODULE.BoundedMemberReader._read_stored
+
+            def tracking_read_stored(
+                reader: MODULE.BoundedMemberReader,
+                max_bytes: int,
+            ) -> bytes:
+                read_limits.append(max_bytes)
+                return real_read_stored(reader, max_bytes)
+
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with mock.patch.object(
+                MODULE.BoundedMemberReader,
+                "_read_stored",
+                new=tracking_read_stored,
+            ):
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    rc = MODULE.cmd_zip_show(
+                        self._show_args(
+                            archive_path,
+                            member="logs/large.log",
+                            max_member_bytes=1,
+                        )
+                    )
+
+        self.assertEqual(rc, 1)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertTrue(read_limits)
+        self.assertLessEqual(max(read_limits), 2)
+        self.assertIn("member exceeds max bytes", stderr.getvalue())
+
     def test_zip_show_all_drains_later_member_after_output_truncation(
         self,
     ) -> None:
@@ -593,131 +821,229 @@ class ArchiveTriageTests(unittest.TestCase):
     def test_malformed_compressed_later_member_is_bounded_failure(
         self,
     ) -> None:
-        cases = [
-            (
-                "deflate",
+        with tempfile.TemporaryDirectory() as temp_dir:
+            archive_path = Path(temp_dir) / "deflate.zip"
+            with zipfile.ZipFile(archive_path, "w") as archive:
+                archive.writestr(
+                    "logs/first.log",
+                    "first\n" + ("one\n" * 100),
+                    compress_type=zipfile.ZIP_STORED,
+                )
+                archive.writestr(
+                    "logs/broken.log",
+                    "second\n" + ("two\n" * 20_000),
+                    compress_type=zipfile.ZIP_DEFLATED,
+                )
+            self._corrupt_member_compressed_stream(
+                archive_path,
+                "logs/broken.log",
                 zipfile.ZIP_DEFLATED,
-                "zlib.error",
-                "invalid deflate stream",
-            ),
-            (
-                "lzma",
-                zipfile.ZIP_LZMA,
-                "lzma.LZMAError",
-                "invalid LZMA stream",
-            ),
-            (
-                "bzip2",
-                zipfile.ZIP_BZIP2,
-                "OSError",
-                "invalid BZIP2 stream",
-            ),
-        ]
-        for label, compression, error_type, detail in cases:
+            )
+            args = self._show_args(
+                archive_path,
+                member=r"logs/.*",
+                regex=True,
+                all=True,
+                head=1,
+                max_output_chars=1,
+            )
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                rc = MODULE.cmd_zip_show(args)
+
+        self.assertEqual(rc, 1)
+        self.assertEqual(stdout.getvalue(), "")
+        error_text = stderr.getvalue()
+        self.assertEqual(len(error_text.splitlines()), 1)
+        self.assertLessEqual(
+            len(error_text),
+            MODULE.DEFAULT_MAX_OUTPUT_CHARS,
+        )
+        self.assertNotIn("Traceback", error_text)
+        self.assertIn('"ordinal":2', error_text)
+        self.assertIn("type=zlib.error", error_text)
+        self.assertIn("invalid deflate stream", error_text)
+
+    def test_forged_small_file_size_is_detected_for_supported_methods(
+        self,
+    ) -> None:
+        for label, compression in (
+            ("stored", zipfile.ZIP_STORED),
+            ("deflate", zipfile.ZIP_DEFLATED),
+        ):
             with self.subTest(compression=label):
                 with tempfile.TemporaryDirectory() as temp_dir:
                     archive_path = Path(temp_dir) / f"{label}.zip"
                     with zipfile.ZipFile(archive_path, "w") as archive:
                         archive.writestr(
-                            "logs/first.log",
-                            "first\n" + ("one\n" * 100),
-                            compress_type=zipfile.ZIP_STORED,
-                        )
-                        archive.writestr(
-                            "logs/broken.log",
-                            "second\n" + ("two\n" * 20_000),
+                            "logs/expanded.log",
+                            (b"A" * 1023 + b"\n") * 256,
                             compress_type=compression,
                         )
-                    self._corrupt_member_compressed_stream(
+                    self._replace_declared_file_size(
                         archive_path,
-                        "logs/broken.log",
-                        compression,
-                    )
-                    args = self._show_args(
-                        archive_path,
-                        member=r"logs/.*",
-                        regex=True,
-                        all=True,
-                        head=1,
-                        max_output_chars=1,
+                        ordinal=1,
+                        file_size=1,
                     )
                     stdout = io.StringIO()
                     stderr = io.StringIO()
                     with redirect_stdout(stdout), redirect_stderr(stderr):
-                        rc = MODULE.cmd_zip_show(args)
+                        rc = MODULE.cmd_zip_show(
+                            self._show_args(
+                                archive_path,
+                                member="logs/expanded.log",
+                                head=1,
+                            )
+                        )
 
                 self.assertEqual(rc, 1)
                 self.assertEqual(stdout.getvalue(), "")
-                error_text = stderr.getvalue()
-                self.assertEqual(len(error_text.splitlines()), 1)
-                self.assertLessEqual(
-                    len(error_text),
-                    MODULE.DEFAULT_MAX_OUTPUT_CHARS,
+                self.assertIn(
+                    "decompressed member size differs from central directory",
+                    stderr.getvalue(),
                 )
-                self.assertNotIn("Traceback", error_text)
-                self.assertIn('"ordinal":2', error_text)
-                self.assertIn(f"type={error_type}", error_text)
-                self.assertIn(detail, error_text)
 
-    def test_unrelated_bounded_unicode_member_does_not_block_selection(self) -> None:
-        unicode_name = f"logs/{'测' * 100}.log"
+    def test_lzma_and_bzip2_are_rejected_before_decompression(
+        self,
+    ) -> None:
+        for label, compression in (
+            ("lzma", zipfile.ZIP_LZMA),
+            ("bzip2", zipfile.ZIP_BZIP2),
+        ):
+            with self.subTest(compression=label):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    archive_path = Path(temp_dir) / f"{label}.zip"
+                    with zipfile.ZipFile(archive_path, "w") as archive:
+                        archive.writestr(
+                            "logs/expanded.log",
+                            b"A\n" * (512 * 1024),
+                            compress_type=compression,
+                        )
+                    self._replace_declared_file_size(
+                        archive_path,
+                        ordinal=1,
+                        file_size=1,
+                    )
+                    stdout = io.StringIO()
+                    stderr = io.StringIO()
+                    with mock.patch.object(
+                        MODULE,
+                        "BoundedMemberReader",
+                        wraps=MODULE.BoundedMemberReader,
+                    ) as reader:
+                        with redirect_stdout(stdout), redirect_stderr(stderr):
+                            rc = MODULE.cmd_zip_show(
+                                self._show_args(
+                                    archive_path,
+                                    member="logs/expanded.log",
+                                    head=1,
+                                )
+                            )
+
+                self.assertEqual(rc, 1)
+                reader.assert_not_called()
+                self.assertEqual(stdout.getvalue(), "")
+                self.assertIn(
+                    "compression method is unsupported for bounded extraction",
+                    stderr.getvalue(),
+                )
+
+    def test_unmatched_boundary_member_identity_is_not_rendered(self) -> None:
+        cp437_raw_name = b"\x01" * MODULE.DEFAULT_MAX_RAW_MEMBER_NAME_BYTES
+        placeholder = "A" * len(cp437_raw_name)
         with tempfile.TemporaryDirectory() as temp_dir:
-            archive_path = Path(temp_dir) / "unicode-name.zip"
+            archive_path = Path(temp_dir) / "cp437-name.zip"
             with zipfile.ZipFile(archive_path, "w") as archive:
-                archive.writestr(unicode_name, "unrelated\n")
+                archive.writestr(placeholder, "unrelated\n")
                 archive.writestr("logs/selected.log", "selected\n")
+            self._replace_member_raw_name(
+                archive_path,
+                ordinal=1,
+                raw_name=cp437_raw_name,
+                flag_bits=0,
+            )
 
             list_stdout = io.StringIO()
             list_stderr = io.StringIO()
-            with redirect_stdout(list_stdout), redirect_stderr(list_stderr):
-                list_rc = MODULE.cmd_zip_list(self._list_args(archive_path))
-
             show_stdout = io.StringIO()
             show_stderr = io.StringIO()
-            with redirect_stdout(show_stdout), redirect_stderr(show_stderr):
-                show_rc = MODULE.cmd_zip_show(
-                    self._show_args(
-                        archive_path,
-                        member="logs/selected.log",
-                    )
-                )
+            real_render = MODULE._render_member_identity
 
-        self.assertEqual(list_rc, 0, list_stderr.getvalue())
-        self.assertIn('"ordinal":1', list_stdout.getvalue())
-        self.assertEqual(show_rc, 0, show_stderr.getvalue())
-        self.assertIn("selected", show_stdout.getvalue())
+            def reject_unmatched_render(
+                identity: MODULE.CentralDirectoryIdentity,
+            ) -> str:
+                if identity.ordinal == 1:
+                    raise AssertionError("unmatched member identity was rendered")
+                return real_render(identity)
 
-    def test_bzip2_member_preserves_non_decompressor_os_error(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            archive_path = Path(temp_dir) / "bzip2-io-error.zip"
-            with zipfile.ZipFile(archive_path, "w") as archive:
-                archive.writestr(
-                    "logs/bzip2.log",
-                    "content\n",
-                    compress_type=zipfile.ZIP_BZIP2,
-                )
-
-            stdout = io.StringIO()
-            stderr = io.StringIO()
             with mock.patch.object(
-                MODULE.zipfile.ZipFile,
-                "open",
-                side_effect=OSError(5, "Input/output error"),
+                MODULE,
+                "_render_member_identity",
+                side_effect=reject_unmatched_render,
             ):
-                with redirect_stdout(stdout), redirect_stderr(stderr):
-                    rc = MODULE.cmd_zip_show(
+                with redirect_stdout(list_stdout), redirect_stderr(list_stderr):
+                    list_rc = MODULE.cmd_zip_list(
+                        self._list_args(
+                            archive_path,
+                            match="selected.log",
+                        )
+                    )
+                with redirect_stdout(show_stdout), redirect_stderr(show_stderr):
+                    show_rc = MODULE.cmd_zip_show(
                         self._show_args(
                             archive_path,
-                            member="logs/bzip2.log",
+                            member="logs/selected.log",
                         )
                     )
 
-        self.assertEqual(rc, 1)
-        self.assertEqual(stdout.getvalue(), "")
-        error_text = stderr.getvalue()
-        self.assertIn("type=OSError", error_text)
-        self.assertIn("Input/output error", error_text)
-        self.assertNotIn("invalid BZIP2 stream", error_text)
+        self.assertEqual(list_rc, 0, list_stderr.getvalue())
+        self.assertNotIn('"ordinal":1', list_stdout.getvalue())
+        self.assertIn('"ordinal":2', list_stdout.getvalue())
+        self.assertEqual(show_rc, 0, show_stderr.getvalue())
+        self.assertIn("selected", show_stdout.getvalue())
+
+    def test_identity_bound_covers_utf8_and_cp437_raw_name_limit(self) -> None:
+        utf8_name = "é" * (MODULE.DEFAULT_MAX_RAW_MEMBER_NAME_BYTES // 2)
+        cp437_raw_name = b"\x01" * MODULE.DEFAULT_MAX_RAW_MEMBER_NAME_BYTES
+        placeholder = "A" * len(cp437_raw_name)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            archive_path = Path(temp_dir) / "identity-limits.zip"
+            with zipfile.ZipFile(archive_path, "w") as archive:
+                archive.writestr(utf8_name, "utf8\n")
+                archive.writestr(placeholder, "cp437\n")
+            self._replace_member_raw_name(
+                archive_path,
+                ordinal=2,
+                raw_name=cp437_raw_name,
+                flag_bits=0,
+            )
+
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                rc = MODULE.cmd_zip_list(self._list_args(archive_path))
+
+        self.assertEqual(rc, 0, stderr.getvalue())
+        identities = [
+            self._parse_identity(line.split("\t", 2)[2])
+            for line in stdout.getvalue().splitlines()
+        ]
+        self.assertEqual(len(identities), 2)
+        self.assertEqual(
+            len(base64.b64decode(identities[0]["raw_name_b64"])),
+            MODULE.DEFAULT_MAX_RAW_MEMBER_NAME_BYTES,
+        )
+        self.assertEqual(
+            len(base64.b64decode(identities[1]["raw_name_b64"])),
+            MODULE.DEFAULT_MAX_RAW_MEMBER_NAME_BYTES,
+        )
+        for line in stdout.getvalue().splitlines():
+            rendered = line.split("\t", 2)[2]
+            self.assertLessEqual(
+                len(rendered),
+                MODULE.DEFAULT_MAX_MEMBER_IDENTITY_CHARS,
+            )
 
     def test_zipfile_member_error_detail_is_bounded_and_single_line(
         self,
@@ -728,8 +1054,8 @@ class ArchiveTriageTests(unittest.TestCase):
             stdout = io.StringIO()
             stderr = io.StringIO()
             with mock.patch.object(
-                MODULE.zipfile.ZipFile,
-                "open",
+                MODULE,
+                "_member_payload_layout",
                 side_effect=zipfile.BadZipFile(oversized_detail),
             ):
                 with redirect_stdout(stdout), redirect_stderr(stderr):
@@ -774,22 +1100,26 @@ class ArchiveTriageTests(unittest.TestCase):
                 )
 
             opened_infos = []
-            real_open = zipfile.ZipFile.open
+            real_layout = MODULE._member_payload_layout
 
-            def tracking_open(
-                archive: zipfile.ZipFile,
-                member: object,
-                *args: object,
-                **kwargs: object,
-            ) -> object:
-                opened_infos.append(member)
-                return real_open(archive, member, *args, **kwargs)
+            def tracking_layout(
+                archive_stream: io.BufferedReader,
+                member: MODULE.ArchiveMember,
+                *,
+                central_start: int,
+            ) -> MODULE.MemberPayloadLayout:
+                opened_infos.append(member.info)
+                return real_layout(
+                    archive_stream,
+                    member,
+                    central_start=central_start,
+                )
 
             show_stdout = io.StringIO()
             with mock.patch.object(
-                MODULE.zipfile.ZipFile,
-                "open",
-                new=tracking_open,
+                MODULE,
+                "_member_payload_layout",
+                side_effect=tracking_layout,
             ):
                 with redirect_stdout(show_stdout):
                     show_rc = MODULE.cmd_zip_show(
@@ -1162,6 +1492,9 @@ class BugTriageDocumentationTests(unittest.TestCase):
         self.assertIn("and 100,000 lines", recipe)
         self.assertIn("protects archive object identity", recipe)
         self.assertIn("Before constructing Python `ZipInfo` objects", recipe)
+        self.assertIn("accepts only stored and DEFLATE members", recipe)
+        self.assertIn("rejects those\nmethods before opening a decompressor", recipe)
+        self.assertIn("absence of trailing compressed data", recipe)
 
     def test_private_migration_contract_is_explicit(self) -> None:
         migration = (REPO_ROOT / "docs/cisco-build-artifacts-migration.md").read_text(

@@ -118,6 +118,14 @@ against concurrent in-place mutation.
 
 Before constructing Python `ZipInfo` objects, it reads EOCD/ZIP64 metadata and
 sequentially counts bounded central-directory records from that same descriptor.
+For extraction, it accepts only stored and DEFLATE members. Python's BZIP2 and
+LZMA ZIP paths can allocate decompressor-internal output or dictionaries before
+the helper can enforce its actual-byte budget, so the helper rejects those
+methods before opening a decompressor. The accepted paths consume the complete
+declared compressed span in bounded chunks, count actual decompressed bytes,
+and verify stream termination, absence of trailing compressed data, file size,
+CRC, local-header metadata, and any data descriptor before buffered output is
+published.
 
 ## 5. Report Decisive Evidence
 

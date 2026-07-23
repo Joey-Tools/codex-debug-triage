@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import binascii
 import codecs
 import collections
 import contextlib
@@ -20,14 +21,12 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 
 try:
-    from lzma import LZMAError as LzmaError
+    import zlib
 except ImportError:
-    LzmaError = None
-
-try:
-    from zlib import error as ZlibError
-except ImportError:
+    zlib = None
     ZlibError = None
+else:
+    ZlibError = zlib.error
 
 
 DEFAULT_LIST_LIMIT = 200
@@ -43,7 +42,6 @@ DEFAULT_MAX_OUTPUT_LINES = 200
 DEFAULT_MAX_OUTPUT_CHARS = 64 * 1024
 DEFAULT_CANDIDATE_REPORT_LIMIT = 20
 DEFAULT_MAX_RAW_MEMBER_NAME_BYTES = 512
-DEFAULT_MAX_MEMBER_IDENTITY_CHARS = 1_536
 DEFAULT_MAX_ERROR_DETAIL_CHARS = 1_024
 DEFAULT_MAX_AMBIGUITY_REPORT_LINES = DEFAULT_CANDIDATE_REPORT_LIMIT + 2
 DEFAULT_MAX_AMBIGUITY_REPORT_CHARS = DEFAULT_MAX_OUTPUT_CHARS
@@ -58,7 +56,42 @@ ZIP64_EOCD_SIGNATURE = b"PK\x06\x06"
 ZIP64_EOCD_MIN_SIZE = 56
 CENTRAL_DIRECTORY_SIGNATURE = b"PK\x01\x02"
 CENTRAL_DIRECTORY_HEADER_SIZE = 46
+LOCAL_FILE_HEADER_SIGNATURE = b"PK\x03\x04"
+LOCAL_FILE_HEADER_SIZE = 30
+DATA_DESCRIPTOR_SIGNATURE = b"PK\x07\x08"
+DATA_DESCRIPTOR_FLAG = 0x08
+ENCRYPTED_FLAG = 0x01
 UTF8_FILENAME_FLAG = 0x800
+ZIP64_EXTRA_FIELD_ID = 0x0001
+UINT32_MAX = 0xFFFFFFFF
+UINT64_MAX = 0xFFFFFFFFFFFFFFFF
+DEFLATE_INPUT_CHUNK_BYTES = 64 * 1024
+
+
+def _member_identity_character_limit(max_raw_name_bytes: int) -> int:
+    """Return the exact JSON upper bound for any accepted member identity."""
+
+    fixed_chars = len(
+        json.dumps(
+            {
+                "flag_bits": 0xFFFF,
+                "name": "",
+                "ordinal": UINT64_MAX,
+                "raw_name_b64": "",
+            },
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    )
+    max_escaped_name_chars = 6 * max_raw_name_bytes
+    max_base64_chars = 4 * ((max_raw_name_bytes + 2) // 3)
+    return fixed_chars + max_escaped_name_chars + max_base64_chars
+
+
+DEFAULT_MAX_MEMBER_IDENTITY_CHARS = _member_identity_character_limit(
+    DEFAULT_MAX_RAW_MEMBER_NAME_BYTES
+)
 
 
 class ArtifactLimitError(ValueError):
@@ -78,10 +111,25 @@ class CentralDirectoryIdentity:
 
 
 @dataclass(frozen=True)
+class CentralDirectoryLayout:
+    identities: list[CentralDirectoryIdentity]
+    central_start: int
+
+
+@dataclass(frozen=True)
 class ArchiveMember:
     info: zipfile.ZipInfo
     identity: CentralDirectoryIdentity
-    rendered_identity: str
+    local_record_end: int
+
+
+@dataclass(frozen=True)
+class MemberPayloadLayout:
+    data_start: int
+    payload_end: int
+    local_data_end: int
+    uses_data_descriptor: bool
+    uses_zip64_descriptor: bool
 
 
 class DecompressedByteBudget:
@@ -102,44 +150,165 @@ class DecompressedByteBudget:
 
 
 class BoundedMemberReader(io.RawIOBase):
-    """Count actual decompressed bytes returned by one ZipExtFile."""
+    """Stream one validated STORED/DEFLATED member under actual byte caps."""
 
     def __init__(
         self,
-        raw_stream: zipfile.ZipExtFile,
+        archive_stream: io.BufferedReader,
+        member: ArchiveMember,
+        layout: MemberPayloadLayout,
         *,
         max_member_bytes: int,
         aggregate_budget: DecompressedByteBudget,
     ) -> None:
         super().__init__()
-        self._raw_stream = raw_stream
+        self._archive_stream = archive_stream
+        self._member = member
+        self._layout = layout
         self._max_member_bytes = max_member_bytes
         self._aggregate_budget = aggregate_budget
         self._member_bytes = 0
+        self._compressed_remaining = member.info.compress_size
+        self._compressed_buffer = b""
+        self._crc = 0
+        self._finished = False
+        self._archive_stream.seek(layout.data_start)
+        if member.info.compress_type == zipfile.ZIP_DEFLATED:
+            if zlib is None:
+                raise NotImplementedError(
+                    "DEFLATE extraction requires the Python zlib module"
+                )
+            self._decompressor = zlib.decompressobj(-15)
+        else:
+            self._decompressor = None
 
     def readable(self) -> bool:
         return True
 
     def readinto(self, buffer: object) -> int | None:
-        byte_count = self._raw_stream.readinto(buffer)
-        if not byte_count:
-            return byte_count
+        if self._finished:
+            return 0
+        destination = memoryview(buffer).cast("B")
+        if not destination:
+            return 0
+        read_limit = min(
+            len(destination),
+            self._max_member_bytes - self._member_bytes + 1,
+            self._aggregate_budget.max_total_bytes
+            - self._aggregate_budget.total_bytes
+            + 1,
+        )
+        if read_limit <= 0:
+            raise ArtifactLimitError("decompressed byte budget is exhausted")
 
-        next_member_bytes = self._member_bytes + byte_count
+        if self._member.info.compress_type == zipfile.ZIP_STORED:
+            data = self._read_stored(read_limit)
+        else:
+            data = self._read_deflated(read_limit)
+        if not data:
+            self._finish()
+            return 0
+
+        next_member_bytes = self._member_bytes + len(data)
         if next_member_bytes > self._max_member_bytes:
             raise ArtifactLimitError(
                 "decompressed member exceeds max bytes: "
                 f"{next_member_bytes} > {self._max_member_bytes}"
             )
-        self._aggregate_budget.consume(byte_count)
+        self._aggregate_budget.consume(len(data))
         self._member_bytes = next_member_bytes
-        return byte_count
+        self._crc = binascii.crc32(data, self._crc)
+        destination[: len(data)] = data
+        if self._stream_complete():
+            self._finish()
+        return len(data)
 
-    def close(self) -> None:
-        try:
-            self._raw_stream.close()
-        finally:
-            super().close()
+    def _read_stored(self, max_bytes: int) -> bytes:
+        if self._compressed_remaining == 0:
+            return b""
+        read_size = min(max_bytes, self._compressed_remaining)
+        data = self._archive_stream.read(read_size)
+        if len(data) != read_size:
+            raise zipfile.BadZipFile("truncated stored member payload")
+        self._compressed_remaining -= len(data)
+        return data
+
+    def _read_deflated(self, max_bytes: int) -> bytes:
+        assert self._decompressor is not None
+        while True:
+            if self._decompressor.eof:
+                if (
+                    self._decompressor.unused_data
+                    or self._compressed_buffer
+                    or self._compressed_remaining
+                ):
+                    raise zipfile.BadZipFile(
+                        "deflate member contains trailing compressed data"
+                    )
+                return b""
+
+            if self._compressed_buffer:
+                compressed = self._compressed_buffer
+                self._compressed_buffer = b""
+            elif self._compressed_remaining:
+                read_size = min(
+                    DEFLATE_INPUT_CHUNK_BYTES,
+                    self._compressed_remaining,
+                )
+                compressed = self._archive_stream.read(read_size)
+                if len(compressed) != read_size:
+                    raise zipfile.BadZipFile("truncated deflate member payload")
+                self._compressed_remaining -= len(compressed)
+            else:
+                raise zipfile.BadZipFile(
+                    "deflate stream did not terminate within its compressed span"
+                )
+
+            data = self._decompressor.decompress(compressed, max_bytes)
+            self._compressed_buffer = self._decompressor.unconsumed_tail
+            if self._decompressor.unused_data:
+                raise zipfile.BadZipFile(
+                    "deflate member contains trailing compressed data"
+                )
+            if data:
+                return data
+
+    def _stream_complete(self) -> bool:
+        if self._member.info.compress_type == zipfile.ZIP_STORED:
+            return self._compressed_remaining == 0
+        assert self._decompressor is not None
+        return (
+            self._decompressor.eof
+            and not self._decompressor.unused_data
+            and not self._compressed_buffer
+            and self._compressed_remaining == 0
+        )
+
+    def _finish(self) -> None:
+        if self._finished:
+            return
+        if not self._stream_complete():
+            if self._member.info.compress_type == zipfile.ZIP_DEFLATED:
+                raise zipfile.BadZipFile(
+                    "deflate stream did not terminate within its compressed span"
+                )
+            raise zipfile.BadZipFile("stored member payload was not fully consumed")
+
+        info = self._member.info
+        if self._member_bytes != info.file_size:
+            raise zipfile.BadZipFile(
+                "decompressed member size differs from central directory: "
+                f"{self._member_bytes} != {info.file_size}"
+            )
+        if self._crc & UINT32_MAX != info.CRC:
+            raise zipfile.BadZipFile("Bad CRC-32 for file")
+        if self._layout.uses_data_descriptor:
+            _validate_data_descriptor(
+                self._archive_stream,
+                self._member,
+                self._layout,
+            )
+        self._finished = True
 
 
 class OutputBudget:
@@ -440,7 +609,7 @@ def _preflight_central_directory(
     *,
     max_archive_members: int,
     max_central_directory_bytes: int,
-) -> list[CentralDirectoryIdentity]:
+) -> CentralDirectoryLayout:
     archive_size = os.fstat(stream.fileno()).st_size
     eocd_offset, eocd = _find_eocd(stream, archive_size)
     (
@@ -499,7 +668,10 @@ def _preflight_central_directory(
         raise zipfile.BadZipFile(
             "declared and counted central-directory entries differ"
         )
-    return identities
+    return CentralDirectoryLayout(
+        identities=identities,
+        central_start=central_start,
+    )
 
 
 def _render_member_identity(identity: CentralDirectoryIdentity) -> str:
@@ -525,19 +697,38 @@ def _render_member_identity(identity: CentralDirectoryIdentity) -> str:
 
 def _validated_members(
     archive: zipfile.ZipFile,
-    identities: list[CentralDirectoryIdentity],
+    directory: CentralDirectoryLayout,
     max_archive_members: int,
 ) -> list[ArchiveMember]:
+    if archive.start_dir != directory.central_start:
+        raise zipfile.BadZipFile(
+            "ZipFile and preflight central-directory offsets differ"
+        )
     infos = archive.infolist()
     if len(infos) > max_archive_members:
         raise ArtifactLimitError(
             f"archive member count exceeds limit: {len(infos)} > {max_archive_members}"
         )
-    if len(infos) != len(identities):
+    if len(infos) != len(directory.identities):
         raise zipfile.BadZipFile("ZipInfo and central-directory member counts differ")
 
+    header_offsets = [info.header_offset for info in infos]
+    if len(set(header_offsets)) != len(header_offsets) or any(
+        offset < 0 or offset >= directory.central_start for offset in header_offsets
+    ):
+        raise zipfile.BadZipFile("invalid or duplicate local-header offsets")
+    sorted_offsets = sorted(header_offsets)
+    record_ends = {
+        offset: (
+            sorted_offsets[index + 1]
+            if index + 1 < len(sorted_offsets)
+            else directory.central_start
+        )
+        for index, offset in enumerate(sorted_offsets)
+    }
+
     members = []
-    for info, identity in zip(infos, identities, strict=True):
+    for info, identity in zip(infos, directory.identities, strict=True):
         if info.orig_filename != identity.decoded_name:
             raise zipfile.BadZipFile(
                 "ZipInfo and central-directory names differ: "
@@ -552,10 +743,198 @@ def _validated_members(
             ArchiveMember(
                 info=info,
                 identity=identity,
-                rendered_identity=_render_member_identity(identity),
+                local_record_end=record_ends[info.header_offset],
             )
         )
     return members
+
+
+def _render_archive_member(member: ArchiveMember) -> str:
+    return _render_member_identity(member.identity)
+
+
+def _parse_extra_fields(extra: bytes) -> dict[int, bytes]:
+    fields: dict[int, bytes] = {}
+    cursor = 0
+    while cursor < len(extra):
+        if len(extra) - cursor < 4:
+            raise zipfile.BadZipFile("truncated local extra-field header")
+        field_id, field_size = struct.unpack_from("<HH", extra, cursor)
+        cursor += 4
+        field_end = cursor + field_size
+        if field_end > len(extra):
+            raise zipfile.BadZipFile("local extra field exceeds its bounds")
+        if field_id in fields:
+            raise zipfile.BadZipFile("duplicate local extra-field identifier")
+        fields[field_id] = extra[cursor:field_end]
+        cursor = field_end
+    return fields
+
+
+def _resolved_local_sizes(
+    *,
+    local_file_size: int,
+    local_compress_size: int,
+    extra: bytes,
+) -> tuple[int, int, bool]:
+    needs_file_size = local_file_size == UINT32_MAX
+    needs_compress_size = local_compress_size == UINT32_MAX
+    if not needs_file_size and not needs_compress_size:
+        return local_file_size, local_compress_size, False
+
+    fields = _parse_extra_fields(extra)
+    zip64 = fields.get(ZIP64_EXTRA_FIELD_ID)
+    if zip64 is None:
+        raise zipfile.BadZipFile("local ZIP64 sizes are missing")
+    cursor = 0
+
+    def take_size() -> int:
+        nonlocal cursor
+        if len(zip64) - cursor < 8:
+            raise zipfile.BadZipFile("truncated local ZIP64 size")
+        value = struct.unpack_from("<Q", zip64, cursor)[0]
+        cursor += 8
+        return value
+
+    resolved_file_size = take_size() if needs_file_size else local_file_size
+    resolved_compress_size = take_size() if needs_compress_size else local_compress_size
+    return resolved_file_size, resolved_compress_size, True
+
+
+def _member_payload_layout(
+    archive_stream: io.BufferedReader,
+    member: ArchiveMember,
+    *,
+    central_start: int,
+) -> MemberPayloadLayout:
+    info = member.info
+    header = _read_exact_at(
+        archive_stream,
+        info.header_offset,
+        LOCAL_FILE_HEADER_SIZE,
+    )
+    fields = struct.unpack("<4s5H3L2H", header)
+    if fields[0] != LOCAL_FILE_HEADER_SIGNATURE:
+        raise zipfile.BadZipFile("invalid local-file-header signature")
+    local_flags = fields[2]
+    local_compression = fields[3]
+    local_crc = fields[6]
+    local_compress_size = fields[7]
+    local_file_size = fields[8]
+    name_length = fields[9]
+    extra_length = fields[10]
+    if local_flags != info.flag_bits:
+        raise zipfile.BadZipFile(
+            f"local and central member flags differ: ordinal={member.identity.ordinal}"
+        )
+    if local_flags & ENCRYPTED_FLAG:
+        raise NotImplementedError("encrypted ZIP members are unsupported")
+    if local_compression != info.compress_type:
+        raise zipfile.BadZipFile(
+            "local and central compression methods differ: "
+            f"ordinal={member.identity.ordinal}"
+        )
+
+    variable_start = info.header_offset + LOCAL_FILE_HEADER_SIZE
+    data_start = variable_start + name_length + extra_length
+    payload_end = data_start + info.compress_size
+    if (
+        variable_start < 0
+        or data_start < variable_start
+        or payload_end < data_start
+        or payload_end > member.local_record_end
+        or member.local_record_end > central_start
+    ):
+        raise zipfile.BadZipFile("member payload exceeds the local-data region")
+    raw_name = _read_exact_at(archive_stream, variable_start, name_length)
+    if raw_name != member.identity.raw_name:
+        raise zipfile.BadZipFile(
+            "local and central raw member names differ: "
+            f"ordinal={member.identity.ordinal}"
+        )
+    extra = _read_exact_at(
+        archive_stream,
+        variable_start + name_length,
+        extra_length,
+    )
+    (
+        resolved_file_size,
+        resolved_compress_size,
+        uses_zip64_sizes,
+    ) = _resolved_local_sizes(
+        local_file_size=local_file_size,
+        local_compress_size=local_compress_size,
+        extra=extra,
+    )
+    uses_data_descriptor = bool(local_flags & DATA_DESCRIPTOR_FLAG)
+    if uses_data_descriptor:
+        if local_crc not in (0, info.CRC):
+            raise zipfile.BadZipFile(
+                "local and central CRC values differ before data descriptor"
+            )
+        if resolved_file_size not in (0, info.file_size):
+            raise zipfile.BadZipFile(
+                "local and central file sizes differ before data descriptor"
+            )
+        if resolved_compress_size not in (0, info.compress_size):
+            raise zipfile.BadZipFile(
+                "local and central compressed sizes differ before data descriptor"
+            )
+    else:
+        if local_crc != info.CRC:
+            raise zipfile.BadZipFile("local and central CRC values differ")
+        if resolved_file_size != info.file_size:
+            raise zipfile.BadZipFile("local and central file sizes differ")
+        if resolved_compress_size != info.compress_size:
+            raise zipfile.BadZipFile("local and central compressed sizes differ")
+    return MemberPayloadLayout(
+        data_start=data_start,
+        payload_end=payload_end,
+        local_data_end=member.local_record_end,
+        uses_data_descriptor=uses_data_descriptor,
+        uses_zip64_descriptor=uses_zip64_sizes,
+    )
+
+
+def _validate_data_descriptor(
+    archive_stream: io.BufferedReader,
+    member: ArchiveMember,
+    layout: MemberPayloadLayout,
+) -> None:
+    value_format = "<LQQ" if layout.uses_zip64_descriptor else "<LLL"
+    value_size = struct.calcsize(value_format)
+    available_size = layout.local_data_end - layout.payload_end
+    if available_size < value_size:
+        raise zipfile.BadZipFile("data descriptor exceeds the local-data region")
+    read_size = min(
+        available_size,
+        value_size + len(DATA_DESCRIPTOR_SIGNATURE),
+    )
+    available = _read_exact_at(
+        archive_stream,
+        layout.payload_end,
+        read_size,
+    )
+    expected = (
+        member.info.CRC,
+        member.info.compress_size,
+        member.info.file_size,
+    )
+    candidates = [struct.unpack_from(value_format, available, 0)]
+    if len(available) >= value_size + len(
+        DATA_DESCRIPTOR_SIGNATURE
+    ) and available.startswith(DATA_DESCRIPTOR_SIGNATURE):
+        candidates.append(
+            struct.unpack_from(
+                value_format,
+                available,
+                len(DATA_DESCRIPTOR_SIGNATURE),
+            )
+        )
+    if expected not in candidates:
+        raise zipfile.BadZipFile(
+            "data descriptor differs from validated member metadata"
+        )
 
 
 def _find_members(
@@ -590,12 +969,12 @@ def _validate_member_budget(
     info = member.info
     if info.is_dir():
         raise ValueError(
-            f"member is not a regular file: member={member.rendered_identity}"
+            f"member is not a regular file: member={_render_archive_member(member)}"
         )
     if info.file_size > max_member_bytes:
         raise ArtifactLimitError(
             "member exceeds max bytes: "
-            f"member={member.rendered_identity}; "
+            f"member={_render_archive_member(member)}; "
             f"{info.file_size} > {max_member_bytes}"
         )
     next_total = total_member_bytes + info.file_size
@@ -611,10 +990,23 @@ def _preflight_selected_members(
     selected: list[ArchiveMember],
     args: argparse.Namespace,
 ) -> None:
-    """Preflight every selected member metadata budget."""
+    """Preflight every selected member before opening any decompressor."""
 
     total_member_bytes = 0
     for member in selected:
+        if member.info.compress_type not in (
+            zipfile.ZIP_STORED,
+            zipfile.ZIP_DEFLATED,
+        ):
+            raise NotImplementedError(
+                "compression method is unsupported for bounded extraction: "
+                f"method={member.info.compress_type}; "
+                f"member={_render_archive_member(member)}"
+            )
+        if member.info.compress_type == zipfile.ZIP_DEFLATED and zlib is None:
+            raise NotImplementedError(
+                "DEFLATE extraction requires the Python zlib module"
+            )
         total_member_bytes = _validate_member_budget(
             member,
             max_member_bytes=args.max_member_bytes,
@@ -624,18 +1016,25 @@ def _preflight_selected_members(
 
 
 def _iter_member_lines(
-    archive: zipfile.ZipFile,
-    info: zipfile.ZipInfo,
+    archive_stream: io.BufferedReader,
+    member: ArchiveMember,
     *,
+    central_start: int,
     encoding: str,
     max_member_bytes: int,
     aggregate_budget: DecompressedByteBudget,
     max_member_lines: int,
     max_input_line_chars: int,
 ) -> Iterator[tuple[int, str]]:
-    raw_stream = archive.open(info)
+    layout = _member_payload_layout(
+        archive_stream,
+        member,
+        central_start=central_start,
+    )
     bounded_stream = BoundedMemberReader(
-        raw_stream,
+        archive_stream,
+        member,
+        layout,
         max_member_bytes=max_member_bytes,
         aggregate_budget=aggregate_budget,
     )
@@ -719,16 +1118,18 @@ def _select_stream_lines(
 
 
 def _add_member_output(
-    archive: zipfile.ZipFile,
+    archive_stream: io.BufferedReader,
     member: ArchiveMember,
+    central_start: int,
     args: argparse.Namespace,
     grep_pattern: re.Pattern[str] | None,
     output: OutputBudget,
     aggregate_budget: DecompressedByteBudget,
 ) -> None:
     line_iterator = _iter_member_lines(
-        archive,
-        member.info,
+        archive_stream,
+        member,
+        central_start=central_start,
         encoding=args.encoding,
         max_member_bytes=args.max_member_bytes,
         aggregate_budget=aggregate_budget,
@@ -753,7 +1154,7 @@ def _add_member_output(
     except _archive_errors() as error:
         error_type, detail = _bounded_member_error(error, member)
         raise MemberReadError(
-            f"member={member.rendered_identity} read failed: "
+            f"member={_render_archive_member(member)} read failed: "
             f"type={error_type}; detail={detail}"
         ) from error
     finally:
@@ -768,16 +1169,6 @@ def _bounded_member_error(
     if ZlibError is not None and isinstance(error, ZlibError):
         error_type = "zlib.error"
         detail_text = "invalid deflate stream"
-    elif LzmaError is not None and isinstance(error, LzmaError):
-        error_type = "lzma.LZMAError"
-        detail_text = "invalid LZMA stream"
-    elif (
-        member.info.compress_type == zipfile.ZIP_BZIP2
-        and isinstance(error, OSError)
-        and str(error) == "Invalid data stream"
-    ):
-        error_type = "OSError"
-        detail_text = "invalid BZIP2 stream"
     else:
         error_type = type(error).__name__
         detail_text = str(error)
@@ -804,9 +1195,7 @@ def _archive_errors() -> tuple[type[BaseException], ...]:
         zipfile.BadZipFile,
         zipfile.LargeZipFile,
     )
-    optional_errors = tuple(
-        error for error in (ZlibError, LzmaError) if error is not None
-    )
+    optional_errors = tuple(error for error in (ZlibError,) if error is not None)
     return errors + optional_errors
 
 
@@ -818,7 +1207,7 @@ def cmd_zip_list(args: argparse.Namespace) -> int:
             zip_path,
             args.max_archive_bytes,
         ) as archive_stream:
-            identities = _preflight_central_directory(
+            directory = _preflight_central_directory(
                 archive_stream,
                 max_archive_members=args.max_archive_members,
                 max_central_directory_bytes=args.max_central_directory_bytes,
@@ -826,7 +1215,7 @@ def cmd_zip_list(args: argparse.Namespace) -> int:
             with zipfile.ZipFile(archive_stream) as archive:
                 members = _validated_members(
                     archive,
-                    identities,
+                    directory,
                     args.max_archive_members,
                 )
                 output = OutputBudget(args.limit, args.max_output_chars)
@@ -836,7 +1225,7 @@ def cmd_zip_list(args: argparse.Namespace) -> int:
                     if not output.add(
                         f"{member.info.file_size}\t"
                         f"{member.info.compress_size}\t"
-                        f"{member.rendered_identity}",
+                        f"{_render_archive_member(member)}",
                         allow_line_truncation=False,
                     ):
                         break
@@ -861,7 +1250,7 @@ def _report_ambiguous_members(matches: list[ArchiveMember]) -> None:
     )
     reported = 0
     for member in matches[:DEFAULT_CANDIDATE_REPORT_LIMIT]:
-        candidate = f"member={member.rendered_identity}"
+        candidate = f"member={_render_archive_member(member)}"
         if (
             len(lines) >= DEFAULT_MAX_AMBIGUITY_REPORT_LINES - 1
             or char_count + len(candidate) + 1 > report_char_limit
@@ -913,7 +1302,7 @@ def cmd_zip_show(args: argparse.Namespace) -> int:
             zip_path,
             args.max_archive_bytes,
         ) as archive_stream:
-            identities = _preflight_central_directory(
+            directory = _preflight_central_directory(
                 archive_stream,
                 max_archive_members=args.max_archive_members,
                 max_central_directory_bytes=args.max_central_directory_bytes,
@@ -921,7 +1310,7 @@ def cmd_zip_show(args: argparse.Namespace) -> int:
             with zipfile.ZipFile(archive_stream) as archive:
                 members = _validated_members(
                     archive,
-                    identities,
+                    directory,
                     args.max_archive_members,
                 )
                 matches = _find_members(
@@ -956,12 +1345,13 @@ def cmd_zip_show(args: argparse.Namespace) -> int:
                         output.add("")
                     if not output.truncated:
                         output.add(
-                            f"== {member.rendered_identity} ==",
+                            f"== {_render_archive_member(member)} ==",
                             allow_line_truncation=False,
                         )
                     _add_member_output(
-                        archive,
+                        archive_stream,
                         member,
+                        directory.central_start,
                         args,
                         grep_pattern,
                         output,

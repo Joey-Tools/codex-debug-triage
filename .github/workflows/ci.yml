@@ -19,7 +19,7 @@ jobs:
           python-version: "3.x"
       - name: Compile Python helpers
         run: |
-          python3 -m py_compile skills/bug-triage-playbook/scripts/jenkins_artifact_probe.py tests/test_jenkins_artifact_probe.py
+          python3 -m py_compile skills/bug-triage-playbook/scripts/archive_triage.py tests/test_archive_triage.py
       - name: Run tests
         run: |
-          python3 -m unittest tests.test_jenkins_artifact_probe
+          python3 -m unittest tests.test_archive_triage
