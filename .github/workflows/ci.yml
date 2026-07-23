@@ -12,11 +12,17 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version:
+          - "3.9"
+          - "3.x"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.x"
+          python-version: ${{ matrix.python-version }}
       - name: Compile Python helpers
         run: |
           python3 -m py_compile skills/bug-triage-playbook/scripts/archive_triage.py tests/test_archive_triage.py

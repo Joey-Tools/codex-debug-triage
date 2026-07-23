@@ -11,6 +11,7 @@ import subprocess
 import struct
 import sys
 import tempfile
+import time
 import unittest
 import zipfile
 from contextlib import redirect_stderr, redirect_stdout
@@ -38,8 +39,8 @@ class ArchiveTriageTests(unittest.TestCase):
             archive.writestr("metadata.json", '{"result": "failed"}\n')
         return archive_path
 
-    def _make_prefixed_zip64_archive(self, directory: Path) -> tuple[Path, bytes]:
-        archive_path = directory / "prefixed-zip64.zip"
+    def _make_forced_zip64_archive(self, directory: Path) -> Path:
+        archive_path = directory / "forced-zip64.zip"
         with mock.patch.object(zipfile, "ZIP_FILECOUNT_LIMIT", 0):
             with zipfile.ZipFile(archive_path, "w", allowZip64=True) as archive:
                 archive.writestr(
@@ -50,9 +51,7 @@ class ArchiveTriageTests(unittest.TestCase):
         archive_bytes = archive_path.read_bytes()
         self.assertIn(MODULE.ZIP64_EOCD_SIGNATURE, archive_bytes)
         self.assertIn(MODULE.ZIP64_LOCATOR_SIGNATURE, archive_bytes)
-        prefix = b"prefixed-container-data"
-        archive_path.write_bytes(prefix + archive_bytes)
-        return archive_path, prefix
+        return archive_path
 
     def _make_dual_view_archive(self, directory: Path) -> Path:
         outer_path = directory / "outer.zip"
@@ -223,6 +222,74 @@ class ArchiveTriageTests(unittest.TestCase):
         struct.pack_into("<L", data, info.header_offset + 22, file_size)
         central_offset = self._central_directory_records(data)[ordinal - 1][0]
         struct.pack_into("<L", data, central_offset + 24, file_size)
+        archive_path.write_bytes(data)
+
+    def _replace_member_flag_bits(
+        self,
+        archive_path: Path,
+        *,
+        ordinal: int,
+        flag_bits: int,
+    ) -> None:
+        with zipfile.ZipFile(archive_path) as archive:
+            info = archive.infolist()[ordinal - 1]
+
+        data = bytearray(archive_path.read_bytes())
+        struct.pack_into("<H", data, info.header_offset + 6, flag_bits)
+        central_offset = self._central_directory_records(data)[ordinal - 1][0]
+        struct.pack_into("<H", data, central_offset + 8, flag_bits)
+        archive_path.write_bytes(data)
+
+    def _replace_member_disk_start(
+        self,
+        archive_path: Path,
+        *,
+        ordinal: int,
+        disk_start: int,
+        use_zip64_sentinel: bool,
+    ) -> None:
+        data = bytearray(archive_path.read_bytes())
+        central_offset = self._central_directory_records(data)[ordinal - 1][0]
+        if not use_zip64_sentinel:
+            struct.pack_into("<H", data, central_offset + 34, disk_start)
+            archive_path.write_bytes(data)
+            return
+
+        name_length, extra_length = struct.unpack_from(
+            "<HH",
+            data,
+            central_offset + 28,
+        )
+        zip64_extra = struct.pack(
+            "<HHI",
+            MODULE.ZIP64_EXTRA_FIELD_ID,
+            4,
+            disk_start,
+        )
+        insert_offset = (
+            central_offset
+            + MODULE.CENTRAL_DIRECTORY_HEADER_SIZE
+            + name_length
+            + extra_length
+        )
+        eocd_offset = data.rfind(MODULE.EOCD_SIGNATURE)
+        self.assertGreaterEqual(eocd_offset, insert_offset)
+        central_size = struct.unpack_from("<L", data, eocd_offset + 12)[0]
+
+        struct.pack_into("<H", data, central_offset + 6, 45)
+        struct.pack_into(
+            "<H", data, central_offset + 30, extra_length + len(zip64_extra)
+        )
+        struct.pack_into("<H", data, central_offset + 34, 0xFFFF)
+        data[insert_offset:insert_offset] = zip64_extra
+
+        new_eocd_offset = eocd_offset + len(zip64_extra)
+        struct.pack_into(
+            "<L",
+            data,
+            new_eocd_offset + 12,
+            central_size + len(zip64_extra),
+        )
         archive_path.write_bytes(data)
 
     def _append_to_member_compressed_span(
@@ -588,31 +655,30 @@ class ArchiveTriageTests(unittest.TestCase):
 
     def test_zip_preflight_does_not_cap_unverified_eocd_signatures(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            archive_path = self._make_archive(Path(temp_dir))
+            archive_path = Path(temp_dir) / "many-signatures.zip"
             invalid_candidate = MODULE.EOCD_SIGNATURE + (b"\0" * 18)
-            archive_path.write_bytes(
-                (invalid_candidate * 2_048) + archive_path.read_bytes()
-            )
+            with zipfile.ZipFile(archive_path, "w") as archive:
+                archive.writestr(
+                    "many-signatures.bin",
+                    invalid_candidate * 2_048,
+                    compress_type=zipfile.ZIP_STORED,
+                )
             stdout = io.StringIO()
             stderr = io.StringIO()
             with redirect_stdout(stdout), redirect_stderr(stderr):
                 rc = MODULE.cmd_zip_list(self._list_args(archive_path))
 
         self.assertEqual(rc, 0, stderr.getvalue())
-        self.assertIn("logs/console.txt", stdout.getvalue())
+        self.assertIn("many-signatures.bin", stdout.getvalue())
 
-    def test_single_eocd_candidate_variants_are_accepted(self) -> None:
+    def test_unprefixed_single_eocd_candidate_variants_are_accepted(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             directory = Path(temp_dir)
             ordinary_path = self._make_archive(directory)
-            prefixed_path = directory / "prefixed.zip"
-            prefix = b"self-extracting-prefix"
-            prefixed_path.write_bytes(prefix + ordinary_path.read_bytes())
-            zip64_path, _ = self._make_prefixed_zip64_archive(directory)
+            zip64_path = self._make_forced_zip64_archive(directory)
 
             cases = {
                 "ordinary": ordinary_path,
-                "prefixed": prefixed_path,
                 "zip64": zip64_path,
             }
             for label, archive_path in cases.items():
@@ -621,6 +687,33 @@ class ArchiveTriageTests(unittest.TestCase):
                     with redirect_stdout(io.StringIO()), redirect_stderr(stderr):
                         rc = MODULE.cmd_zip_list(self._list_args(archive_path))
                     self.assertEqual(rc, 0, stderr.getvalue())
+
+    def test_prefixed_ordinary_archive_is_rejected_before_zipfile(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            directory = Path(temp_dir)
+            archive_path = self._make_archive(directory)
+            prefixed_path = directory / "prefixed.zip"
+            prefixed_path.write_bytes(
+                b"self-extracting-prefix" + archive_path.read_bytes()
+            )
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            real_zipfile = zipfile.ZipFile
+            with mock.patch.object(
+                MODULE.zipfile,
+                "ZipFile",
+                wraps=real_zipfile,
+            ) as constructor:
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    rc = MODULE.cmd_zip_list(self._list_args(prefixed_path))
+
+        self.assertEqual(rc, 1)
+        constructor.assert_not_called()
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn(
+            "concatenated or prefixed ZIP archives are unsupported",
+            stderr.getvalue(),
+        )
 
     def test_zip64_preflight_accepts_bounded_directory_metadata(self) -> None:
         central_header = bytearray(MODULE.CENTRAL_DIRECTORY_HEADER_SIZE)
@@ -674,9 +767,11 @@ class ArchiveTriageTests(unittest.TestCase):
                     ),
                 )
 
-    def test_prefixed_forced_zip64_archive_is_accepted(self) -> None:
+    def test_unprefixed_forced_zip64_archive_is_accepted_for_extraction(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            archive_path, _ = self._make_prefixed_zip64_archive(Path(temp_dir))
+            archive_path = self._make_forced_zip64_archive(Path(temp_dir))
             stdout = io.StringIO()
             stderr = io.StringIO()
             with redirect_stdout(stdout), redirect_stderr(stderr):
@@ -690,9 +785,43 @@ class ArchiveTriageTests(unittest.TestCase):
         self.assertEqual(rc, 0, stderr.getvalue())
         self.assertIn("zip64", stdout.getvalue())
 
-    def test_prefixed_zip64_rejects_tampered_locator_offsets(self) -> None:
+    def test_prefixed_forced_zip64_archive_is_rejected_before_zipfile(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            archive_path, prefix = self._make_prefixed_zip64_archive(Path(temp_dir))
+            directory = Path(temp_dir)
+            archive_path = self._make_forced_zip64_archive(directory)
+            prefixed_path = directory / "prefixed-zip64.zip"
+            prefixed_path.write_bytes(
+                b"prefixed-container-data" + archive_path.read_bytes()
+            )
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            real_zipfile = zipfile.ZipFile
+            with mock.patch.object(
+                MODULE.zipfile,
+                "ZipFile",
+                wraps=real_zipfile,
+            ) as constructor:
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    rc = MODULE.cmd_zip_show(
+                        self._show_args(
+                            prefixed_path,
+                            member="logs/zip64.log",
+                        )
+                    )
+
+        self.assertEqual(rc, 1)
+        constructor.assert_not_called()
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn(
+            "concatenated or prefixed ZIP64 archives are unsupported",
+            stderr.getvalue(),
+        )
+
+    def test_zip64_rejects_tampered_locator_offsets(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            archive_path = self._make_forced_zip64_archive(Path(temp_dir))
             original = archive_path.read_bytes()
             locator_offset = original.rfind(MODULE.ZIP64_LOCATOR_SIGNATURE)
             self.assertGreaterEqual(locator_offset, 0)
@@ -703,10 +832,11 @@ class ArchiveTriageTests(unittest.TestCase):
             )[0]
             physical_zip64_offset = locator_offset - MODULE.ZIP64_EOCD_MIN_SIZE
             cases = {
-                "inconsistent": logical_zip64_offset + 1,
+                "before-physical": logical_zip64_offset - 1,
                 "beyond-physical": physical_zip64_offset + 1,
             }
-            self.assertGreater(len(prefix), 1)
+            self.assertEqual(logical_zip64_offset, physical_zip64_offset)
+            self.assertGreater(logical_zip64_offset, 0)
             for label, tampered_offset in cases.items():
                 with self.subTest(case=label):
                     data = bytearray(original)
@@ -724,6 +854,105 @@ class ArchiveTriageTests(unittest.TestCase):
 
                     self.assertEqual(rc, 1)
                     self.assertIn("ZIP64", stderr.getvalue())
+
+    def test_unsupported_general_purpose_flags_are_rejected_before_zipfile(
+        self,
+    ) -> None:
+        unsupported_bits = [
+            1 << bit_index
+            for bit_index in range(16)
+            if not (1 << bit_index) & MODULE.SUPPORTED_GENERAL_PURPOSE_FLAGS
+        ]
+        self.assertIn(0x0020, unsupported_bits)
+        self.assertIn(0x0040, unsupported_bits)
+        self.assertEqual(len(unsupported_bits), 14)
+
+        for flag_bits in unsupported_bits:
+            with self.subTest(flag_bits=f"0x{flag_bits:04x}"):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    archive_path = Path(temp_dir) / "flags.zip"
+                    with self.assertWarns(UserWarning):
+                        with zipfile.ZipFile(archive_path, "w") as archive:
+                            archive.writestr("logs/member.log", "first\n")
+                            archive.writestr("logs/member.log", "second\n")
+                    self._replace_member_flag_bits(
+                        archive_path,
+                        ordinal=2,
+                        flag_bits=flag_bits,
+                    )
+                    stdout = io.StringIO()
+                    stderr = io.StringIO()
+                    with mock.patch.object(
+                        MODULE,
+                        "BoundedMemberReader",
+                        wraps=MODULE.BoundedMemberReader,
+                    ) as reader:
+                        with redirect_stdout(stdout), redirect_stderr(stderr):
+                            rc = MODULE.cmd_zip_show(
+                                self._show_args(
+                                    archive_path,
+                                    member="logs/member.log",
+                                    all=True,
+                                )
+                            )
+
+                self.assertEqual(rc, 1)
+                reader.assert_not_called()
+                self.assertEqual(stdout.getvalue(), "")
+                self.assertIn(
+                    "unsupported ZIP general-purpose flag bits",
+                    stderr.getvalue(),
+                )
+
+    def test_nonzero_member_disk_start_is_rejected_before_zipfile(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            archive_path = self._make_archive(Path(temp_dir))
+            self._replace_member_disk_start(
+                archive_path,
+                ordinal=1,
+                disk_start=1,
+                use_zip64_sentinel=False,
+            )
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            real_zipfile = zipfile.ZipFile
+            with mock.patch.object(
+                MODULE.zipfile,
+                "ZipFile",
+                wraps=real_zipfile,
+            ) as constructor:
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    rc = MODULE.cmd_zip_list(self._list_args(archive_path))
+
+        self.assertEqual(rc, 1)
+        constructor.assert_not_called()
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("disk-start=1", stderr.getvalue())
+
+    def test_zip64_member_disk_start_sentinel_is_resolved(self) -> None:
+        for disk_start, expected_rc in ((0, 0), (1, 1)):
+            with self.subTest(disk_start=disk_start):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    archive_path = Path(temp_dir) / "member-disk-start.zip"
+                    with zipfile.ZipFile(archive_path, "w") as archive:
+                        archive.writestr("logs/member.log", "member\n")
+                    self._replace_member_disk_start(
+                        archive_path,
+                        ordinal=1,
+                        disk_start=disk_start,
+                        use_zip64_sentinel=True,
+                    )
+                    stdout = io.StringIO()
+                    stderr = io.StringIO()
+                    with redirect_stdout(stdout), redirect_stderr(stderr):
+                        rc = MODULE.cmd_zip_list(self._list_args(archive_path))
+
+                self.assertEqual(rc, expected_rc, stderr.getvalue())
+                if expected_rc == 0:
+                    self.assertIn("logs/member.log", stdout.getvalue())
+                else:
+                    self.assertEqual(stdout.getvalue(), "")
+                    self.assertIn("disk-start=1", stderr.getvalue())
 
     def test_python39_static_compatibility_has_no_strict_zip(self) -> None:
         source = SCRIPT_PATH.read_text(encoding="utf-8")
@@ -768,6 +997,233 @@ class ArchiveTriageTests(unittest.TestCase):
 
         self.assertEqual(rc, 0)
         open_call.assert_called_once()
+
+    def test_archive_growth_after_initial_fstat_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            archive_path = self._make_archive(Path(temp_dir))
+            real_fstat = os.fstat
+            fstat_calls = 0
+
+            def grow_after_initial_fstat(fd: int) -> os.stat_result:
+                nonlocal fstat_calls
+                fstat_calls += 1
+                if fstat_calls == 2:
+                    growth_fd = os.open(
+                        archive_path,
+                        os.O_WRONLY | os.O_APPEND,
+                    )
+                    try:
+                        os.write(growth_fd, b"concurrent-growth")
+                    finally:
+                        os.close(growth_fd)
+                return real_fstat(fd)
+
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            real_zipfile = zipfile.ZipFile
+            with mock.patch.object(
+                MODULE.os,
+                "fstat",
+                side_effect=grow_after_initial_fstat,
+            ):
+                with mock.patch.object(
+                    MODULE.zipfile,
+                    "ZipFile",
+                    wraps=real_zipfile,
+                ) as constructor:
+                    with redirect_stdout(stdout), redirect_stderr(stderr):
+                        rc = MODULE.cmd_zip_list(self._list_args(archive_path))
+
+        self.assertEqual(rc, 1)
+        constructor.assert_not_called()
+        self.assertGreaterEqual(fstat_calls, 2)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("archive size changed after open", stderr.getvalue())
+
+    def test_pinned_archive_reader_enforces_initial_eof(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            archive_path = self._make_archive(Path(temp_dir))
+            archive_size = archive_path.stat().st_size
+            with MODULE._open_pinned_archive(
+                archive_path,
+                MODULE.DEFAULT_MAX_ARCHIVE_BYTES,
+            ) as archive_stream:
+                with self.assertRaisesRegex(
+                    zipfile.BadZipFile,
+                    "seek exceeds the initially accepted size",
+                ):
+                    archive_stream.seek(archive_size + 1)
+                archive_stream.seek(archive_size)
+                self.assertEqual(archive_stream.read(1), b"")
+
+    def test_zip_show_escapes_terminal_control_characters(self) -> None:
+        unsafe_line = "before\x1b]0;owned\x07after\x08X\u009b31mred\u202e"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            archive_path = Path(temp_dir) / "terminal-controls.zip"
+            with zipfile.ZipFile(archive_path, "w") as archive:
+                archive.writestr(
+                    "logs/control.log",
+                    unsafe_line + "\n",
+                )
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                rc = MODULE.cmd_zip_show(
+                    self._show_args(
+                        archive_path,
+                        member="logs/control.log",
+                    )
+                )
+
+        self.assertEqual(rc, 0, stderr.getvalue())
+        rendered = stdout.getvalue()
+        for unsafe_character in ("\x1b", "\x07", "\x08", "\u009b", "\u202e"):
+            self.assertNotIn(unsafe_character, rendered)
+        self.assertIn(
+            "before\\x1b]0;owned\\x07after\\x08X\\x9b31mred\\u202e",
+            rendered,
+        )
+
+    def test_regex_entrypoints_terminate_catastrophic_backtracking(self) -> None:
+        catastrophic_pattern = r"(a+)+$"
+        hostile_name = ("a" * 400) + "!"
+        hostile_line = ("a" * 20_000) + "!\n"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            archive_path = Path(temp_dir) / "regex-deadline.zip"
+            with zipfile.ZipFile(archive_path, "w") as archive:
+                archive.writestr(hostile_name, "name\n")
+                archive.writestr("logs/hostile.log", hostile_line)
+
+            cases = {
+                "zip-list-match": self._list_args(
+                    archive_path,
+                    match=catastrophic_pattern,
+                ),
+                "member-regex": self._show_args(
+                    archive_path,
+                    member=catastrophic_pattern,
+                    regex=True,
+                ),
+                "grep": self._show_args(
+                    archive_path,
+                    member="logs/hostile.log",
+                    grep=catastrophic_pattern,
+                ),
+            }
+            for label, args in cases.items():
+                with self.subTest(entrypoint=label):
+                    stdout = io.StringIO()
+                    stderr = io.StringIO()
+                    started = time.monotonic()
+                    with mock.patch.object(
+                        MODULE,
+                        "DEFAULT_REGEX_MATCH_TIMEOUT_SECONDS",
+                        0.05,
+                    ):
+                        with mock.patch.object(
+                            MODULE,
+                            "DEFAULT_REGEX_AGGREGATE_TIMEOUT_SECONDS",
+                            2.0,
+                        ):
+                            with redirect_stdout(stdout), redirect_stderr(stderr):
+                                if label == "zip-list-match":
+                                    rc = MODULE.cmd_zip_list(args)
+                                else:
+                                    rc = MODULE.cmd_zip_show(args)
+                    elapsed = time.monotonic() - started
+
+                    self.assertEqual(rc, 1)
+                    self.assertLess(elapsed, 2.0)
+                    self.assertEqual(stdout.getvalue(), "")
+                    self.assertIn(
+                        "regular expression per-match deadline exceeded",
+                        stderr.getvalue(),
+                    )
+
+    def test_regex_timeout_reaps_worker(self) -> None:
+        budget = MODULE.RegexMatchBudget()
+        process = None
+        with MODULE.IsolatedRegexMatcher(
+            r"(a+)+$",
+            ignore_case=False,
+            budget=budget,
+        ) as matcher:
+            process = matcher._process
+            self.assertIsNotNone(process)
+            with mock.patch.object(
+                MODULE,
+                "DEFAULT_REGEX_MATCH_TIMEOUT_SECONDS",
+                0.05,
+            ):
+                with self.assertRaisesRegex(
+                    MODULE.ArtifactLimitError,
+                    "per-match deadline exceeded",
+                ):
+                    matcher.search(("a" * 20_000) + "!")
+
+        assert process is not None
+        self.assertIsNotNone(process.poll())
+
+    def test_regex_worker_crash_is_a_bounded_failure(self) -> None:
+        budget = MODULE.RegexMatchBudget()
+        process = None
+        with MODULE.IsolatedRegexMatcher(
+            "safe",
+            ignore_case=False,
+            budget=budget,
+        ) as matcher:
+            process = matcher._process
+            self.assertIsNotNone(process)
+            assert process is not None
+            process.kill()
+            process.wait(1.0)
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "worker is unavailable",
+            ):
+                matcher.search("safe")
+
+        assert process is not None
+        self.assertIsNotNone(process.poll())
+
+    def test_regex_workers_share_and_enforce_aggregate_deadline(self) -> None:
+        budget = MODULE.RegexMatchBudget()
+        processes = []
+        real_popen = subprocess.Popen
+
+        def tracking_popen(
+            *args: object,
+            **kwargs: object,
+        ) -> subprocess.Popen[bytes]:
+            process = real_popen(*args, **kwargs)
+            processes.append(process)
+            return process
+
+        with mock.patch.object(
+            MODULE.subprocess,
+            "Popen",
+            side_effect=tracking_popen,
+        ):
+            with MODULE.IsolatedRegexMatcher(
+                "first",
+                ignore_case=False,
+                budget=budget,
+            ) as first_matcher:
+                self.assertTrue(first_matcher.search("first"))
+                budget.deadline = time.monotonic() - 1.0
+                with self.assertRaisesRegex(
+                    MODULE.ArtifactLimitError,
+                    "aggregate deadline exceeded",
+                ):
+                    with MODULE.IsolatedRegexMatcher(
+                        "second",
+                        ignore_case=False,
+                        budget=budget,
+                    ):
+                        self.fail("expired matcher unexpectedly started")
+
+        self.assertEqual(len(processes), 2)
+        self.assertTrue(all(process.poll() is not None for process in processes))
 
     def test_zip_show_rejects_member_over_line_cap_without_partial_output(
         self,
@@ -868,11 +1324,17 @@ class ArchiveTriageTests(unittest.TestCase):
                 raise OSError("stream is not seekable")
 
         archive_buffer = NonSeekableBuffer()
+        member_name = "logs/déscriptor.log"
         with zipfile.ZipFile(archive_buffer, "w") as archive:
             archive.writestr(
-                "logs/descriptor.log",
+                member_name,
                 "descriptor\n",
                 compress_type=zipfile.ZIP_DEFLATED,
+            )
+        with zipfile.ZipFile(io.BytesIO(archive_buffer.getvalue())) as archive:
+            self.assertEqual(
+                archive.getinfo(member_name).flag_bits,
+                MODULE.SUPPORTED_GENERAL_PURPOSE_FLAGS,
             )
 
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -884,7 +1346,7 @@ class ArchiveTriageTests(unittest.TestCase):
                 rc = MODULE.cmd_zip_show(
                     self._show_args(
                         archive_path,
-                        member="logs/descriptor.log",
+                        member=member_name,
                     )
                 )
 
@@ -1594,19 +2056,40 @@ class ArchiveTriageTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.code, 2)
 
-    def test_zip_show_reports_invalid_grep_regex(self) -> None:
+    def test_regex_entrypoints_report_invalid_patterns(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             archive_path = self._make_archive(Path(temp_dir))
-            args = self._show_args(
-                archive_path,
-                grep="[",
-            )
-            stderr = io.StringIO()
-            with redirect_stdout(io.StringIO()), redirect_stderr(stderr):
-                rc = MODULE.cmd_zip_show(args)
+            cases = {
+                "zip-list-match": self._list_args(
+                    archive_path,
+                    match="[",
+                ),
+                "member-regex": self._show_args(
+                    archive_path,
+                    member="[",
+                    regex=True,
+                ),
+                "grep": self._show_args(
+                    archive_path,
+                    grep="[",
+                ),
+            }
+            for label, args in cases.items():
+                with self.subTest(entrypoint=label):
+                    stdout = io.StringIO()
+                    stderr = io.StringIO()
+                    with redirect_stdout(stdout), redirect_stderr(stderr):
+                        if label == "zip-list-match":
+                            rc = MODULE.cmd_zip_list(args)
+                        else:
+                            rc = MODULE.cmd_zip_show(args)
 
-        self.assertEqual(rc, 1)
-        self.assertIn("error=unterminated character set", stderr.getvalue())
+                    self.assertEqual(rc, 1)
+                    self.assertEqual(stdout.getvalue(), "")
+                    self.assertIn(
+                        "error=unterminated character set",
+                        stderr.getvalue(),
+                    )
 
     def test_command_line_zip_list_smoke(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

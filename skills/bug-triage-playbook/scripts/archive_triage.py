@@ -13,9 +13,13 @@ import json
 import os
 import pathlib
 import re
+import selectors
 import stat
 import struct
+import subprocess
 import sys
+import time
+import unicodedata
 import zipfile
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -60,12 +64,20 @@ LOCAL_FILE_HEADER_SIGNATURE = b"PK\x03\x04"
 LOCAL_FILE_HEADER_SIZE = 30
 DATA_DESCRIPTOR_SIGNATURE = b"PK\x07\x08"
 DATA_DESCRIPTOR_FLAG = 0x08
-ENCRYPTED_FLAG = 0x01
 UTF8_FILENAME_FLAG = 0x800
+SUPPORTED_GENERAL_PURPOSE_FLAGS = DATA_DESCRIPTOR_FLAG | UTF8_FILENAME_FLAG
 ZIP64_EXTRA_FIELD_ID = 0x0001
 UINT32_MAX = 0xFFFFFFFF
 UINT64_MAX = 0xFFFFFFFFFFFFFFFF
 DEFLATE_INPUT_CHUNK_BYTES = 64 * 1024
+DEFAULT_MAX_REGEX_PATTERN_CHARS = 4 * 1024
+DEFAULT_REGEX_WORKER_START_TIMEOUT_SECONDS = 1.0
+DEFAULT_REGEX_MATCH_TIMEOUT_SECONDS = 0.25
+DEFAULT_REGEX_AGGREGATE_TIMEOUT_SECONDS = 5.0
+REGEX_WORKER_RESPONSE_BYTES = 4 * 1024
+REGEX_WORKER_MAX_REQUEST_BYTES = (12 * DEFAULT_MAX_INPUT_LINE_CHARS) + 4 * 1024
+REGEX_WORKER_STOP_TIMEOUT_SECONDS = 0.5
+REGEX_WORKER_ARG = "--archive-triage-regex-worker"
 
 
 def _member_identity_character_limit(max_raw_name_bytes: int) -> int:
@@ -132,6 +144,73 @@ class MemberPayloadLayout:
     uses_zip64_descriptor: bool
 
 
+class PinnedArchiveReader(io.RawIOBase):
+    """Expose the initially accepted archive extent as an immutable EOF."""
+
+    def __init__(self, raw_stream: io.FileIO, archive_size: int) -> None:
+        super().__init__()
+        self._raw_stream = raw_stream
+        self.archive_size = archive_size
+
+    def _validate_size(self) -> None:
+        current_size = os.fstat(self._raw_stream.fileno()).st_size
+        if current_size != self.archive_size:
+            raise zipfile.BadZipFile(
+                "archive size changed after open: "
+                f"initial={self.archive_size}; current={current_size}"
+            )
+
+    def validate_unchanged(self) -> None:
+        self._validate_size()
+
+    def readable(self) -> bool:
+        return True
+
+    def seekable(self) -> bool:
+        return True
+
+    def fileno(self) -> int:
+        return self._raw_stream.fileno()
+
+    def tell(self) -> int:
+        return self._raw_stream.tell()
+
+    def seek(self, offset: int, whence: int = os.SEEK_SET) -> int:
+        self._validate_size()
+        if whence == os.SEEK_SET:
+            target = offset
+        elif whence == os.SEEK_CUR:
+            target = self.tell() + offset
+        elif whence == os.SEEK_END:
+            target = self.archive_size + offset
+        else:
+            raise ValueError(f"unsupported seek mode: {whence}")
+        if target < 0 or target > self.archive_size:
+            raise zipfile.BadZipFile("archive seek exceeds the initially accepted size")
+        return self._raw_stream.seek(target, os.SEEK_SET)
+
+    def readinto(self, buffer: object) -> int | None:
+        self._validate_size()
+        position = self.tell()
+        if position < 0 or position > self.archive_size:
+            raise zipfile.BadZipFile(
+                "archive read starts outside the initially accepted size"
+            )
+        remaining = self.archive_size - position
+        if remaining == 0:
+            return 0
+        view = memoryview(buffer)
+        bounded_view = view[: min(len(view), remaining)]
+        return self._raw_stream.readinto(bounded_view)
+
+    def close(self) -> None:
+        if not self.closed:
+            try:
+                self._raw_stream.close()
+            finally:
+                super().close()
+
+
 class DecompressedByteBudget:
     """Track actual decompressed bytes across all selected members."""
 
@@ -154,7 +233,7 @@ class BoundedMemberReader(io.RawIOBase):
 
     def __init__(
         self,
-        archive_stream: io.BufferedReader,
+        archive_stream: PinnedArchiveReader,
         member: ArchiveMember,
         layout: MemberPayloadLayout,
         *,
@@ -370,16 +449,388 @@ def _positive_int(value: str) -> int:
     return parsed
 
 
-def _compile_pattern(pattern: str, ignore_case: bool = False) -> re.Pattern[str]:
-    flags = re.IGNORECASE if ignore_case else 0
-    return re.compile(pattern, flags)
+def _escape_terminal_text(value: str) -> str:
+    escaped: list[str] = []
+    for character in value:
+        if character.isprintable() and not unicodedata.category(character).startswith(
+            "C"
+        ):
+            escaped.append(character)
+            continue
+        codepoint = ord(character)
+        if codepoint <= 0xFF:
+            escaped.append(f"\\x{codepoint:02x}")
+        elif codepoint <= 0xFFFF:
+            escaped.append(f"\\u{codepoint:04x}")
+        else:
+            escaped.append(f"\\U{codepoint:08x}")
+    return "".join(escaped)
+
+
+class RegexMatchBudget:
+    """Share one aggregate deadline across all regex workers in a command."""
+
+    def __init__(self) -> None:
+        self.deadline = time.monotonic() + DEFAULT_REGEX_AGGREGATE_TIMEOUT_SECONDS
+
+    def _bounded_deadline(
+        self,
+        timeout_seconds: float,
+        timeout_kind: str,
+    ) -> tuple[float, str]:
+        now = time.monotonic()
+        remaining = self.deadline - now
+        if remaining <= 0:
+            raise ArtifactLimitError("regular expression aggregate deadline exceeded")
+        if remaining <= timeout_seconds:
+            return self.deadline, "aggregate"
+        return (
+            now + timeout_seconds,
+            timeout_kind,
+        )
+
+    def startup_deadline(self) -> tuple[float, str]:
+        return self._bounded_deadline(
+            DEFAULT_REGEX_WORKER_START_TIMEOUT_SECONDS,
+            "startup",
+        )
+
+    def request_deadline(self) -> tuple[float, str]:
+        return self._bounded_deadline(
+            DEFAULT_REGEX_MATCH_TIMEOUT_SECONDS,
+            "per-match",
+        )
+
+
+class IsolatedRegexMatcher:
+    """Run Python's backtracking regex engine in a terminable subprocess."""
+
+    def __init__(
+        self,
+        pattern: str,
+        *,
+        ignore_case: bool,
+        budget: RegexMatchBudget,
+    ) -> None:
+        if len(pattern) > DEFAULT_MAX_REGEX_PATTERN_CHARS:
+            raise ArtifactLimitError(
+                "regular expression exceeds max characters: "
+                f"{len(pattern)} > {DEFAULT_MAX_REGEX_PATTERN_CHARS}"
+            )
+        self._pattern = pattern
+        self._ignore_case = ignore_case
+        self._budget = budget
+        self._process: subprocess.Popen[bytes] | None = None
+
+    def __enter__(self) -> IsolatedRegexMatcher:
+        script_path = pathlib.Path(__file__).resolve()
+        self._process = subprocess.Popen(
+            [
+                sys.executable,
+                "-I",
+                "-B",
+                str(script_path),
+                REGEX_WORKER_ARG,
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            bufsize=0,
+            close_fds=True,
+            start_new_session=True,
+        )
+        try:
+            if self._process.stdin is None:
+                raise RuntimeError(
+                    "regular expression worker request pipe is unavailable"
+                )
+            os.set_blocking(self._process.stdin.fileno(), False)
+            response = self._request(
+                {
+                    "op": "compile",
+                    "pattern": self._pattern,
+                    "ignore_case": self._ignore_case,
+                },
+                startup=True,
+            )
+            if response.get("status") != "ready":
+                detail = response.get(
+                    "detail",
+                    "regular expression worker rejected the pattern",
+                )
+                raise re.error(str(detail))
+        except BaseException:
+            self.close()
+            raise
+        return self
+
+    def __exit__(
+        self,
+        exc_type: object,
+        exc_value: object,
+        traceback: object,
+    ) -> None:
+        self.close()
+
+    def _running_process(self) -> subprocess.Popen[bytes]:
+        process = self._process
+        if process is None or process.poll() is not None:
+            raise RuntimeError("regular expression worker is unavailable")
+        if process.stdin is None or process.stdout is None:
+            raise RuntimeError("regular expression worker pipes are unavailable")
+        return process
+
+    def _deadline_exceeded(self, deadline_kind: str) -> None:
+        if not self._terminate():
+            raise RuntimeError(
+                "regular expression "
+                f"{deadline_kind} deadline exceeded and the worker "
+                "could not be reaped"
+            )
+        raise ArtifactLimitError(
+            f"regular expression {deadline_kind} deadline exceeded"
+        )
+
+    def _send_request(
+        self,
+        request: dict[str, object],
+        *,
+        deadline: float,
+        deadline_kind: str,
+    ) -> None:
+        process = self._running_process()
+        assert process.stdin is not None
+        payload = (
+            json.dumps(
+                request,
+                ensure_ascii=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            + b"\n"
+        )
+        if len(payload) > REGEX_WORKER_MAX_REQUEST_BYTES:
+            raise ArtifactLimitError(
+                "regular expression request exceeds the worker byte limit"
+            )
+        view = memoryview(payload)
+        with selectors.DefaultSelector() as selector:
+            selector.register(process.stdin.fileno(), selectors.EVENT_WRITE)
+            while view:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not selector.select(remaining):
+                    self._deadline_exceeded(deadline_kind)
+                try:
+                    written = os.write(process.stdin.fileno(), view)
+                except BlockingIOError:
+                    continue
+                if written <= 0:
+                    raise RuntimeError("regular expression worker request pipe closed")
+                view = view[written:]
+
+    def _read_response(
+        self,
+        *,
+        deadline: float,
+        deadline_kind: str,
+    ) -> dict[str, object]:
+        process = self._process
+        if process is None or process.stdout is None:
+            raise RuntimeError("regular expression worker is unavailable")
+        response = bytearray()
+        with selectors.DefaultSelector() as selector:
+            selector.register(process.stdout.fileno(), selectors.EVENT_READ)
+            while b"\n" not in response:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not selector.select(remaining):
+                    self._deadline_exceeded(deadline_kind)
+                chunk = os.read(
+                    process.stdout.fileno(),
+                    REGEX_WORKER_RESPONSE_BYTES + 1 - len(response),
+                )
+                if not chunk:
+                    self._terminate()
+                    raise RuntimeError(
+                        "regular expression worker closed its response pipe"
+                    )
+                response.extend(chunk)
+                if len(response) > REGEX_WORKER_RESPONSE_BYTES:
+                    self._terminate()
+                    raise ArtifactLimitError(
+                        "regular expression worker response exceeds its limit"
+                    )
+        line, separator, trailing = bytes(response).partition(b"\n")
+        if separator != b"\n" or trailing:
+            self._terminate()
+            raise RuntimeError("invalid regular expression worker framing")
+        try:
+            decoded = json.loads(line)
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            self._terminate()
+            raise RuntimeError("invalid regular expression worker response") from error
+        if not isinstance(decoded, dict):
+            self._terminate()
+            raise RuntimeError("invalid regular expression worker response")
+        return decoded
+
+    def _request(
+        self,
+        request: dict[str, object],
+        *,
+        startup: bool = False,
+    ) -> dict[str, object]:
+        if startup:
+            deadline, deadline_kind = self._budget.startup_deadline()
+        else:
+            deadline, deadline_kind = self._budget.request_deadline()
+        try:
+            self._send_request(
+                request,
+                deadline=deadline,
+                deadline_kind=deadline_kind,
+            )
+            return self._read_response(
+                deadline=deadline,
+                deadline_kind=deadline_kind,
+            )
+        except (BrokenPipeError, OSError) as error:
+            self._terminate()
+            raise RuntimeError(
+                "regular expression worker communication failed"
+            ) from error
+
+    def search(self, candidate: str) -> bool:
+        response = self._request(
+            {
+                "op": "search",
+                "candidate": candidate,
+            }
+        )
+        if response.get("status") != "matched":
+            self._terminate()
+            raise RuntimeError("regular expression worker returned an error")
+        matched = response.get("matched")
+        if not isinstance(matched, bool):
+            self._terminate()
+            raise RuntimeError("regular expression worker returned an error")
+        return matched
+
+    def _terminate(self) -> bool:
+        process = self._process
+        if process is None:
+            return True
+        reaped = process.poll() is not None
+        try:
+            if not reaped:
+                try:
+                    process.terminate()
+                except OSError:
+                    pass
+                try:
+                    process.wait(REGEX_WORKER_STOP_TIMEOUT_SECONDS)
+                    reaped = True
+                except subprocess.TimeoutExpired:
+                    try:
+                        process.kill()
+                    except OSError:
+                        pass
+                    try:
+                        process.wait(REGEX_WORKER_STOP_TIMEOUT_SECONDS)
+                        reaped = True
+                    except subprocess.TimeoutExpired:
+                        reaped = False
+        finally:
+            for pipe in (process.stdin, process.stdout):
+                if pipe is not None:
+                    try:
+                        pipe.close()
+                    except OSError:
+                        pass
+            self._process = None
+        return reaped
+
+    def close(self) -> None:
+        if not self._terminate():
+            raise RuntimeError("regular expression worker could not be reaped")
+
+
+def _write_regex_worker_response(response: dict[str, object]) -> None:
+    payload = (
+        json.dumps(
+            response,
+            ensure_ascii=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        + b"\n"
+    )
+    if len(payload) > REGEX_WORKER_RESPONSE_BYTES:
+        raise RuntimeError("regular expression worker response is too large")
+    view = memoryview(payload)
+    while view:
+        written = os.write(sys.stdout.fileno(), view)
+        if written <= 0:
+            raise RuntimeError("regular expression worker response pipe closed")
+        view = view[written:]
+
+
+def _read_regex_worker_request() -> dict[str, object] | None:
+    payload = sys.stdin.buffer.readline(REGEX_WORKER_MAX_REQUEST_BYTES + 1)
+    if not payload:
+        return None
+    if len(payload) > REGEX_WORKER_MAX_REQUEST_BYTES or not payload.endswith(b"\n"):
+        raise RuntimeError("invalid regular expression worker request framing")
+    decoded = json.loads(payload)
+    if not isinstance(decoded, dict):
+        raise RuntimeError("invalid regular expression worker request")
+    return decoded
+
+
+def _regex_worker_main() -> int:
+    request = _read_regex_worker_request()
+    if request is None or request.get("op") != "compile":
+        return 2
+    pattern_text = request.get("pattern")
+    ignore_case = request.get("ignore_case")
+    if not isinstance(pattern_text, str) or not isinstance(ignore_case, bool):
+        return 2
+    try:
+        pattern = re.compile(
+            pattern_text,
+            re.IGNORECASE if ignore_case else 0,
+        )
+    except re.error as error:
+        _write_regex_worker_response(
+            {
+                "status": "error",
+                "detail": _escape_terminal_text(str(error))[
+                    :DEFAULT_MAX_ERROR_DETAIL_CHARS
+                ],
+            }
+        )
+        return 1
+    _write_regex_worker_response({"status": "ready"})
+    while True:
+        request = _read_regex_worker_request()
+        if request is None:
+            return 0
+        if request.get("op") != "search":
+            return 2
+        candidate = request.get("candidate")
+        if not isinstance(candidate, str):
+            return 2
+        matched = pattern.search(candidate) is not None
+        _write_regex_worker_response(
+            {
+                "status": "matched",
+                "matched": matched,
+            }
+        )
 
 
 @contextlib.contextmanager
 def _open_pinned_archive(
     path: pathlib.Path,
     max_archive_bytes: int,
-) -> Iterator[io.BufferedReader]:
+) -> Iterator[PinnedArchiveReader]:
     flags = os.O_RDONLY
     flags |= getattr(os, "O_CLOEXEC", 0)
     flags |= getattr(os, "O_NONBLOCK", 0)
@@ -393,8 +844,14 @@ def _open_pinned_archive(
                 "archive file exceeds max bytes: "
                 f"{metadata.st_size} > {max_archive_bytes}"
             )
-        stream = os.fdopen(fd, "rb", closefd=True)
+        raw_stream = os.fdopen(
+            fd,
+            "rb",
+            buffering=0,
+            closefd=True,
+        )
         fd = -1
+        stream = PinnedArchiveReader(raw_stream, metadata.st_size)
         with stream:
             yield stream
     finally:
@@ -403,7 +860,7 @@ def _open_pinned_archive(
 
 
 def _read_exact_at(
-    stream: io.BufferedReader,
+    stream: PinnedArchiveReader,
     offset: int,
     size: int,
 ) -> bytes:
@@ -417,7 +874,7 @@ def _read_exact_at(
 
 
 def _find_eocd(
-    stream: io.BufferedReader,
+    stream: PinnedArchiveReader,
     archive_size: int,
 ) -> tuple[int, tuple[int, int, int, int, int, int]]:
     """Return the one EOCD view whose declared comment reaches physical EOF.
@@ -483,7 +940,7 @@ def _find_eocd(
 
 
 def _read_zip64_directory_metadata(
-    stream: io.BufferedReader,
+    stream: PinnedArchiveReader,
     eocd_offset: int,
 ) -> tuple[int, int, int, int]:
     locator_offset = eocd_offset - ZIP64_LOCATOR_SIZE
@@ -519,7 +976,10 @@ def _read_zip64_directory_metadata(
         raise zipfile.BadZipFile(
             "ZIP64 locator points beyond the physical end-of-directory record"
         )
-    concatenation_offset = physical_zip64_offset - zip64_offset
+    if zip64_offset != physical_zip64_offset:
+        raise zipfile.BadZipFile(
+            "concatenated or prefixed ZIP64 archives are unsupported"
+        )
 
     disk_number = fields[4]
     central_disk = fields[5]
@@ -530,25 +990,21 @@ def _read_zip64_directory_metadata(
         raise zipfile.BadZipFile("multi-disk ZIP archives are unsupported")
     if entries_on_disk != total_entries:
         raise zipfile.BadZipFile("inconsistent ZIP64 member counts")
-    logical_central_offset = fields[9]
-    physical_central_start = logical_central_offset + concatenation_offset
-    if (
-        physical_central_start < 0
-        or physical_central_start + central_size != physical_zip64_offset
-    ):
+    central_start = fields[9]
+    if central_start < 0 or central_start + central_size != physical_zip64_offset:
         raise zipfile.BadZipFile(
             "inconsistent ZIP64 locator and central-directory offsets"
         )
     return (
         total_entries,
         central_size,
-        physical_central_start,
+        central_start,
         physical_zip64_offset,
     )
 
 
 def _has_zip64_locator(
-    stream: io.BufferedReader,
+    stream: PinnedArchiveReader,
     eocd_offset: int,
 ) -> bool:
     locator_offset = eocd_offset - ZIP64_LOCATOR_SIZE
@@ -590,8 +1046,64 @@ def _decode_central_directory_name(
     return raw_name.decode("cp437")
 
 
+def _validate_general_purpose_flags(
+    flag_bits: int,
+    *,
+    ordinal: int,
+) -> None:
+    unsupported = flag_bits & ~SUPPORTED_GENERAL_PURPOSE_FLAGS
+    if unsupported:
+        raise NotImplementedError(
+            "unsupported ZIP general-purpose flag bits: "
+            f"ordinal={ordinal}; flags=0x{flag_bits:04x}; "
+            f"unsupported=0x{unsupported:04x}"
+        )
+
+
+def _resolved_central_directory_disk_start(
+    header: bytes,
+    extra: bytes,
+    *,
+    ordinal: int,
+) -> int:
+    disk_start = struct.unpack_from("<H", header, 34)[0]
+    if disk_start != 0xFFFF:
+        return disk_start
+
+    fields = _parse_extra_fields(
+        extra,
+        record_label="central-directory",
+    )
+    zip64 = fields.get(ZIP64_EXTRA_FIELD_ID)
+    if zip64 is None:
+        raise zipfile.BadZipFile(
+            f"central-directory ZIP64 disk-start is missing: ordinal={ordinal}"
+        )
+    cursor = 0
+
+    def skip_field(size: int, label: str) -> None:
+        nonlocal cursor
+        if len(zip64) - cursor < size:
+            raise zipfile.BadZipFile(
+                f"truncated central-directory ZIP64 {label}: ordinal={ordinal}"
+            )
+        cursor += size
+
+    central_compress_size = struct.unpack_from("<L", header, 20)[0]
+    central_file_size = struct.unpack_from("<L", header, 24)[0]
+    local_header_offset = struct.unpack_from("<L", header, 42)[0]
+    if central_file_size == UINT32_MAX:
+        skip_field(8, "file size")
+    if central_compress_size == UINT32_MAX:
+        skip_field(8, "compressed size")
+    if local_header_offset == UINT32_MAX:
+        skip_field(8, "local-header offset")
+    skip_field(4, "disk-start")
+    return struct.unpack_from("<L", zip64, cursor - 4)[0]
+
+
 def _read_central_directory_identities(
-    stream: io.BufferedReader,
+    stream: PinnedArchiveReader,
     *,
     central_start: int,
     central_size: int,
@@ -638,6 +1150,21 @@ def _read_central_directory_identities(
             filename_length,
         )
         flag_bits = struct.unpack_from("<H", header, 8)[0]
+        extra = _read_exact_at(
+            stream,
+            cursor + CENTRAL_DIRECTORY_HEADER_SIZE + filename_length,
+            extra_length,
+        )
+        disk_start = _resolved_central_directory_disk_start(
+            header,
+            extra,
+            ordinal=ordinal,
+        )
+        if disk_start != 0:
+            raise zipfile.BadZipFile(
+                "multi-disk ZIP archives are unsupported: "
+                f"member ordinal={ordinal}; disk-start={disk_start}"
+            )
         decoded_name = _decode_central_directory_name(
             raw_name,
             flag_bits=flag_bits,
@@ -657,12 +1184,12 @@ def _read_central_directory_identities(
 
 
 def _preflight_central_directory(
-    stream: io.BufferedReader,
+    stream: PinnedArchiveReader,
     *,
     max_archive_members: int,
     max_central_directory_bytes: int,
 ) -> CentralDirectoryLayout:
-    archive_size = os.fstat(stream.fileno()).st_size
+    archive_size = stream.archive_size
     eocd_offset, eocd = _find_eocd(stream, archive_size)
     (
         disk_number,
@@ -711,8 +1238,10 @@ def _preflight_central_directory(
         )
     if central_start < 0:
         raise zipfile.BadZipFile("central directory starts before the archive")
-    if not uses_zip64 and central_offset > central_start:
-        raise zipfile.BadZipFile("invalid central-directory offset")
+    if not uses_zip64 and central_offset != central_start:
+        raise zipfile.BadZipFile(
+            "concatenated or prefixed ZIP archives are unsupported"
+        )
 
     identities = _read_central_directory_identities(
         stream,
@@ -809,19 +1338,23 @@ def _render_archive_member(member: ArchiveMember) -> str:
     return _render_member_identity(member.identity)
 
 
-def _parse_extra_fields(extra: bytes) -> dict[int, bytes]:
+def _parse_extra_fields(
+    extra: bytes,
+    *,
+    record_label: str = "local",
+) -> dict[int, bytes]:
     fields: dict[int, bytes] = {}
     cursor = 0
     while cursor < len(extra):
         if len(extra) - cursor < 4:
-            raise zipfile.BadZipFile("truncated local extra-field header")
+            raise zipfile.BadZipFile(f"truncated {record_label} extra-field header")
         field_id, field_size = struct.unpack_from("<HH", extra, cursor)
         cursor += 4
         field_end = cursor + field_size
         if field_end > len(extra):
-            raise zipfile.BadZipFile("local extra field exceeds its bounds")
+            raise zipfile.BadZipFile(f"{record_label} extra field exceeds its bounds")
         if field_id in fields:
-            raise zipfile.BadZipFile("duplicate local extra-field identifier")
+            raise zipfile.BadZipFile(f"duplicate {record_label} extra-field identifier")
         fields[field_id] = extra[cursor:field_end]
         cursor = field_end
     return fields
@@ -858,7 +1391,7 @@ def _resolved_local_sizes(
 
 
 def _member_payload_layout(
-    archive_stream: io.BufferedReader,
+    archive_stream: PinnedArchiveReader,
     member: ArchiveMember,
     *,
     central_start: int,
@@ -883,8 +1416,10 @@ def _member_payload_layout(
         raise zipfile.BadZipFile(
             f"local and central member flags differ: ordinal={member.identity.ordinal}"
         )
-    if local_flags & ENCRYPTED_FLAG:
-        raise NotImplementedError("encrypted ZIP members are unsupported")
+    _validate_general_purpose_flags(
+        local_flags,
+        ordinal=member.identity.ordinal,
+    )
     if local_compression != info.compress_type:
         raise zipfile.BadZipFile(
             "local and central compression methods differ: "
@@ -953,7 +1488,7 @@ def _member_payload_layout(
 
 
 def _validate_data_descriptor(
-    archive_stream: io.BufferedReader,
+    archive_stream: PinnedArchiveReader,
     member: ArchiveMember,
     layout: MemberPayloadLayout,
 ) -> None:
@@ -998,11 +1533,15 @@ def _find_members(
     needle: str,
     use_regex: bool,
     ignore_case: bool,
+    regex_matcher: IsolatedRegexMatcher | None,
 ) -> list[ArchiveMember]:
     if use_regex:
-        pattern = _compile_pattern(needle, ignore_case)
+        if regex_matcher is None:
+            raise RuntimeError("member regex matcher is unavailable")
         return [
-            member for member in members if pattern.search(member.identity.decoded_name)
+            member
+            for member in members
+            if regex_matcher.search(member.identity.decoded_name)
         ]
 
     compare = needle.lower() if ignore_case else needle
@@ -1063,6 +1602,10 @@ def _preflight_selected_members(
             raise NotImplementedError(
                 "DEFLATE extraction requires the Python zlib module"
             )
+        _validate_general_purpose_flags(
+            member.info.flag_bits,
+            ordinal=member.identity.ordinal,
+        )
         total_member_bytes = _validate_member_budget(
             member,
             max_member_bytes=args.max_member_bytes,
@@ -1072,7 +1615,7 @@ def _preflight_selected_members(
 
 
 def _iter_member_lines(
-    archive_stream: io.BufferedReader,
+    archive_stream: PinnedArchiveReader,
     member: ArchiveMember,
     *,
     central_start: int,
@@ -1124,18 +1667,18 @@ def _iter_member_lines(
 def _select_stream_lines(
     lines: Iterator[tuple[int, str]],
     *,
-    grep_pattern: re.Pattern[str] | None,
+    grep_matcher: IsolatedRegexMatcher | None,
     context: int,
     head: int,
     tail: int,
 ) -> Iterator[tuple[int, str]]:
-    if grep_pattern:
+    if grep_matcher:
         previous: collections.deque[tuple[int, str]] = collections.deque(maxlen=context)
         last_emitted = 0
         trailing = 0
         for item in lines:
             line_number, line = item
-            if grep_pattern.search(line):
+            if grep_matcher.search(line):
                 for candidate in previous:
                     if candidate[0] > last_emitted:
                         yield candidate
@@ -1174,11 +1717,11 @@ def _select_stream_lines(
 
 
 def _add_member_output(
-    archive_stream: io.BufferedReader,
+    archive_stream: PinnedArchiveReader,
     member: ArchiveMember,
     central_start: int,
     args: argparse.Namespace,
-    grep_pattern: re.Pattern[str] | None,
+    grep_matcher: IsolatedRegexMatcher | None,
     output: OutputBudget,
     aggregate_budget: DecompressedByteBudget,
 ) -> None:
@@ -1194,7 +1737,7 @@ def _add_member_output(
     )
     selected_lines = _select_stream_lines(
         line_iterator,
-        grep_pattern=grep_pattern,
+        grep_matcher=grep_matcher,
         context=args.context,
         head=args.head,
         tail=args.tail,
@@ -1202,7 +1745,8 @@ def _add_member_output(
     try:
         collecting_output = not output.truncated
         for line_number, line in selected_lines:
-            rendered = f"{line_number}:{line}" if args.line_numbers else line
+            safe_line = _escape_terminal_text(line)
+            rendered = f"{line_number}:{safe_line}" if args.line_numbers else safe_line
             if collecting_output:
                 collecting_output = output.add(rendered)
         for _ in line_iterator:
@@ -1258,33 +1802,46 @@ def _archive_errors() -> tuple[type[BaseException], ...]:
 def cmd_zip_list(args: argparse.Namespace) -> int:
     zip_path = pathlib.Path(args.zip_path)
     try:
-        pattern = _compile_pattern(args.match, args.ignore_case) if args.match else None
-        with _open_pinned_archive(
-            zip_path,
-            args.max_archive_bytes,
-        ) as archive_stream:
-            directory = _preflight_central_directory(
-                archive_stream,
-                max_archive_members=args.max_archive_members,
-                max_central_directory_bytes=args.max_central_directory_bytes,
-            )
-            with zipfile.ZipFile(archive_stream) as archive:
-                members = _validated_members(
-                    archive,
-                    directory,
-                    args.max_archive_members,
+        regex_budget = RegexMatchBudget()
+        with contextlib.ExitStack() as workers:
+            matcher = (
+                workers.enter_context(
+                    IsolatedRegexMatcher(
+                        args.match,
+                        ignore_case=args.ignore_case,
+                        budget=regex_budget,
+                    )
                 )
-                output = OutputBudget(args.limit, args.max_output_chars)
-                for member in members:
-                    if pattern and not pattern.search(member.identity.decoded_name):
-                        continue
-                    if not output.add(
-                        f"{member.info.file_size}\t"
-                        f"{member.info.compress_size}\t"
-                        f"{_render_archive_member(member)}",
-                        allow_line_truncation=False,
-                    ):
-                        break
+                if args.match
+                else None
+            )
+            with _open_pinned_archive(
+                zip_path,
+                args.max_archive_bytes,
+            ) as archive_stream:
+                directory = _preflight_central_directory(
+                    archive_stream,
+                    max_archive_members=args.max_archive_members,
+                    max_central_directory_bytes=args.max_central_directory_bytes,
+                )
+                with zipfile.ZipFile(archive_stream) as archive:
+                    members = _validated_members(
+                        archive,
+                        directory,
+                        args.max_archive_members,
+                    )
+                    output = OutputBudget(args.limit, args.max_output_chars)
+                    for member in members:
+                        if matcher and not matcher.search(member.identity.decoded_name):
+                            continue
+                        if not output.add(
+                            f"{member.info.file_size}\t"
+                            f"{member.info.compress_size}\t"
+                            f"{_render_archive_member(member)}",
+                            allow_line_truncation=False,
+                        ):
+                            break
+                archive_stream.validate_unchanged()
     except _archive_errors() + (re.error,) as error:
         print(f"error={error}", file=sys.stderr)
         return 1
@@ -1332,7 +1889,7 @@ def _report_ambiguous_members(matches: list[ArchiveMember]) -> None:
         print(line, file=sys.stderr)
 
 
-def _validate_show_args(args: argparse.Namespace) -> re.Pattern[str] | None:
+def _validate_show_args(args: argparse.Namespace) -> None:
     if args.head > args.max_output_lines:
         raise ArtifactLimitError(
             f"head exceeds max output lines: {args.head} > {args.max_output_lines}"
@@ -1347,72 +1904,99 @@ def _validate_show_args(args: argparse.Namespace) -> re.Pattern[str] | None:
             f"{args.context} > {args.max_output_lines}"
         )
     codecs.lookup(args.encoding)
-    return _compile_pattern(args.grep, args.ignore_case) if args.grep else None
 
 
 def cmd_zip_show(args: argparse.Namespace) -> int:
     zip_path = pathlib.Path(args.zip_path)
     try:
-        grep_pattern = _validate_show_args(args)
-        with _open_pinned_archive(
-            zip_path,
-            args.max_archive_bytes,
-        ) as archive_stream:
-            directory = _preflight_central_directory(
-                archive_stream,
-                max_archive_members=args.max_archive_members,
-                max_central_directory_bytes=args.max_central_directory_bytes,
+        _validate_show_args(args)
+        regex_budget = RegexMatchBudget()
+        with contextlib.ExitStack() as workers:
+            member_matcher = (
+                workers.enter_context(
+                    IsolatedRegexMatcher(
+                        args.member,
+                        ignore_case=args.ignore_case,
+                        budget=regex_budget,
+                    )
+                )
+                if args.regex
+                else None
             )
-            with zipfile.ZipFile(archive_stream) as archive:
-                members = _validated_members(
-                    archive,
-                    directory,
-                    args.max_archive_members,
-                )
-                matches = _find_members(
-                    members,
-                    args.member,
-                    args.regex,
-                    args.ignore_case,
-                )
-                if not matches:
-                    print("error=no matching members", file=sys.stderr)
-                    return 1
-                if len(matches) > 1 and not args.all:
-                    _report_ambiguous_members(matches)
-                    return 1
-                if args.all and len(matches) > args.max_members:
-                    print(
-                        "error=matching members exceed limit: "
-                        f"{len(matches)} > {args.max_members}",
-                        file=sys.stderr,
+            grep_matcher = (
+                workers.enter_context(
+                    IsolatedRegexMatcher(
+                        args.grep,
+                        ignore_case=args.ignore_case,
+                        budget=regex_budget,
                     )
-                    return 1
-
-                selected = matches if args.all else matches[:1]
-                _preflight_selected_members(selected, args)
-                output = OutputBudget(
-                    args.max_output_lines,
-                    args.max_output_chars,
                 )
-                aggregate_budget = DecompressedByteBudget(args.max_total_member_bytes)
-                for index, member in enumerate(selected):
-                    if index and not output.truncated:
-                        output.add("")
-                    if not output.truncated:
-                        output.add(
-                            f"== {_render_archive_member(member)} ==",
-                            allow_line_truncation=False,
+                if args.grep
+                else None
+            )
+            with _open_pinned_archive(
+                zip_path,
+                args.max_archive_bytes,
+            ) as archive_stream:
+                directory = _preflight_central_directory(
+                    archive_stream,
+                    max_archive_members=args.max_archive_members,
+                    max_central_directory_bytes=args.max_central_directory_bytes,
+                )
+                with zipfile.ZipFile(archive_stream) as archive:
+                    members = _validated_members(
+                        archive,
+                        directory,
+                        args.max_archive_members,
+                    )
+                    matches = _find_members(
+                        members,
+                        args.member,
+                        args.regex,
+                        args.ignore_case,
+                        member_matcher,
+                    )
+                    if not matches:
+                        print("error=no matching members", file=sys.stderr)
+                        return 1
+                    if len(matches) > 1 and not args.all:
+                        _report_ambiguous_members(matches)
+                        return 1
+                    if args.all and len(matches) > args.max_members:
+                        print(
+                            "error=matching members exceed limit: "
+                            f"{len(matches)} > {args.max_members}",
+                            file=sys.stderr,
                         )
-                    _add_member_output(
-                        archive_stream,
-                        member,
-                        directory.central_start,
-                        args,
-                        grep_pattern,
-                        output,
-                        aggregate_budget,
+                        return 1
+
+                    selected = matches if args.all else matches[:1]
+                    _preflight_selected_members(selected, args)
+                    output = OutputBudget(
+                        args.max_output_lines,
+                        args.max_output_chars,
                     )
+                    aggregate_budget = DecompressedByteBudget(
+                        args.max_total_member_bytes
+                    )
+                    for index, member in enumerate(selected):
+                        if index and not output.truncated:
+                            output.add("")
+                        if not output.truncated:
+                            output.add(
+                                f"== {_render_archive_member(member)} ==",
+                                allow_line_truncation=False,
+                            )
+                        _add_member_output(
+                            archive_stream,
+                            member,
+                            directory.central_start,
+                            args,
+                            grep_matcher,
+                            output,
+                            aggregate_budget,
+                        )
+                archive_stream.validate_unchanged()
     except _archive_errors() + (re.error,) as error:
         print(f"error={error}", file=sys.stderr)
         return 1
@@ -1538,6 +2122,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
+    if sys.argv[1:] == [REGEX_WORKER_ARG]:
+        return _regex_worker_main()
     parser = build_parser()
     args = parser.parse_args()
     return args.func(args)

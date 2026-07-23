@@ -111,13 +111,18 @@ and 100,000 lines; cap an input line at 131,072 characters; cap selected members
 at 32 MiB total; and cap displayed output at 200 lines and 65,536 characters.
 Narrow the selection before raising a cap.
 
-The helper opens the archive once and holds that file descriptor through member
-selection and reading. This protects archive object identity against path
-replacement. It does not freeze the content of the same underlying object
-against concurrent in-place mutation.
+The helper opens the archive once, records the initially accepted file size,
+and holds that file descriptor through member selection and reading. Its
+reader exposes that initial size as the only EOF and rejects later file-size
+growth or shrinkage before seeks and reads. This protects archive object identity
+against path replacement and preserves the accepted extent, but it does not
+freeze same-size content changes to the underlying object.
 
 Before constructing Python `ZipInfo` objects, it reads EOCD/ZIP64 metadata and
 sequentially counts bounded central-directory records from that same descriptor.
+It rejects prefixed or concatenated ZIP views and multi-disk member starts.
+Before extracting a selected member, it rejects general-purpose flags other
+than the implemented data-descriptor and UTF-8-name semantics.
 For extraction, it accepts only stored and DEFLATE members. Python's BZIP2 and
 LZMA ZIP paths can allocate decompressor-internal output or dictionaries before
 the helper can enforce its actual-byte budget, so the helper rejects those
@@ -126,6 +131,11 @@ declared compressed span in bounded chunks, count actual decompressed bytes,
 and verify stream termination, absence of trailing compressed data, file size,
 CRC, local-header metadata, and any data descriptor before buffered output is
 published.
+
+User-provided member, listing, and line-filter regular expressions run only in
+terminable isolated workers under per-match and command-wide deadlines.
+Decoded member text escapes terminal control and non-printing characters before
+output character accounting and publication.
 
 ## 5. Report Decisive Evidence
 
