@@ -420,21 +420,33 @@ def _find_eocd(
     stream: io.BufferedReader,
     archive_size: int,
 ) -> tuple[int, tuple[int, int, int, int, int, int]]:
+    """Return the one EOCD view whose declared comment reaches physical EOF.
+
+    The bounded tail can contain an entire second ZIP inside the outer EOCD
+    comment.  Both EOCD records then describe individually valid parser views,
+    so choosing the last one would hide the outer view.  Enumerate the fixed
+    65,557-byte window once and fail closed as soon as a second EOF-bound
+    candidate appears.  Raw signatures are not counted or capped.
+    """
+
     tail_size = min(
         archive_size,
         EOCD_MIN_SIZE + EOCD_MAX_COMMENT,
     )
     tail_start = archive_size - tail_size
     tail = _read_exact_at(stream, tail_start, tail_size)
-    search_end = len(tail)
+    search_start = 0
+    candidate: tuple[int, tuple[int, int, int, int, int, int]] | None = None
+    last_signature_offset = -1
     while True:
-        relative_offset = tail.rfind(
+        relative_offset = tail.find(
             EOCD_SIGNATURE,
-            0,
-            search_end,
+            search_start,
         )
         if relative_offset < 0:
-            raise zipfile.BadZipFile("end-of-central-directory record not found")
+            break
+        last_signature_offset = relative_offset
+        search_start = relative_offset + 1
         if relative_offset + EOCD_MIN_SIZE <= len(tail):
             fields = struct.unpack_from(
                 "<4s4H2LH",
@@ -443,18 +455,12 @@ def _find_eocd(
             )
             comment_length = fields[-1]
             if relative_offset + EOCD_MIN_SIZE + comment_length == len(tail):
-                if (
-                    tail.find(
-                        EOCD_SIGNATURE,
-                        relative_offset + 1,
-                    )
-                    >= 0
-                ):
+                if candidate is not None:
                     raise zipfile.BadZipFile(
                         "ambiguous end-of-central-directory signature"
                     )
-                return (
-                    tail_start + relative_offset,
+                candidate = (
+                    relative_offset,
                     (
                         fields[1],
                         fields[2],
@@ -464,7 +470,16 @@ def _find_eocd(
                         fields[6],
                     ),
                 )
-        search_end = relative_offset
+
+    if candidate is None:
+        raise zipfile.BadZipFile("end-of-central-directory record not found")
+    relative_offset, eocd = candidate
+    if relative_offset != last_signature_offset:
+        raise zipfile.BadZipFile("ambiguous end-of-central-directory signature")
+    return (
+        tail_start + relative_offset,
+        eocd,
+    )
 
 
 def _read_zip64_directory_metadata(

@@ -54,6 +54,23 @@ class ArchiveTriageTests(unittest.TestCase):
         archive_path.write_bytes(prefix + archive_bytes)
         return archive_path, prefix
 
+    def _make_dual_view_archive(self, directory: Path) -> Path:
+        outer_path = directory / "outer.zip"
+        with zipfile.ZipFile(outer_path, "w") as archive:
+            archive.writestr("outer.txt", "outer\n")
+        outer = bytearray(outer_path.read_bytes())
+        outer_eocd_offset = outer.rfind(MODULE.EOCD_SIGNATURE)
+        self.assertGreaterEqual(outer_eocd_offset, 0)
+
+        inner_buffer = io.BytesIO()
+        with zipfile.ZipFile(inner_buffer, "w") as archive:
+            archive.writestr("inner.txt", "inner\n")
+        inner = inner_buffer.getvalue()
+        self.assertLessEqual(len(inner), MODULE.EOCD_MAX_COMMENT)
+        struct.pack_into("<H", outer, outer_eocd_offset + 20, len(inner))
+        outer_path.write_bytes(outer + inner)
+        return outer_path
+
     def _corrupt_member_payload_tail(
         self,
         archive_path: Path,
@@ -522,6 +539,88 @@ class ArchiveTriageTests(unittest.TestCase):
             "ambiguous end-of-central-directory signature",
             stderr.getvalue(),
         )
+
+    def test_zip_preflight_rejects_nested_dual_view_archive(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            archive_path = self._make_dual_view_archive(Path(temp_dir))
+            with zipfile.ZipFile(archive_path) as archive:
+                self.assertEqual(archive.namelist(), ["inner.txt"])
+
+            outer_bytes = archive_path.read_bytes()
+            outer_eocd_offset = outer_bytes.find(MODULE.EOCD_SIGNATURE)
+            inner_eocd_offset = outer_bytes.rfind(MODULE.EOCD_SIGNATURE)
+            self.assertGreater(inner_eocd_offset, outer_eocd_offset)
+            outer_comment_length = struct.unpack_from(
+                "<H",
+                outer_bytes,
+                outer_eocd_offset + 20,
+            )[0]
+            inner_comment_length = struct.unpack_from(
+                "<H",
+                outer_bytes,
+                inner_eocd_offset + 20,
+            )[0]
+            self.assertEqual(
+                outer_eocd_offset + MODULE.EOCD_MIN_SIZE + outer_comment_length,
+                len(outer_bytes),
+            )
+            self.assertEqual(
+                inner_eocd_offset + MODULE.EOCD_MIN_SIZE + inner_comment_length,
+                len(outer_bytes),
+            )
+
+            real_zipfile = zipfile.ZipFile
+            stderr = io.StringIO()
+            with mock.patch.object(
+                MODULE.zipfile,
+                "ZipFile",
+                wraps=real_zipfile,
+            ) as constructor:
+                with redirect_stderr(stderr):
+                    rc = MODULE.cmd_zip_list(self._list_args(archive_path))
+
+        self.assertEqual(rc, 1)
+        constructor.assert_not_called()
+        self.assertIn(
+            "ambiguous end-of-central-directory signature",
+            stderr.getvalue(),
+        )
+
+    def test_zip_preflight_does_not_cap_unverified_eocd_signatures(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            archive_path = self._make_archive(Path(temp_dir))
+            invalid_candidate = MODULE.EOCD_SIGNATURE + (b"\0" * 18)
+            archive_path.write_bytes(
+                (invalid_candidate * 2_048) + archive_path.read_bytes()
+            )
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                rc = MODULE.cmd_zip_list(self._list_args(archive_path))
+
+        self.assertEqual(rc, 0, stderr.getvalue())
+        self.assertIn("logs/console.txt", stdout.getvalue())
+
+    def test_single_eocd_candidate_variants_are_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            directory = Path(temp_dir)
+            ordinary_path = self._make_archive(directory)
+            prefixed_path = directory / "prefixed.zip"
+            prefix = b"self-extracting-prefix"
+            prefixed_path.write_bytes(prefix + ordinary_path.read_bytes())
+            zip64_path, _ = self._make_prefixed_zip64_archive(directory)
+
+            cases = {
+                "ordinary": ordinary_path,
+                "prefixed": prefixed_path,
+                "zip64": zip64_path,
+            }
+            for label, archive_path in cases.items():
+                with self.subTest(case=label):
+                    stderr = io.StringIO()
+                    with redirect_stdout(io.StringIO()), redirect_stderr(stderr):
+                        rc = MODULE.cmd_zip_list(self._list_args(archive_path))
+                    self.assertEqual(rc, 0, stderr.getvalue())
 
     def test_zip64_preflight_accepts_bounded_directory_metadata(self) -> None:
         central_header = bytearray(MODULE.CENTRAL_DIRECTORY_HEADER_SIZE)
