@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import codecs
 import collections
 import contextlib
@@ -16,6 +17,17 @@ import struct
 import sys
 import zipfile
 from collections.abc import Iterator
+from dataclasses import dataclass
+
+try:
+    from lzma import LZMAError as LzmaError
+except ImportError:
+    LzmaError = None
+
+try:
+    from zlib import error as ZlibError
+except ImportError:
+    ZlibError = None
 
 
 DEFAULT_LIST_LIMIT = 200
@@ -31,6 +43,9 @@ DEFAULT_MAX_OUTPUT_LINES = 200
 DEFAULT_MAX_OUTPUT_CHARS = 64 * 1024
 DEFAULT_CANDIDATE_REPORT_LIMIT = 20
 DEFAULT_MAX_MEMBER_NAME_CHARS = 512
+DEFAULT_MAX_RAW_MEMBER_NAME_BYTES = 512
+DEFAULT_MAX_MEMBER_IDENTITY_CHARS = 1_536
+DEFAULT_MAX_ERROR_DETAIL_CHARS = 1_024
 DEFAULT_MAX_AMBIGUITY_REPORT_LINES = DEFAULT_CANDIDATE_REPORT_LIMIT + 2
 DEFAULT_MAX_AMBIGUITY_REPORT_CHARS = DEFAULT_MAX_OUTPUT_CHARS
 AMBIGUITY_NOTICE_RESERVE_CHARS = 128
@@ -44,6 +59,7 @@ ZIP64_EOCD_SIGNATURE = b"PK\x06\x06"
 ZIP64_EOCD_MIN_SIZE = 56
 CENTRAL_DIRECTORY_SIGNATURE = b"PK\x01\x02"
 CENTRAL_DIRECTORY_HEADER_SIZE = 46
+UTF8_FILENAME_FLAG = 0x800
 
 
 class ArtifactLimitError(ValueError):
@@ -52,6 +68,21 @@ class ArtifactLimitError(ValueError):
 
 class MemberReadError(ValueError):
     pass
+
+
+@dataclass(frozen=True)
+class CentralDirectoryIdentity:
+    ordinal: int
+    raw_name: bytes
+    decoded_name: str
+    flag_bits: int
+
+
+@dataclass(frozen=True)
+class ArchiveMember:
+    info: zipfile.ZipInfo
+    identity: CentralDirectoryIdentity
+    rendered_identity: str
 
 
 class DecompressedByteBudget:
@@ -244,10 +275,13 @@ def _find_eocd(
             )
             comment_length = fields[-1]
             if relative_offset + EOCD_MIN_SIZE + comment_length == len(tail):
-                if tail.find(
-                    EOCD_SIGNATURE,
-                    relative_offset + 1,
-                ) >= 0:
+                if (
+                    tail.find(
+                        EOCD_SIGNATURE,
+                        relative_offset + 1,
+                    )
+                    >= 0
+                ):
                     raise zipfile.BadZipFile(
                         "ambiguous end-of-central-directory signature"
                     )
@@ -310,16 +344,42 @@ def _read_zip64_directory_metadata(
     return total_entries, central_size, fields[9], zip64_offset
 
 
-def _count_central_directory_entries(
+def _decode_central_directory_name(
+    raw_name: bytes,
+    *,
+    flag_bits: int,
+    ordinal: int,
+) -> str:
+    if len(raw_name) > DEFAULT_MAX_RAW_MEMBER_NAME_BYTES:
+        raise ArtifactLimitError(
+            "central-directory member raw name exceeds max bytes: "
+            f"ordinal={ordinal}; {len(raw_name)} > "
+            f"{DEFAULT_MAX_RAW_MEMBER_NAME_BYTES}"
+        )
+    if b"\0" in raw_name:
+        raise zipfile.BadZipFile(
+            f"central-directory member name contains a NUL byte: ordinal={ordinal}"
+        )
+    if flag_bits & UTF8_FILENAME_FLAG:
+        try:
+            return raw_name.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise zipfile.BadZipFile(
+                f"central-directory member has an invalid UTF-8 name: ordinal={ordinal}"
+            ) from error
+    return raw_name.decode("cp437")
+
+
+def _read_central_directory_identities(
     stream: io.BufferedReader,
     *,
     central_start: int,
     central_size: int,
     max_archive_members: int,
-) -> int:
+) -> list[CentralDirectoryIdentity]:
     central_end = central_start + central_size
     cursor = central_start
-    count = 0
+    identities: list[CentralDirectoryIdentity] = []
     while cursor < central_end:
         header = _read_exact_at(
             stream,
@@ -341,16 +401,40 @@ def _count_central_directory_entries(
         )
         if cursor + record_size > central_end:
             raise zipfile.BadZipFile("central-directory entry exceeds its bounds")
-        count += 1
-        if count > max_archive_members:
+        ordinal = len(identities) + 1
+        if ordinal > max_archive_members:
             raise ArtifactLimitError(
-                "archive member count exceeds limit: "
-                f"> {max_archive_members}"
+                f"archive member count exceeds limit: > {max_archive_members}"
             )
+        if filename_length > DEFAULT_MAX_RAW_MEMBER_NAME_BYTES:
+            raise ArtifactLimitError(
+                "central-directory member raw name exceeds max bytes: "
+                f"ordinal={ordinal}; {filename_length} > "
+                f"{DEFAULT_MAX_RAW_MEMBER_NAME_BYTES}"
+            )
+        raw_name = _read_exact_at(
+            stream,
+            cursor + CENTRAL_DIRECTORY_HEADER_SIZE,
+            filename_length,
+        )
+        flag_bits = struct.unpack_from("<H", header, 8)[0]
+        decoded_name = _decode_central_directory_name(
+            raw_name,
+            flag_bits=flag_bits,
+            ordinal=ordinal,
+        )
+        identity = CentralDirectoryIdentity(
+            ordinal=ordinal,
+            raw_name=raw_name,
+            decoded_name=decoded_name,
+            flag_bits=flag_bits,
+        )
+        _render_member_identity(identity)
+        identities.append(identity)
         cursor += record_size
     if cursor != central_end:
         raise zipfile.BadZipFile("central-directory size mismatch")
-    return count
+    return identities
 
 
 def _preflight_central_directory(
@@ -358,7 +442,7 @@ def _preflight_central_directory(
     *,
     max_archive_members: int,
     max_central_directory_bytes: int,
-) -> None:
+) -> list[CentralDirectoryIdentity]:
     archive_size = os.fstat(stream.fileno()).st_size
     eocd_offset, eocd = _find_eocd(stream, archive_size)
     (
@@ -407,47 +491,95 @@ def _preflight_central_directory(
     if central_offset > central_start:
         raise zipfile.BadZipFile("invalid central-directory offset")
 
-    counted_entries = _count_central_directory_entries(
+    identities = _read_central_directory_identities(
         stream,
         central_start=central_start,
         central_size=central_size,
         max_archive_members=max_archive_members,
     )
-    if counted_entries != total_entries:
+    if len(identities) != total_entries:
         raise zipfile.BadZipFile(
             "declared and counted central-directory entries differ"
         )
+    return identities
 
 
-def _validated_infos(
+def _render_member_identity(identity: CentralDirectoryIdentity) -> str:
+    _escape_member_name(identity.decoded_name)
+    rendered = json.dumps(
+        {
+            "flag_bits": identity.flag_bits,
+            "name": identity.decoded_name,
+            "ordinal": identity.ordinal,
+            "raw_name_b64": base64.b64encode(identity.raw_name).decode("ascii"),
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    if len(rendered) > DEFAULT_MAX_MEMBER_IDENTITY_CHARS:
+        raise ArtifactLimitError(
+            "rendered member identity exceeds max characters: "
+            f"ordinal={identity.ordinal}; {len(rendered)} > "
+            f"{DEFAULT_MAX_MEMBER_IDENTITY_CHARS}"
+        )
+    return rendered
+
+
+def _validated_members(
     archive: zipfile.ZipFile,
+    identities: list[CentralDirectoryIdentity],
     max_archive_members: int,
-) -> list[zipfile.ZipInfo]:
+) -> list[ArchiveMember]:
     infos = archive.infolist()
     if len(infos) > max_archive_members:
         raise ArtifactLimitError(
-            "archive member count exceeds limit: "
-            f"{len(infos)} > {max_archive_members}"
+            f"archive member count exceeds limit: {len(infos)} > {max_archive_members}"
         )
-    return infos
+    if len(infos) != len(identities):
+        raise zipfile.BadZipFile("ZipInfo and central-directory member counts differ")
+
+    members = []
+    for info, identity in zip(infos, identities, strict=True):
+        if info.orig_filename != identity.decoded_name:
+            raise zipfile.BadZipFile(
+                "ZipInfo and central-directory names differ: "
+                f"ordinal={identity.ordinal}"
+            )
+        if info.flag_bits != identity.flag_bits:
+            raise zipfile.BadZipFile(
+                "ZipInfo and central-directory flags differ: "
+                f"ordinal={identity.ordinal}"
+            )
+        members.append(
+            ArchiveMember(
+                info=info,
+                identity=identity,
+                rendered_identity=_render_member_identity(identity),
+            )
+        )
+    return members
 
 
 def _find_members(
-    infos: list[zipfile.ZipInfo],
+    members: list[ArchiveMember],
     needle: str,
     use_regex: bool,
     ignore_case: bool,
-) -> list[zipfile.ZipInfo]:
+) -> list[ArchiveMember]:
     if use_regex:
         pattern = _compile_pattern(needle, ignore_case)
-        return [info for info in infos if pattern.search(info.filename)]
+        return [
+            member for member in members if pattern.search(member.identity.decoded_name)
+        ]
 
     compare = needle.lower() if ignore_case else needle
     matches = []
-    for info in infos:
-        candidate = info.filename.lower() if ignore_case else info.filename
+    for member in members:
+        name = member.identity.decoded_name
+        candidate = name.lower() if ignore_case else name
         if candidate == compare:
-            matches.append(info)
+            matches.append(member)
     return matches
 
 
@@ -464,21 +596,22 @@ def _escape_member_name(name: str) -> str:
 
 
 def _validate_member_budget(
-    info: zipfile.ZipInfo,
-    escaped_name: str,
+    member: ArchiveMember,
     *,
     max_member_bytes: int,
     total_member_bytes: int,
     max_total_member_bytes: int,
 ) -> int:
+    info = member.info
     if info.is_dir():
         raise ValueError(
-            f"member is not a regular file: member={escaped_name}"
+            f"member is not a regular file: member={member.rendered_identity}"
         )
     if info.file_size > max_member_bytes:
         raise ArtifactLimitError(
             "member exceeds max bytes: "
-            f"member={escaped_name}; {info.file_size} > {max_member_bytes}"
+            f"member={member.rendered_identity}; "
+            f"{info.file_size} > {max_member_bytes}"
         )
     next_total = total_member_bytes + info.file_size
     if next_total > max_total_member_bytes:
@@ -489,25 +622,20 @@ def _validate_member_budget(
     return next_total
 
 
-def _prepare_selected_members(
-    selected: list[zipfile.ZipInfo],
+def _preflight_selected_members(
+    selected: list[ArchiveMember],
     args: argparse.Namespace,
-) -> list[tuple[zipfile.ZipInfo, str]]:
-    """Escape names and preflight every selected metadata budget."""
+) -> None:
+    """Preflight every selected member metadata budget."""
 
-    prepared: list[tuple[zipfile.ZipInfo, str]] = []
     total_member_bytes = 0
-    for info in selected:
-        escaped_name = _escape_member_name(info.filename)
+    for member in selected:
         total_member_bytes = _validate_member_budget(
-            info,
-            escaped_name,
+            member,
             max_member_bytes=args.max_member_bytes,
             total_member_bytes=total_member_bytes,
             max_total_member_bytes=args.max_total_member_bytes,
         )
-        prepared.append((info, escaped_name))
-    return prepared
 
 
 def _iter_member_lines(
@@ -541,14 +669,12 @@ def _iter_member_lines(
                 break
             if len(raw_line) > max_input_line_chars:
                 raise ArtifactLimitError(
-                    "input line exceeds max characters: "
-                    f"> {max_input_line_chars}"
+                    f"input line exceeds max characters: > {max_input_line_chars}"
                 )
             line_number += 1
             if line_number > max_member_lines:
                 raise ArtifactLimitError(
-                    "member line count exceeds limit: "
-                    f"> {max_member_lines}"
+                    f"member line count exceeds limit: > {max_member_lines}"
                 )
             yield line_number, raw_line.rstrip("\r\n")
     finally:
@@ -564,9 +690,7 @@ def _select_stream_lines(
     tail: int,
 ) -> Iterator[tuple[int, str]]:
     if grep_pattern:
-        previous: collections.deque[tuple[int, str]] = collections.deque(
-            maxlen=context
-        )
+        previous: collections.deque[tuple[int, str]] = collections.deque(maxlen=context)
         last_emitted = 0
         trailing = 0
         for item in lines:
@@ -611,8 +735,7 @@ def _select_stream_lines(
 
 def _add_member_output(
     archive: zipfile.ZipFile,
-    info: zipfile.ZipInfo,
-    escaped_name: str,
+    member: ArchiveMember,
     args: argparse.Namespace,
     grep_pattern: re.Pattern[str] | None,
     output: OutputBudget,
@@ -620,7 +743,7 @@ def _add_member_output(
 ) -> None:
     line_iterator = _iter_member_lines(
         archive,
-        info,
+        member.info,
         encoding=args.encoding,
         max_member_bytes=args.max_member_bytes,
         aggregate_budget=aggregate_budget,
@@ -643,18 +766,43 @@ def _add_member_output(
         for _ in line_iterator:
             pass
     except _archive_errors() as error:
-        detail = json.dumps(str(error), ensure_ascii=True)
+        error_type, detail = _bounded_member_error(error, member)
         raise MemberReadError(
-            f"member={escaped_name} read failed: "
-            f"type={type(error).__name__}; detail={detail}"
+            f"member={member.rendered_identity} read failed: "
+            f"type={error_type}; detail={detail}"
         ) from error
     finally:
         selected_lines.close()
         line_iterator.close()
 
 
+def _bounded_member_error(
+    error: BaseException,
+    member: ArchiveMember,
+) -> tuple[str, str]:
+    if ZlibError is not None and isinstance(error, ZlibError):
+        error_type = "zlib.error"
+        detail_text = "invalid deflate stream"
+    elif LzmaError is not None and isinstance(error, LzmaError):
+        error_type = "lzma.LZMAError"
+        detail_text = "invalid LZMA stream"
+    elif member.info.compress_type == zipfile.ZIP_BZIP2 and isinstance(error, OSError):
+        error_type = "OSError"
+        detail_text = "invalid BZIP2 stream"
+    else:
+        error_type = type(error).__name__
+        detail_text = str(error)
+
+    detail = json.dumps(detail_text, ensure_ascii=True)
+    if len(detail) > DEFAULT_MAX_ERROR_DETAIL_CHARS:
+        detail = json.dumps(
+            "diagnostic omitted because its escaped form exceeds the limit"
+        )
+    return error_type, detail
+
+
 def _archive_errors() -> tuple[type[BaseException], ...]:
-    return (
+    errors: tuple[type[BaseException], ...] = (
         ArtifactLimitError,
         EOFError,
         KeyError,
@@ -667,38 +815,39 @@ def _archive_errors() -> tuple[type[BaseException], ...]:
         zipfile.BadZipFile,
         zipfile.LargeZipFile,
     )
+    optional_errors = tuple(
+        error for error in (ZlibError, LzmaError) if error is not None
+    )
+    return errors + optional_errors
 
 
 def cmd_zip_list(args: argparse.Namespace) -> int:
     zip_path = pathlib.Path(args.zip_path)
     try:
-        pattern = (
-            _compile_pattern(args.match, args.ignore_case)
-            if args.match
-            else None
-        )
+        pattern = _compile_pattern(args.match, args.ignore_case) if args.match else None
         with _open_pinned_archive(
             zip_path,
             args.max_archive_bytes,
         ) as archive_stream:
-            _preflight_central_directory(
+            identities = _preflight_central_directory(
                 archive_stream,
                 max_archive_members=args.max_archive_members,
                 max_central_directory_bytes=args.max_central_directory_bytes,
             )
             with zipfile.ZipFile(archive_stream) as archive:
-                infos = _validated_infos(
+                members = _validated_members(
                     archive,
+                    identities,
                     args.max_archive_members,
                 )
                 output = OutputBudget(args.limit, args.max_output_chars)
-                for info in infos:
-                    if pattern and not pattern.search(info.filename):
+                for member in members:
+                    if pattern and not pattern.search(member.identity.decoded_name):
                         continue
-                    escaped_name = _escape_member_name(info.filename)
                     if not output.add(
-                        f"{info.file_size}\t{info.compress_size}\t"
-                        f"{escaped_name}",
+                        f"{member.info.file_size}\t"
+                        f"{member.info.compress_size}\t"
+                        f"{member.rendered_identity}",
                         allow_line_truncation=False,
                     ):
                         break
@@ -715,16 +864,15 @@ def cmd_zip_list(args: argparse.Namespace) -> int:
     return 0
 
 
-def _report_ambiguous_members(matches: list[zipfile.ZipInfo]) -> None:
+def _report_ambiguous_members(matches: list[ArchiveMember]) -> None:
     lines = ["error=multiple matching members"]
     char_count = len(lines[0]) + 1
     report_char_limit = (
-        DEFAULT_MAX_AMBIGUITY_REPORT_CHARS
-        - AMBIGUITY_NOTICE_RESERVE_CHARS
+        DEFAULT_MAX_AMBIGUITY_REPORT_CHARS - AMBIGUITY_NOTICE_RESERVE_CHARS
     )
     reported = 0
-    for info in matches[:DEFAULT_CANDIDATE_REPORT_LIMIT]:
-        candidate = f"member={_escape_member_name(info.filename)}"
+    for member in matches[:DEFAULT_CANDIDATE_REPORT_LIMIT]:
+        candidate = f"member={member.rendered_identity}"
         if (
             len(lines) >= DEFAULT_MAX_AMBIGUITY_REPORT_LINES - 1
             or char_count + len(candidate) + 1 > report_char_limit
@@ -753,13 +901,11 @@ def _report_ambiguous_members(matches: list[zipfile.ZipInfo]) -> None:
 def _validate_show_args(args: argparse.Namespace) -> re.Pattern[str] | None:
     if args.head > args.max_output_lines:
         raise ArtifactLimitError(
-            "head exceeds max output lines: "
-            f"{args.head} > {args.max_output_lines}"
+            f"head exceeds max output lines: {args.head} > {args.max_output_lines}"
         )
     if args.tail > args.max_output_lines:
         raise ArtifactLimitError(
-            "tail exceeds max output lines: "
-            f"{args.tail} > {args.max_output_lines}"
+            f"tail exceeds max output lines: {args.tail} > {args.max_output_lines}"
         )
     if args.context > args.max_output_lines:
         raise ArtifactLimitError(
@@ -767,11 +913,7 @@ def _validate_show_args(args: argparse.Namespace) -> re.Pattern[str] | None:
             f"{args.context} > {args.max_output_lines}"
         )
     codecs.lookup(args.encoding)
-    return (
-        _compile_pattern(args.grep, args.ignore_case)
-        if args.grep
-        else None
-    )
+    return _compile_pattern(args.grep, args.ignore_case) if args.grep else None
 
 
 def cmd_zip_show(args: argparse.Namespace) -> int:
@@ -782,18 +924,19 @@ def cmd_zip_show(args: argparse.Namespace) -> int:
             zip_path,
             args.max_archive_bytes,
         ) as archive_stream:
-            _preflight_central_directory(
+            identities = _preflight_central_directory(
                 archive_stream,
                 max_archive_members=args.max_archive_members,
                 max_central_directory_bytes=args.max_central_directory_bytes,
             )
             with zipfile.ZipFile(archive_stream) as archive:
-                infos = _validated_infos(
+                members = _validated_members(
                     archive,
+                    identities,
                     args.max_archive_members,
                 )
                 matches = _find_members(
-                    infos,
+                    members,
                     args.member,
                     args.regex,
                     args.ignore_case,
@@ -813,26 +956,23 @@ def cmd_zip_show(args: argparse.Namespace) -> int:
                     return 1
 
                 selected = matches if args.all else matches[:1]
-                prepared = _prepare_selected_members(selected, args)
+                _preflight_selected_members(selected, args)
                 output = OutputBudget(
                     args.max_output_lines,
                     args.max_output_chars,
                 )
-                aggregate_budget = DecompressedByteBudget(
-                    args.max_total_member_bytes
-                )
-                for index, (info, escaped_name) in enumerate(prepared):
+                aggregate_budget = DecompressedByteBudget(args.max_total_member_bytes)
+                for index, member in enumerate(selected):
                     if index and not output.truncated:
                         output.add("")
                     if not output.truncated:
                         output.add(
-                            f"== {escaped_name} ==",
+                            f"== {member.rendered_identity} ==",
                             allow_line_truncation=False,
                         )
                     _add_member_output(
                         archive,
-                        info,
-                        escaped_name,
+                        member,
                         args,
                         grep_pattern,
                         output,

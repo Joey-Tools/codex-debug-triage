@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import importlib.util
 import io
 import json
@@ -57,6 +58,109 @@ class ArchiveTriageTests(unittest.TestCase):
         data[payload_offset + info.compress_size - 1] ^= 0x01
         archive_path.write_bytes(data)
 
+    def _corrupt_member_compressed_stream(
+        self,
+        archive_path: Path,
+        member_name: str,
+        compression: int,
+    ) -> None:
+        with zipfile.ZipFile(archive_path) as archive:
+            info = archive.getinfo(member_name)
+
+        data = bytearray(archive_path.read_bytes())
+        header_offset = info.header_offset
+        name_length, extra_length = struct.unpack_from(
+            "<HH",
+            data,
+            header_offset + 26,
+        )
+        payload_offset = header_offset + 30 + name_length + extra_length
+        corrupt_offset = payload_offset
+        if compression == zipfile.ZIP_LZMA:
+            properties_length = struct.unpack_from(
+                "<H",
+                data,
+                payload_offset + 2,
+            )[0]
+            corrupt_offset += 4 + properties_length
+        payload_end = payload_offset + info.compress_size
+        self.assertLess(corrupt_offset, payload_end)
+        data[corrupt_offset:payload_end] = b"\xff" * (payload_end - corrupt_offset)
+        archive_path.write_bytes(data)
+
+    def _central_directory_records(
+        self,
+        data: bytes | bytearray,
+    ) -> list[tuple[int, int, int]]:
+        eocd_offset = data.rfind(MODULE.EOCD_SIGNATURE)
+        self.assertGreaterEqual(eocd_offset, 0)
+        entry_count = struct.unpack_from("<H", data, eocd_offset + 10)[0]
+        cursor = struct.unpack_from("<L", data, eocd_offset + 16)[0]
+        records = []
+        for _ in range(entry_count):
+            self.assertEqual(
+                data[cursor : cursor + 4],
+                MODULE.CENTRAL_DIRECTORY_SIGNATURE,
+            )
+            name_length, extra_length, comment_length = struct.unpack_from(
+                "<3H",
+                data,
+                cursor + 28,
+            )
+            name_offset = cursor + MODULE.CENTRAL_DIRECTORY_HEADER_SIZE
+            records.append((cursor, name_offset, name_length))
+            cursor += (
+                MODULE.CENTRAL_DIRECTORY_HEADER_SIZE
+                + name_length
+                + extra_length
+                + comment_length
+            )
+        return records
+
+    def _replace_member_name_byte(
+        self,
+        archive_path: Path,
+        *,
+        ordinal: int,
+        byte_index: int,
+        replacement: int,
+    ) -> None:
+        with zipfile.ZipFile(archive_path) as archive:
+            info = archive.infolist()[ordinal - 1]
+
+        data = bytearray(archive_path.read_bytes())
+        local_name_length = struct.unpack_from(
+            "<H",
+            data,
+            info.header_offset + 26,
+        )[0]
+        self.assertLess(byte_index, local_name_length)
+        local_name_offset = info.header_offset + 30
+        data[local_name_offset + byte_index] = replacement
+
+        _, central_name_offset, central_name_length = self._central_directory_records(
+            data
+        )[ordinal - 1]
+        self.assertEqual(central_name_length, local_name_length)
+        data[central_name_offset + byte_index] = replacement
+        archive_path.write_bytes(data)
+
+    def _parse_identity(self, rendered: str) -> dict[str, object]:
+        identity = json.loads(rendered)
+        self.assertEqual(
+            set(identity),
+            {"flag_bits", "name", "ordinal", "raw_name_b64"},
+        )
+        raw_name = base64.b64decode(
+            identity["raw_name_b64"],
+            validate=True,
+        )
+        encoding = (
+            "utf-8" if identity["flag_bits"] & MODULE.UTF8_FILENAME_FLAG else "cp437"
+        )
+        self.assertEqual(raw_name.decode(encoding), identity["name"])
+        return identity
+
     def _list_args(
         self,
         archive_path: Path,
@@ -69,9 +173,7 @@ class ArchiveTriageTests(unittest.TestCase):
             "limit": MODULE.DEFAULT_LIST_LIMIT,
             "max_archive_bytes": MODULE.DEFAULT_MAX_ARCHIVE_BYTES,
             "max_archive_members": MODULE.DEFAULT_MAX_ARCHIVE_MEMBERS,
-            "max_central_directory_bytes": (
-                MODULE.DEFAULT_MAX_CENTRAL_DIRECTORY_BYTES
-            ),
+            "max_central_directory_bytes": (MODULE.DEFAULT_MAX_CENTRAL_DIRECTORY_BYTES),
             "max_output_chars": MODULE.DEFAULT_MAX_OUTPUT_CHARS,
         }
         values.update(overrides)
@@ -96,9 +198,7 @@ class ArchiveTriageTests(unittest.TestCase):
             "line_numbers": False,
             "max_archive_bytes": MODULE.DEFAULT_MAX_ARCHIVE_BYTES,
             "max_archive_members": MODULE.DEFAULT_MAX_ARCHIVE_MEMBERS,
-            "max_central_directory_bytes": (
-                MODULE.DEFAULT_MAX_CENTRAL_DIRECTORY_BYTES
-            ),
+            "max_central_directory_bytes": (MODULE.DEFAULT_MAX_CENTRAL_DIRECTORY_BYTES),
             "max_members": MODULE.DEFAULT_MAX_MEMBERS,
             "max_member_bytes": MODULE.DEFAULT_MAX_MEMBER_BYTES,
             "max_total_member_bytes": MODULE.DEFAULT_MAX_TOTAL_MEMBER_BYTES,
@@ -126,7 +226,11 @@ class ArchiveTriageTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         lines = stdout.getvalue().splitlines()
         self.assertEqual(len(lines), 1)
-        self.assertTrue(lines[0].endswith('\t"logs/worker.log"'))
+        fields = lines[0].split("\t", 2)
+        self.assertEqual(len(fields), 3)
+        identity = self._parse_identity(fields[2])
+        self.assertEqual(identity["name"], "logs/worker.log")
+        self.assertEqual(identity["ordinal"], 2)
 
     def test_zip_show_filters_with_context_and_line_numbers(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -143,15 +247,14 @@ class ArchiveTriageTests(unittest.TestCase):
                 rc = MODULE.cmd_zip_show(args)
 
         self.assertEqual(rc, 0)
+        lines = stdout.getvalue().splitlines()
         self.assertEqual(
-            stdout.getvalue().splitlines(),
-            [
-                '== "logs/console.txt" ==',
-                "1:alpha",
-                "2:ERROR boom",
-                "3:gamma",
-            ],
+            lines[1:],
+            ["1:alpha", "2:ERROR boom", "3:gamma"],
         )
+        identity = self._parse_identity(lines[0][3:-3])
+        self.assertEqual(identity["name"], "logs/console.txt")
+        self.assertEqual(identity["ordinal"], 1)
 
     def test_zip_show_requires_all_for_multiple_regex_matches(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -167,13 +270,18 @@ class ArchiveTriageTests(unittest.TestCase):
                 rc = MODULE.cmd_zip_show(args)
 
         self.assertEqual(rc, 1)
+        lines = stderr.getvalue().splitlines()
+        self.assertEqual(lines[0], "error=multiple matching members")
+        identities = [
+            self._parse_identity(line.removeprefix("member=")) for line in lines[1:]
+        ]
         self.assertEqual(
-            stderr.getvalue().splitlines(),
-            [
-                "error=multiple matching members",
-                'member="logs/console.txt"',
-                'member="logs/worker.log"',
-            ],
+            [identity["name"] for identity in identities],
+            ["logs/console.txt", "logs/worker.log"],
+        )
+        self.assertEqual(
+            [identity["ordinal"] for identity in identities],
+            [1, 2],
         )
 
     def test_zip_show_reports_missing_member(self) -> None:
@@ -479,8 +587,244 @@ class ArchiveTriageTests(unittest.TestCase):
 
         self.assertEqual(rc, 1)
         self.assertEqual(stdout.getvalue(), "")
-        self.assertIn('member="logs/two.log"', stderr.getvalue())
+        self.assertIn('"name":"logs/two.log"', stderr.getvalue())
         self.assertIn("Bad CRC-32", stderr.getvalue())
+
+    def test_malformed_compressed_later_member_is_bounded_failure(
+        self,
+    ) -> None:
+        cases = [
+            (
+                "deflate",
+                zipfile.ZIP_DEFLATED,
+                "zlib.error",
+                "invalid deflate stream",
+            ),
+            (
+                "lzma",
+                zipfile.ZIP_LZMA,
+                "lzma.LZMAError",
+                "invalid LZMA stream",
+            ),
+            (
+                "bzip2",
+                zipfile.ZIP_BZIP2,
+                "OSError",
+                "invalid BZIP2 stream",
+            ),
+        ]
+        for label, compression, error_type, detail in cases:
+            with self.subTest(compression=label):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    archive_path = Path(temp_dir) / f"{label}.zip"
+                    with zipfile.ZipFile(archive_path, "w") as archive:
+                        archive.writestr(
+                            "logs/first.log",
+                            "first\n" + ("one\n" * 100),
+                            compress_type=zipfile.ZIP_STORED,
+                        )
+                        archive.writestr(
+                            "logs/broken.log",
+                            "second\n" + ("two\n" * 20_000),
+                            compress_type=compression,
+                        )
+                    self._corrupt_member_compressed_stream(
+                        archive_path,
+                        "logs/broken.log",
+                        compression,
+                    )
+                    args = self._show_args(
+                        archive_path,
+                        member=r"logs/.*",
+                        regex=True,
+                        all=True,
+                        head=1,
+                        max_output_chars=1,
+                    )
+                    stdout = io.StringIO()
+                    stderr = io.StringIO()
+                    with redirect_stdout(stdout), redirect_stderr(stderr):
+                        rc = MODULE.cmd_zip_show(args)
+
+                self.assertEqual(rc, 1)
+                self.assertEqual(stdout.getvalue(), "")
+                error_text = stderr.getvalue()
+                self.assertEqual(len(error_text.splitlines()), 1)
+                self.assertLessEqual(
+                    len(error_text),
+                    MODULE.DEFAULT_MAX_OUTPUT_CHARS,
+                )
+                self.assertNotIn("Traceback", error_text)
+                self.assertIn('"ordinal":2', error_text)
+                self.assertIn(f"type={error_type}", error_text)
+                self.assertIn(detail, error_text)
+
+    def test_zipfile_member_error_detail_is_bounded_and_single_line(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            archive_path = self._make_archive(Path(temp_dir))
+            oversized_detail = ("raw-name-fragment" * 10_000) + "\nINJECTED"
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with mock.patch.object(
+                MODULE.zipfile.ZipFile,
+                "open",
+                side_effect=zipfile.BadZipFile(oversized_detail),
+            ):
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    rc = MODULE.cmd_zip_show(self._show_args(archive_path, head=1))
+
+        self.assertEqual(rc, 1)
+        self.assertEqual(stdout.getvalue(), "")
+        error_text = stderr.getvalue()
+        self.assertEqual(len(error_text.splitlines()), 1)
+        self.assertLessEqual(
+            len(error_text),
+            MODULE.DEFAULT_MAX_MEMBER_IDENTITY_CHARS
+            + MODULE.DEFAULT_MAX_ERROR_DETAIL_CHARS,
+        )
+        self.assertNotIn("raw-name-fragment", error_text)
+        self.assertNotIn("INJECTED", error_text)
+        self.assertIn("diagnostic omitted", error_text)
+
+    def test_duplicate_physical_members_have_distinct_identities(
+        self,
+    ) -> None:
+        duplicate_name = "logs/duplicate.log"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            archive_path = Path(temp_dir) / "duplicates.zip"
+            with self.assertWarns(UserWarning):
+                with zipfile.ZipFile(archive_path, "w") as archive:
+                    archive.writestr(duplicate_name, "first\n")
+                    archive.writestr(duplicate_name, "second\n")
+
+            list_stdout = io.StringIO()
+            with redirect_stdout(list_stdout):
+                list_rc = MODULE.cmd_zip_list(self._list_args(archive_path))
+
+            ambiguous_stderr = io.StringIO()
+            with redirect_stderr(ambiguous_stderr):
+                ambiguous_rc = MODULE.cmd_zip_show(
+                    self._show_args(
+                        archive_path,
+                        member=duplicate_name,
+                        head=1,
+                    )
+                )
+
+            opened_infos = []
+            real_open = zipfile.ZipFile.open
+
+            def tracking_open(
+                archive: zipfile.ZipFile,
+                member: object,
+                *args: object,
+                **kwargs: object,
+            ) -> object:
+                opened_infos.append(member)
+                return real_open(archive, member, *args, **kwargs)
+
+            show_stdout = io.StringIO()
+            with mock.patch.object(
+                MODULE.zipfile.ZipFile,
+                "open",
+                new=tracking_open,
+            ):
+                with redirect_stdout(show_stdout):
+                    show_rc = MODULE.cmd_zip_show(
+                        self._show_args(
+                            archive_path,
+                            member=duplicate_name,
+                            all=True,
+                            head=1,
+                        )
+                    )
+
+        self.assertEqual(list_rc, 0)
+        list_identities = [
+            self._parse_identity(line.split("\t", 2)[2])
+            for line in list_stdout.getvalue().splitlines()
+        ]
+        self.assertEqual(
+            [identity["ordinal"] for identity in list_identities],
+            [1, 2],
+        )
+        self.assertEqual(
+            [identity["name"] for identity in list_identities],
+            [duplicate_name, duplicate_name],
+        )
+        self.assertEqual(
+            list_identities[0]["raw_name_b64"],
+            list_identities[1]["raw_name_b64"],
+        )
+
+        self.assertEqual(ambiguous_rc, 1)
+        ambiguity_identities = [
+            self._parse_identity(line.removeprefix("member="))
+            for line in ambiguous_stderr.getvalue().splitlines()
+            if line.startswith("member=")
+        ]
+        self.assertEqual(
+            [identity["ordinal"] for identity in ambiguity_identities],
+            [1, 2],
+        )
+
+        self.assertEqual(show_rc, 0)
+        show_lines = show_stdout.getvalue().splitlines()
+        self.assertEqual(show_lines[1], "first")
+        self.assertEqual(show_lines[4], "second")
+        heading_identities = [
+            self._parse_identity(line[3:-3])
+            for line in show_lines
+            if line.startswith("== ")
+        ]
+        self.assertEqual(
+            [identity["ordinal"] for identity in heading_identities],
+            [1, 2],
+        )
+        self.assertEqual(len(opened_infos), 2)
+        self.assertIsInstance(opened_infos[0], zipfile.ZipInfo)
+        self.assertIsInstance(opened_infos[1], zipfile.ZipInfo)
+        self.assertIsNot(opened_infos[0], opened_infos[1])
+
+    def test_nul_bearing_central_name_is_rejected_before_zipfile(
+        self,
+    ) -> None:
+        original_name = "logs/nulXname.log"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            archive_path = Path(temp_dir) / "nul-name.zip"
+            with zipfile.ZipFile(archive_path, "w") as archive:
+                archive.writestr(original_name, "content\n")
+            self._replace_member_name_byte(
+                archive_path,
+                ordinal=1,
+                byte_index=original_name.index("X"),
+                replacement=0,
+            )
+
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            real_zipfile = zipfile.ZipFile
+            with mock.patch.object(
+                MODULE.zipfile,
+                "ZipFile",
+                wraps=real_zipfile,
+            ) as constructor:
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    rc = MODULE.cmd_zip_list(self._list_args(archive_path))
+
+        self.assertEqual(rc, 1)
+        constructor.assert_not_called()
+        self.assertEqual(stdout.getvalue(), "")
+        error_text = stderr.getvalue()
+        self.assertEqual(len(error_text.splitlines()), 1)
+        self.assertLessEqual(
+            len(error_text),
+            MODULE.DEFAULT_MAX_OUTPUT_CHARS,
+        )
+        self.assertIn("name contains a NUL byte: ordinal=1", error_text)
+        self.assertNotIn("\0", error_text)
 
     def test_member_names_are_reversible_and_single_line_everywhere(
         self,
@@ -542,9 +886,9 @@ class ArchiveTriageTests(unittest.TestCase):
         )
         listed_names = []
         for line in list_lines:
-            fields = line.split("\t")
+            fields = line.split("\t", 2)
             self.assertEqual(len(fields), 3)
-            listed_names.append(json.loads(fields[2]))
+            listed_names.append(self._parse_identity(fields[2])["name"])
         self.assertEqual(listed_names, names)
 
         self.assertEqual(ambiguous_rc, 1)
@@ -558,7 +902,7 @@ class ArchiveTriageTests(unittest.TestCase):
             MODULE.DEFAULT_MAX_AMBIGUITY_REPORT_CHARS,
         )
         ambiguous_names = [
-            json.loads(line.removeprefix("member="))
+            self._parse_identity(line.removeprefix("member="))["name"]
             for line in ambiguity_lines
             if line.startswith("member=")
         ]
@@ -572,7 +916,7 @@ class ArchiveTriageTests(unittest.TestCase):
             show_args.max_output_chars,
         )
         heading_names = [
-            json.loads(line[3:-3])
+            self._parse_identity(line[3:-3])["name"]
             for line in show_lines
             if line.startswith("== ")
         ]
@@ -605,27 +949,38 @@ class ArchiveTriageTests(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertEqual(stdout.getvalue(), "")
         self.assertEqual(len(stderr.getvalue().splitlines()), 1)
-        self.assertIn(
-            f"member={json.dumps(directory_name, ensure_ascii=True)}",
-            stderr.getvalue(),
+        rendered_identity = (
+            stderr.getvalue()
+            .rstrip()
+            .split(
+                "member=",
+                1,
+            )[1]
         )
+        identity = self._parse_identity(rendered_identity)
+        self.assertEqual(identity["name"], directory_name)
+        self.assertEqual(identity["ordinal"], 1)
 
-    def test_oversized_escaped_member_name_fails_without_partial_output(
+    def test_long_nul_suffix_fails_without_partial_or_unbounded_output(
         self,
     ) -> None:
-        long_name = f"logs/{'x' * 600}.log"
+        long_name = f"logs/X{'x' * 600}.log"
         with tempfile.TemporaryDirectory() as temp_dir:
             archive_path = Path(temp_dir) / "long-name.zip"
             with zipfile.ZipFile(archive_path, "w") as archive:
                 archive.writestr("logs/first.log", "first\n")
                 archive.writestr(long_name, "second\n")
+            self._replace_member_name_byte(
+                archive_path,
+                ordinal=2,
+                byte_index=long_name.index("X"),
+                replacement=0,
+            )
 
             list_stdout = io.StringIO()
             list_stderr = io.StringIO()
             with redirect_stdout(list_stdout), redirect_stderr(list_stderr):
-                list_rc = MODULE.cmd_zip_list(
-                    self._list_args(archive_path)
-                )
+                list_rc = MODULE.cmd_zip_list(self._list_args(archive_path))
 
             show_stdout = io.StringIO()
             show_stderr = io.StringIO()
@@ -650,9 +1005,10 @@ class ArchiveTriageTests(unittest.TestCase):
                 MODULE.DEFAULT_MAX_OUTPUT_CHARS,
             )
             self.assertIn(
-                "escaped member name exceeds max characters",
+                "central-directory member raw name exceeds max bytes",
                 error_text,
             )
+            self.assertNotIn("x" * 80, error_text)
 
     def test_parser_rejects_negative_window(self) -> None:
         parser = MODULE.build_parser()
@@ -698,9 +1054,10 @@ class ArchiveTriageTests(unittest.TestCase):
             )
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertTrue(
-            result.stdout.rstrip().endswith('\t"logs/console.txt"')
-        )
+        fields = result.stdout.rstrip().split("\t", 2)
+        self.assertEqual(len(fields), 3)
+        identity = self._parse_identity(fields[2])
+        self.assertEqual(identity["name"], "logs/console.txt")
 
 
 class BugTriageDocumentationTests(unittest.TestCase):
@@ -732,9 +1089,9 @@ class BugTriageDocumentationTests(unittest.TestCase):
         self.assertNotIn("urllib.request", generic_text)
 
     def test_local_recipe_budgets_artifact_reads(self) -> None:
-        recipe = (
-            SKILL_ROOT / "references/local-artifact-recipes.md"
-        ).read_text(encoding="utf-8")
+        recipe = (SKILL_ROOT / "references/local-artifact-recipes.md").read_text(
+            encoding="utf-8"
+        )
 
         self.assertIn("Start with bounded metadata and candidate names", recipe)
         self.assertIn("Use filenames and counts first", recipe)
@@ -747,9 +1104,9 @@ class BugTriageDocumentationTests(unittest.TestCase):
         self.assertIn("Before constructing Python `ZipInfo` objects", recipe)
 
     def test_private_migration_contract_is_explicit(self) -> None:
-        migration = (
-            REPO_ROOT / "docs/cisco-build-artifacts-migration.md"
-        ).read_text(encoding="utf-8")
+        migration = (REPO_ROOT / "docs/cisco-build-artifacts-migration.md").read_text(
+            encoding="utf-8"
+        )
 
         self.assertIn("probe-url <url>", migration)
         self.assertIn("show-url <url>", migration)
