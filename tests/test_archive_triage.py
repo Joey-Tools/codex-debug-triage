@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import io
+import json
 import os
 import subprocess
 import struct
@@ -34,6 +35,27 @@ class ArchiveTriageTests(unittest.TestCase):
             archive.writestr("logs/worker.log", "ready\ntimeout waiting\ndone\n")
             archive.writestr("metadata.json", '{"result": "failed"}\n')
         return archive_path
+
+    def _corrupt_member_payload_tail(
+        self,
+        archive_path: Path,
+        member_name: str,
+    ) -> None:
+        with zipfile.ZipFile(archive_path) as archive:
+            info = archive.getinfo(member_name)
+
+        data = bytearray(archive_path.read_bytes())
+        header_offset = info.header_offset
+        self.assertEqual(data[header_offset : header_offset + 4], b"PK\x03\x04")
+        name_length, extra_length = struct.unpack_from(
+            "<HH",
+            data,
+            header_offset + 26,
+        )
+        payload_offset = header_offset + 30 + name_length + extra_length
+        self.assertGreater(info.compress_size, 0)
+        data[payload_offset + info.compress_size - 1] ^= 0x01
+        archive_path.write_bytes(data)
 
     def _list_args(
         self,
@@ -104,7 +126,7 @@ class ArchiveTriageTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         lines = stdout.getvalue().splitlines()
         self.assertEqual(len(lines), 1)
-        self.assertTrue(lines[0].endswith("\tlogs/worker.log"))
+        self.assertTrue(lines[0].endswith('\t"logs/worker.log"'))
 
     def test_zip_show_filters_with_context_and_line_numbers(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -124,7 +146,7 @@ class ArchiveTriageTests(unittest.TestCase):
         self.assertEqual(
             stdout.getvalue().splitlines(),
             [
-                "== logs/console.txt ==",
+                '== "logs/console.txt" ==',
                 "1:alpha",
                 "2:ERROR boom",
                 "3:gamma",
@@ -149,8 +171,8 @@ class ArchiveTriageTests(unittest.TestCase):
             stderr.getvalue().splitlines(),
             [
                 "error=multiple matching members",
-                "logs/console.txt",
-                "logs/worker.log",
+                'member="logs/console.txt"',
+                'member="logs/worker.log"',
             ],
         )
 
@@ -388,6 +410,7 @@ class ArchiveTriageTests(unittest.TestCase):
                 member=r"logs/.*",
                 regex=True,
                 all=True,
+                max_output_chars=24,
                 max_total_member_bytes=30,
             )
             stdout = io.StringIO()
@@ -398,6 +421,238 @@ class ArchiveTriageTests(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertEqual(stdout.getvalue(), "")
         self.assertIn("aggregate max bytes", stderr.getvalue())
+
+    def test_zip_show_head_drain_detects_tail_crc_corruption(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            archive_path = Path(temp_dir) / "corrupt-tail.zip"
+            content = "first\n" + ("filler line\n" * 20_000)
+            with zipfile.ZipFile(archive_path, "w") as archive:
+                archive.writestr("logs/large.log", content)
+            self._corrupt_member_payload_tail(
+                archive_path,
+                "logs/large.log",
+            )
+            args = self._show_args(
+                archive_path,
+                member="logs/large.log",
+                head=1,
+            )
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                rc = MODULE.cmd_zip_show(args)
+
+        self.assertEqual(rc, 1)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("Bad CRC-32", stderr.getvalue())
+
+    def test_zip_show_all_drains_later_member_after_output_truncation(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            archive_path = Path(temp_dir) / "corrupt-later.zip"
+            with zipfile.ZipFile(archive_path, "w") as archive:
+                archive.writestr(
+                    "logs/one.log",
+                    "first\n" + ("one\n" * 100),
+                )
+                archive.writestr(
+                    "logs/two.log",
+                    "second\n" + ("two\n" * 20_000),
+                )
+            self._corrupt_member_payload_tail(
+                archive_path,
+                "logs/two.log",
+            )
+            args = self._show_args(
+                archive_path,
+                member=r"logs/.*",
+                regex=True,
+                all=True,
+                head=1,
+                max_output_chars=28,
+            )
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                rc = MODULE.cmd_zip_show(args)
+
+        self.assertEqual(rc, 1)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn('member="logs/two.log"', stderr.getvalue())
+        self.assertIn("Bad CRC-32", stderr.getvalue())
+
+    def test_member_names_are_reversible_and_single_line_everywhere(
+        self,
+    ) -> None:
+        names = [
+            "logs/line\nbreak.txt",
+            r"logs/line\nbreak.txt",
+            "logs/tab\tcr\rreturn\x1b\\tail.txt",
+        ]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            archive_path = Path(temp_dir) / "names.zip"
+            with zipfile.ZipFile(archive_path, "w") as archive:
+                for name in names:
+                    archive.writestr(name, "ok\n")
+
+            list_args = self._list_args(archive_path)
+            list_stdout = io.StringIO()
+            with redirect_stdout(list_stdout):
+                list_rc = MODULE.cmd_zip_list(list_args)
+
+            ambiguous_args = self._show_args(
+                archive_path,
+                member=r"^logs/",
+                regex=True,
+                head=1,
+            )
+            ambiguous_stderr = io.StringIO()
+            with redirect_stderr(ambiguous_stderr):
+                ambiguous_rc = MODULE.cmd_zip_show(ambiguous_args)
+
+            show_args = self._show_args(
+                archive_path,
+                member=r"^logs/",
+                regex=True,
+                all=True,
+                head=1,
+                max_output_lines=12,
+                max_output_chars=512,
+            )
+            show_stdout = io.StringIO()
+            with redirect_stdout(show_stdout):
+                show_rc = MODULE.cmd_zip_show(show_args)
+
+            tiny_args = self._list_args(
+                archive_path,
+                max_output_chars=20,
+            )
+            tiny_stdout = io.StringIO()
+            tiny_stderr = io.StringIO()
+            with redirect_stdout(tiny_stdout), redirect_stderr(tiny_stderr):
+                tiny_rc = MODULE.cmd_zip_list(tiny_args)
+
+        self.assertEqual(list_rc, 0)
+        list_lines = list_stdout.getvalue().splitlines()
+        self.assertEqual(len(list_lines), len(names))
+        self.assertLessEqual(
+            len(list_stdout.getvalue()),
+            list_args.max_output_chars,
+        )
+        listed_names = []
+        for line in list_lines:
+            fields = line.split("\t")
+            self.assertEqual(len(fields), 3)
+            listed_names.append(json.loads(fields[2]))
+        self.assertEqual(listed_names, names)
+
+        self.assertEqual(ambiguous_rc, 1)
+        ambiguity_lines = ambiguous_stderr.getvalue().splitlines()
+        self.assertLessEqual(
+            len(ambiguity_lines),
+            MODULE.DEFAULT_MAX_AMBIGUITY_REPORT_LINES,
+        )
+        self.assertLessEqual(
+            len(ambiguous_stderr.getvalue()),
+            MODULE.DEFAULT_MAX_AMBIGUITY_REPORT_CHARS,
+        )
+        ambiguous_names = [
+            json.loads(line.removeprefix("member="))
+            for line in ambiguity_lines
+            if line.startswith("member=")
+        ]
+        self.assertEqual(ambiguous_names, names)
+
+        self.assertEqual(show_rc, 0)
+        show_lines = show_stdout.getvalue().splitlines()
+        self.assertLessEqual(len(show_lines), show_args.max_output_lines)
+        self.assertLessEqual(
+            len(show_stdout.getvalue()),
+            show_args.max_output_chars,
+        )
+        heading_names = [
+            json.loads(line[3:-3])
+            for line in show_lines
+            if line.startswith("== ")
+        ]
+        self.assertEqual(heading_names, names)
+        self.assertEqual(len(set(heading_names)), len(names))
+
+        for rendered_line in list_lines + ambiguity_lines + show_lines:
+            self.assertNotIn("\r", rendered_line)
+            self.assertNotIn("\x1b", rendered_line)
+
+        self.assertEqual(tiny_rc, 0)
+        self.assertEqual(tiny_stdout.getvalue(), "")
+        self.assertIn("notice=output truncated", tiny_stderr.getvalue())
+
+    def test_member_name_in_error_uses_canonical_escape(self) -> None:
+        directory_name = "logs/control\n\t\x1b\\/"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            archive_path = Path(temp_dir) / "directory-name.zip"
+            with zipfile.ZipFile(archive_path, "w") as archive:
+                archive.writestr(directory_name, b"")
+            args = self._show_args(
+                archive_path,
+                member=directory_name,
+            )
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                rc = MODULE.cmd_zip_show(args)
+
+        self.assertEqual(rc, 1)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(len(stderr.getvalue().splitlines()), 1)
+        self.assertIn(
+            f"member={json.dumps(directory_name, ensure_ascii=True)}",
+            stderr.getvalue(),
+        )
+
+    def test_oversized_escaped_member_name_fails_without_partial_output(
+        self,
+    ) -> None:
+        long_name = f"logs/{'x' * 600}.log"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            archive_path = Path(temp_dir) / "long-name.zip"
+            with zipfile.ZipFile(archive_path, "w") as archive:
+                archive.writestr("logs/first.log", "first\n")
+                archive.writestr(long_name, "second\n")
+
+            list_stdout = io.StringIO()
+            list_stderr = io.StringIO()
+            with redirect_stdout(list_stdout), redirect_stderr(list_stderr):
+                list_rc = MODULE.cmd_zip_list(
+                    self._list_args(archive_path)
+                )
+
+            show_stdout = io.StringIO()
+            show_stderr = io.StringIO()
+            with redirect_stdout(show_stdout), redirect_stderr(show_stderr):
+                show_rc = MODULE.cmd_zip_show(
+                    self._show_args(
+                        archive_path,
+                        member=r"^logs/",
+                        regex=True,
+                        all=True,
+                    )
+                )
+
+        self.assertEqual(list_rc, 1)
+        self.assertEqual(show_rc, 1)
+        self.assertEqual(list_stdout.getvalue(), "")
+        self.assertEqual(show_stdout.getvalue(), "")
+        for error_text in (list_stderr.getvalue(), show_stderr.getvalue()):
+            self.assertEqual(len(error_text.splitlines()), 1)
+            self.assertLessEqual(
+                len(error_text),
+                MODULE.DEFAULT_MAX_OUTPUT_CHARS,
+            )
+            self.assertIn(
+                "escaped member name exceeds max characters",
+                error_text,
+            )
 
     def test_parser_rejects_negative_window(self) -> None:
         parser = MODULE.build_parser()
@@ -443,7 +698,9 @@ class ArchiveTriageTests(unittest.TestCase):
             )
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertTrue(result.stdout.rstrip().endswith("\tlogs/console.txt"))
+        self.assertTrue(
+            result.stdout.rstrip().endswith('\t"logs/console.txt"')
+        )
 
 
 class BugTriageDocumentationTests(unittest.TestCase):

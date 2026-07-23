@@ -7,6 +7,7 @@ import codecs
 import collections
 import contextlib
 import io
+import json
 import os
 import pathlib
 import re
@@ -30,6 +31,9 @@ DEFAULT_MAX_OUTPUT_LINES = 200
 DEFAULT_MAX_OUTPUT_CHARS = 64 * 1024
 DEFAULT_CANDIDATE_REPORT_LIMIT = 20
 DEFAULT_MAX_MEMBER_NAME_CHARS = 512
+DEFAULT_MAX_AMBIGUITY_REPORT_LINES = DEFAULT_CANDIDATE_REPORT_LIMIT + 2
+DEFAULT_MAX_AMBIGUITY_REPORT_CHARS = DEFAULT_MAX_OUTPUT_CHARS
+AMBIGUITY_NOTICE_RESERVE_CHARS = 128
 TRUNCATION_MARKER = "... [truncated]"
 EOCD_SIGNATURE = b"PK\x05\x06"
 EOCD_MIN_SIZE = 22
@@ -46,6 +50,68 @@ class ArtifactLimitError(ValueError):
     pass
 
 
+class MemberReadError(ValueError):
+    pass
+
+
+class DecompressedByteBudget:
+    """Track actual decompressed bytes across all selected members."""
+
+    def __init__(self, max_total_bytes: int) -> None:
+        self.max_total_bytes = max_total_bytes
+        self.total_bytes = 0
+
+    def consume(self, byte_count: int) -> None:
+        next_total = self.total_bytes + byte_count
+        if next_total > self.max_total_bytes:
+            raise ArtifactLimitError(
+                "decompressed members exceed aggregate max bytes: "
+                f"{next_total} > {self.max_total_bytes}"
+            )
+        self.total_bytes = next_total
+
+
+class BoundedMemberReader(io.RawIOBase):
+    """Count actual decompressed bytes returned by one ZipExtFile."""
+
+    def __init__(
+        self,
+        raw_stream: zipfile.ZipExtFile,
+        *,
+        max_member_bytes: int,
+        aggregate_budget: DecompressedByteBudget,
+    ) -> None:
+        super().__init__()
+        self._raw_stream = raw_stream
+        self._max_member_bytes = max_member_bytes
+        self._aggregate_budget = aggregate_budget
+        self._member_bytes = 0
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, buffer: object) -> int | None:
+        byte_count = self._raw_stream.readinto(buffer)
+        if not byte_count:
+            return byte_count
+
+        next_member_bytes = self._member_bytes + byte_count
+        if next_member_bytes > self._max_member_bytes:
+            raise ArtifactLimitError(
+                "decompressed member exceeds max bytes: "
+                f"{next_member_bytes} > {self._max_member_bytes}"
+            )
+        self._aggregate_budget.consume(byte_count)
+        self._member_bytes = next_member_bytes
+        return byte_count
+
+    def close(self) -> None:
+        try:
+            self._raw_stream.close()
+        finally:
+            super().close()
+
+
 class OutputBudget:
     """Buffer bounded output until the command has completed successfully."""
 
@@ -57,7 +123,12 @@ class OutputBudget:
         self.truncated = False
         self._buffer: list[str] = []
 
-    def add(self, text: str) -> bool:
+    def add(
+        self,
+        text: str,
+        *,
+        allow_line_truncation: bool = True,
+    ) -> bool:
         if self.lines >= self.max_lines or self.chars >= self.max_chars:
             self.truncated = True
             return False
@@ -65,6 +136,9 @@ class OutputBudget:
         remaining = self.max_chars - self.chars
         rendered = text
         if len(rendered) + 1 > remaining:
+            if not allow_line_truncation:
+                self.truncated = True
+                return False
             available = remaining - len(TRUNCATION_MARKER) - 1
             if available < 0:
                 self.truncated = True
@@ -77,9 +151,10 @@ class OutputBudget:
         self.chars += len(rendered) + 1
         return not self.truncated
 
-    def flush(self) -> None:
+    def flush(self, stream: io.TextIOBase | None = None) -> None:
+        destination = stream if stream is not None else sys.stdout
         for line in self._buffer:
-            print(line)
+            print(line, file=destination)
 
 
 def _nonnegative_int(value: str) -> int:
@@ -376,18 +451,34 @@ def _find_members(
     return matches
 
 
+def _escape_member_name(name: str) -> str:
+    """Return one reversible, single-line JSON representation."""
+
+    escaped_name = json.dumps(name, ensure_ascii=True)
+    if len(escaped_name) > DEFAULT_MAX_MEMBER_NAME_CHARS:
+        raise ArtifactLimitError(
+            "escaped member name exceeds max characters: "
+            f"{len(escaped_name)} > {DEFAULT_MAX_MEMBER_NAME_CHARS}"
+        )
+    return escaped_name
+
+
 def _validate_member_budget(
     info: zipfile.ZipInfo,
+    escaped_name: str,
     *,
     max_member_bytes: int,
     total_member_bytes: int,
     max_total_member_bytes: int,
 ) -> int:
     if info.is_dir():
-        raise ValueError(f"member is not a regular file: {info.filename}")
+        raise ValueError(
+            f"member is not a regular file: member={escaped_name}"
+        )
     if info.file_size > max_member_bytes:
         raise ArtifactLimitError(
-            f"member exceeds max bytes: {info.file_size} > {max_member_bytes}"
+            "member exceeds max bytes: "
+            f"member={escaped_name}; {info.file_size} > {max_member_bytes}"
         )
     next_total = total_member_bytes + info.file_size
     if next_total > max_total_member_bytes:
@@ -398,17 +489,46 @@ def _validate_member_budget(
     return next_total
 
 
+def _prepare_selected_members(
+    selected: list[zipfile.ZipInfo],
+    args: argparse.Namespace,
+) -> list[tuple[zipfile.ZipInfo, str]]:
+    """Escape names and preflight every selected metadata budget."""
+
+    prepared: list[tuple[zipfile.ZipInfo, str]] = []
+    total_member_bytes = 0
+    for info in selected:
+        escaped_name = _escape_member_name(info.filename)
+        total_member_bytes = _validate_member_budget(
+            info,
+            escaped_name,
+            max_member_bytes=args.max_member_bytes,
+            total_member_bytes=total_member_bytes,
+            max_total_member_bytes=args.max_total_member_bytes,
+        )
+        prepared.append((info, escaped_name))
+    return prepared
+
+
 def _iter_member_lines(
     archive: zipfile.ZipFile,
     info: zipfile.ZipInfo,
     *,
     encoding: str,
+    max_member_bytes: int,
+    aggregate_budget: DecompressedByteBudget,
     max_member_lines: int,
     max_input_line_chars: int,
 ) -> Iterator[tuple[int, str]]:
     raw_stream = archive.open(info)
-    text_stream = io.TextIOWrapper(
+    bounded_stream = BoundedMemberReader(
         raw_stream,
+        max_member_bytes=max_member_bytes,
+        aggregate_budget=aggregate_budget,
+    )
+    buffered_stream = io.BufferedReader(bounded_stream)
+    text_stream = io.TextIOWrapper(
+        buffered_stream,
         encoding=encoding,
         errors="replace",
         newline=None,
@@ -492,14 +612,18 @@ def _select_stream_lines(
 def _add_member_output(
     archive: zipfile.ZipFile,
     info: zipfile.ZipInfo,
+    escaped_name: str,
     args: argparse.Namespace,
     grep_pattern: re.Pattern[str] | None,
     output: OutputBudget,
+    aggregate_budget: DecompressedByteBudget,
 ) -> None:
     line_iterator = _iter_member_lines(
         archive,
         info,
         encoding=args.encoding,
+        max_member_bytes=args.max_member_bytes,
+        aggregate_budget=aggregate_budget,
         max_member_lines=args.max_member_lines,
         max_input_line_chars=args.max_input_line_chars,
     )
@@ -511,10 +635,19 @@ def _add_member_output(
         tail=args.tail,
     )
     try:
+        collecting_output = not output.truncated
         for line_number, line in selected_lines:
             rendered = f"{line_number}:{line}" if args.line_numbers else line
-            if not output.add(rendered):
-                break
+            if collecting_output:
+                collecting_output = output.add(rendered)
+        for _ in line_iterator:
+            pass
+    except _archive_errors() as error:
+        detail = json.dumps(str(error), ensure_ascii=True)
+        raise MemberReadError(
+            f"member={escaped_name} read failed: "
+            f"type={type(error).__name__}; detail={detail}"
+        ) from error
     finally:
         selected_lines.close()
         line_iterator.close()
@@ -562,9 +695,11 @@ def cmd_zip_list(args: argparse.Namespace) -> int:
                 for info in infos:
                     if pattern and not pattern.search(info.filename):
                         continue
+                    escaped_name = _escape_member_name(info.filename)
                     if not output.add(
                         f"{info.file_size}\t{info.compress_size}\t"
-                        f"{info.filename}"
+                        f"{escaped_name}",
+                        allow_line_truncation=False,
                     ):
                         break
     except _archive_errors() + (re.error,) as error:
@@ -581,19 +716,38 @@ def cmd_zip_list(args: argparse.Namespace) -> int:
 
 
 def _report_ambiguous_members(matches: list[zipfile.ZipInfo]) -> None:
-    print("error=multiple matching members", file=sys.stderr)
+    lines = ["error=multiple matching members"]
+    char_count = len(lines[0]) + 1
+    report_char_limit = (
+        DEFAULT_MAX_AMBIGUITY_REPORT_CHARS
+        - AMBIGUITY_NOTICE_RESERVE_CHARS
+    )
+    reported = 0
     for info in matches[:DEFAULT_CANDIDATE_REPORT_LIMIT]:
-        rendered = info.filename
-        if len(rendered) > DEFAULT_MAX_MEMBER_NAME_CHARS:
-            available = DEFAULT_MAX_MEMBER_NAME_CHARS - len(TRUNCATION_MARKER)
-            rendered = f"{rendered[:available]}{TRUNCATION_MARKER}"
-        print(rendered, file=sys.stderr)
-    if len(matches) > DEFAULT_CANDIDATE_REPORT_LIMIT:
-        print(
-            "notice=additional matching members omitted: "
-            f"{len(matches) - DEFAULT_CANDIDATE_REPORT_LIMIT}",
-            file=sys.stderr,
-        )
+        candidate = f"member={_escape_member_name(info.filename)}"
+        if (
+            len(lines) >= DEFAULT_MAX_AMBIGUITY_REPORT_LINES - 1
+            or char_count + len(candidate) + 1 > report_char_limit
+        ):
+            break
+        lines.append(candidate)
+        char_count += len(candidate) + 1
+        reported += 1
+
+    omitted = len(matches) - reported
+    if omitted:
+        notice = f"notice=additional matching members omitted: {omitted}"
+        lines.append(notice)
+        char_count += len(notice) + 1
+
+    if (
+        len(lines) > DEFAULT_MAX_AMBIGUITY_REPORT_LINES
+        or char_count > DEFAULT_MAX_AMBIGUITY_REPORT_CHARS
+    ):
+        raise ArtifactLimitError("ambiguity report exceeds internal budget")
+
+    for line in lines:
+        print(line, file=sys.stderr)
 
 
 def _validate_show_args(args: argparse.Namespace) -> re.Pattern[str] | None:
@@ -658,32 +812,32 @@ def cmd_zip_show(args: argparse.Namespace) -> int:
                     )
                     return 1
 
+                selected = matches if args.all else matches[:1]
+                prepared = _prepare_selected_members(selected, args)
                 output = OutputBudget(
                     args.max_output_lines,
                     args.max_output_chars,
                 )
-                selected = matches if args.all else matches[:1]
-                total_member_bytes = 0
-                for index, info in enumerate(selected):
-                    total_member_bytes = _validate_member_budget(
-                        info,
-                        max_member_bytes=args.max_member_bytes,
-                        total_member_bytes=total_member_bytes,
-                        max_total_member_bytes=args.max_total_member_bytes,
-                    )
-                    if index and not output.add(""):
-                        break
-                    if not output.add(f"== {info.filename} =="):
-                        break
+                aggregate_budget = DecompressedByteBudget(
+                    args.max_total_member_bytes
+                )
+                for index, (info, escaped_name) in enumerate(prepared):
+                    if index and not output.truncated:
+                        output.add("")
+                    if not output.truncated:
+                        output.add(
+                            f"== {escaped_name} ==",
+                            allow_line_truncation=False,
+                        )
                     _add_member_output(
                         archive,
                         info,
+                        escaped_name,
                         args,
                         grep_pattern,
                         output,
+                        aggregate_budget,
                     )
-                    if output.truncated:
-                        break
     except _archive_errors() + (re.error,) as error:
         print(f"error={error}", file=sys.stderr)
         return 1
