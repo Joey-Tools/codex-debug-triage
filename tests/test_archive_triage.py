@@ -53,6 +53,45 @@ class ArchiveTriageTests(unittest.TestCase):
         self.assertIn(MODULE.ZIP64_LOCATOR_SIGNATURE, archive_bytes)
         return archive_path
 
+    def _make_zip64_metadata_archive(
+        self,
+        directory: Path,
+        *,
+        classic_eocd: tuple[int, int, int, int, int, int],
+    ) -> Path:
+        central_header = bytearray(MODULE.CENTRAL_DIRECTORY_HEADER_SIZE)
+        central_header[:4] = MODULE.CENTRAL_DIRECTORY_SIGNATURE
+        zip64_eocd_offset = len(central_header)
+        zip64_eocd = struct.pack(
+            "<4sQ2H2L4Q",
+            MODULE.ZIP64_EOCD_SIGNATURE,
+            MODULE.ZIP64_EOCD_MIN_SIZE - 12,
+            45,
+            45,
+            0,
+            0,
+            1,
+            1,
+            len(central_header),
+            0,
+        )
+        locator = struct.pack(
+            "<4sLQL",
+            MODULE.ZIP64_LOCATOR_SIGNATURE,
+            0,
+            zip64_eocd_offset,
+            1,
+        )
+        eocd = struct.pack(
+            "<4s4H2LH",
+            MODULE.EOCD_SIGNATURE,
+            *classic_eocd,
+            0,
+        )
+        archive_path = directory / "zip64-metadata.zip"
+        archive_path.write_bytes(bytes(central_header) + zip64_eocd + locator + eocd)
+        return archive_path
+
     def _make_dual_view_archive(self, directory: Path) -> Path:
         outer_path = directory / "outer.zip"
         with zipfile.ZipFile(outer_path, "w") as archive:
@@ -715,45 +754,18 @@ class ArchiveTriageTests(unittest.TestCase):
             stderr.getvalue(),
         )
 
-    def test_zip64_preflight_accepts_bounded_directory_metadata(self) -> None:
-        central_header = bytearray(MODULE.CENTRAL_DIRECTORY_HEADER_SIZE)
-        central_header[:4] = MODULE.CENTRAL_DIRECTORY_SIGNATURE
-        zip64_eocd_offset = len(central_header)
-        zip64_eocd = struct.pack(
-            "<4sQ2H2L4Q",
-            MODULE.ZIP64_EOCD_SIGNATURE,
-            MODULE.ZIP64_EOCD_MIN_SIZE - 12,
-            45,
-            45,
-            0,
-            0,
-            1,
-            1,
-            len(central_header),
-            0,
-        )
-        locator = struct.pack(
-            "<4sLQL",
-            MODULE.ZIP64_LOCATOR_SIGNATURE,
-            0,
-            zip64_eocd_offset,
-            1,
-        )
-        eocd = struct.pack(
-            "<4s4H2LH",
-            MODULE.EOCD_SIGNATURE,
-            0,
-            0,
-            0xFFFF,
-            0xFFFF,
-            0xFFFFFFFF,
-            0xFFFFFFFF,
-            0,
-        )
+    def test_zip64_preflight_accepts_classic_eocd_sentinels(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            archive_path = Path(temp_dir) / "zip64-metadata.zip"
-            archive_path.write_bytes(
-                bytes(central_header) + zip64_eocd + locator + eocd
+            archive_path = self._make_zip64_metadata_archive(
+                Path(temp_dir),
+                classic_eocd=(
+                    0xFFFF,
+                    0xFFFF,
+                    0xFFFF,
+                    0xFFFF,
+                    0xFFFFFFFF,
+                    0xFFFFFFFF,
+                ),
             )
             with MODULE._open_pinned_archive(
                 archive_path,
@@ -766,6 +778,100 @@ class ArchiveTriageTests(unittest.TestCase):
                         MODULE.DEFAULT_MAX_CENTRAL_DIRECTORY_BYTES
                     ),
                 )
+
+    def test_zip64_preflight_accepts_equal_classic_eocd_values(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            archive_path = self._make_zip64_metadata_archive(
+                Path(temp_dir),
+                classic_eocd=(
+                    0,
+                    0,
+                    1,
+                    1,
+                    MODULE.CENTRAL_DIRECTORY_HEADER_SIZE,
+                    0,
+                ),
+            )
+            with MODULE._open_pinned_archive(
+                archive_path,
+                MODULE.DEFAULT_MAX_ARCHIVE_BYTES,
+            ) as archive_stream:
+                MODULE._preflight_central_directory(
+                    archive_stream,
+                    max_archive_members=MODULE.DEFAULT_MAX_ARCHIVE_MEMBERS,
+                    max_central_directory_bytes=(
+                        MODULE.DEFAULT_MAX_CENTRAL_DIRECTORY_BYTES
+                    ),
+                )
+
+    def test_zip64_preflight_rejects_conflicting_classic_eocd_values(self) -> None:
+        cases = {
+            "disk-number": (1, 0, 1, 1, MODULE.CENTRAL_DIRECTORY_HEADER_SIZE, 0),
+            "central-directory-disk": (
+                0,
+                1,
+                1,
+                1,
+                MODULE.CENTRAL_DIRECTORY_HEADER_SIZE,
+                0,
+            ),
+            "entries-on-disk": (
+                0,
+                0,
+                2,
+                1,
+                MODULE.CENTRAL_DIRECTORY_HEADER_SIZE,
+                0,
+            ),
+            "total-entries": (
+                0,
+                0,
+                1,
+                2,
+                MODULE.CENTRAL_DIRECTORY_HEADER_SIZE,
+                0,
+            ),
+            "central-directory-size": (
+                0,
+                0,
+                1,
+                1,
+                MODULE.CENTRAL_DIRECTORY_HEADER_SIZE - 1,
+                0,
+            ),
+            "central-directory-offset": (
+                0,
+                0,
+                1,
+                1,
+                MODULE.CENTRAL_DIRECTORY_HEADER_SIZE,
+                1,
+            ),
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            for field, classic_eocd in cases.items():
+                with self.subTest(field=field):
+                    archive_path = self._make_zip64_metadata_archive(
+                        Path(temp_dir),
+                        classic_eocd=classic_eocd,
+                    )
+                    with MODULE._open_pinned_archive(
+                        archive_path,
+                        MODULE.DEFAULT_MAX_ARCHIVE_BYTES,
+                    ) as archive_stream:
+                        with self.assertRaisesRegex(
+                            zipfile.BadZipFile,
+                            f"field={field}",
+                        ):
+                            MODULE._preflight_central_directory(
+                                archive_stream,
+                                max_archive_members=(
+                                    MODULE.DEFAULT_MAX_ARCHIVE_MEMBERS
+                                ),
+                                max_central_directory_bytes=(
+                                    MODULE.DEFAULT_MAX_CENTRAL_DIRECTORY_BYTES
+                                ),
+                            )
 
     def test_unprefixed_forced_zip64_archive_is_accepted_for_extraction(
         self,

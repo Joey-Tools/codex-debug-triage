@@ -129,6 +129,17 @@ class CentralDirectoryLayout:
 
 
 @dataclass(frozen=True)
+class Zip64DirectoryMetadata:
+    disk_number: int
+    central_disk: int
+    entries_on_disk: int
+    total_entries: int
+    central_size: int
+    central_start: int
+    central_end: int
+
+
+@dataclass(frozen=True)
 class ArchiveMember:
     info: zipfile.ZipInfo
     identity: CentralDirectoryIdentity
@@ -942,7 +953,7 @@ def _find_eocd(
 def _read_zip64_directory_metadata(
     stream: PinnedArchiveReader,
     eocd_offset: int,
-) -> tuple[int, int, int, int]:
+) -> Zip64DirectoryMetadata:
     locator_offset = eocd_offset - ZIP64_LOCATOR_SIZE
     locator = _read_exact_at(
         stream,
@@ -995,12 +1006,35 @@ def _read_zip64_directory_metadata(
         raise zipfile.BadZipFile(
             "inconsistent ZIP64 locator and central-directory offsets"
         )
-    return (
-        total_entries,
-        central_size,
-        central_start,
-        physical_zip64_offset,
+    return Zip64DirectoryMetadata(
+        disk_number=disk_number,
+        central_disk=central_disk,
+        entries_on_disk=entries_on_disk,
+        total_entries=total_entries,
+        central_size=central_size,
+        central_start=central_start,
+        central_end=physical_zip64_offset,
     )
+
+
+def _validate_classic_eocd_against_zip64(
+    eocd: tuple[int, int, int, int, int, int],
+    metadata: Zip64DirectoryMetadata,
+) -> None:
+    comparisons = (
+        ("disk-number", eocd[0], 0xFFFF, metadata.disk_number),
+        ("central-directory-disk", eocd[1], 0xFFFF, metadata.central_disk),
+        ("entries-on-disk", eocd[2], 0xFFFF, metadata.entries_on_disk),
+        ("total-entries", eocd[3], 0xFFFF, metadata.total_entries),
+        ("central-directory-size", eocd[4], UINT32_MAX, metadata.central_size),
+        ("central-directory-offset", eocd[5], UINT32_MAX, metadata.central_start),
+    )
+    for field, classic_value, sentinel, zip64_value in comparisons:
+        if classic_value != sentinel and classic_value != zip64_value:
+            raise zipfile.BadZipFile(
+                "classic EOCD and ZIP64 metadata differ: "
+                f"field={field}; classic={classic_value}; zip64={zip64_value}"
+            )
 
 
 def _has_zip64_locator(
@@ -1212,12 +1246,12 @@ def _preflight_central_directory(
         eocd_offset,
     )
     if uses_zip64:
-        (
-            total_entries,
-            central_size,
-            central_start,
-            central_end,
-        ) = _read_zip64_directory_metadata(stream, eocd_offset)
+        zip64_metadata = _read_zip64_directory_metadata(stream, eocd_offset)
+        _validate_classic_eocd_against_zip64(eocd, zip64_metadata)
+        total_entries = zip64_metadata.total_entries
+        central_size = zip64_metadata.central_size
+        central_start = zip64_metadata.central_start
+        central_end = zip64_metadata.central_end
     else:
         if disk_number != 0 or central_disk != 0:
             raise zipfile.BadZipFile("multi-disk ZIP archives are unsupported")
