@@ -120,7 +120,12 @@ freeze same-size content changes to the underlying object.
 
 Before constructing Python `ZipInfo` objects, it reads EOCD/ZIP64 metadata and
 sequentially counts bounded central-directory records from that same descriptor.
-It rejects prefixed or concatenated ZIP views and multi-disk member starts.
+It resolves and orders every local-header offset, binds each central record to
+one matching local record, and requires those records to explain the complete
+byte range from offset zero to the central directory without gaps or unreferenced
+records. Data-descriptor width is derived from the local and central ZIP64
+extra/version/size representation rather than only the local size fields. It
+rejects prefixed or concatenated ZIP views and multi-disk member starts.
 Before extracting a selected member, it rejects general-purpose flags other
 than the implemented data-descriptor and UTF-8-name semantics.
 For extraction, it accepts only stored and DEFLATE members. Python's BZIP2 and

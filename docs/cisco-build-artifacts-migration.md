@@ -29,6 +29,49 @@ network or authentication work.
 GitHub Actions and pull-request checks bypass both skills and stay with the
 GitHub provider workflow named in the generic skill's provider boundary.
 
+## Aggregate Activation And Cutover Ordering
+
+The canonical `Joey-Tools/codex-debug-triage` merge is source history only. It
+does not mutate an installed skill link, an installed `AGENTS.md`, a private
+catalog, or a per-host `current` pointer by itself. Do not treat that merge as
+proof that the replacement provider exists on any machine.
+
+The installed cutover belongs to the `Joey-Tools/codex-private-workflows`
+aggregate. One candidate immutable private-overlay release must contain and
+validate all of these changes together:
+
+1. install the complete `personal_codex/skills/cisco-build-artifacts` source at
+   `skills/cisco-build-artifacts`
+2. update the release's private `AGENTS.md` routing to select that provider for
+   Cisco/Jenkins build acquisition
+3. update `personal_codex/private-sync-manifest.json` so the active catalog
+   includes `skills/cisco-build-artifacts` and excludes
+   `skills/bug-triage-playbook`
+4. include the `removed_links` record that removes
+   `skills/bug-triage-playbook` and names
+   `skills/cisco-build-artifacts` as its replacement
+
+Package validation must prove the provider files, routing policy, active
+catalog, and removal record belong to that same release. The private overlay
+verifier must pass before publication, and the host installer must verify the
+staged aggregate before switching the installed `current` pointer. A source
+checkout, merged private commit, open sync PR, or partially published asset is
+not a trusted release.
+
+Keep both the canonical bug-triage retirement PR and any consumer source-sync
+step blocked until the replacement private release has passed those gates and
+the installed pointer transition has been verified. If the aggregate cannot
+machine-prove this atomic activation, retain a compatible
+`bug-triage-playbook` route and omit its `removed_links` retirement; never point
+installed guidance at a provider that the same trusted release does not
+install.
+
+The non-private cutover fixture at
+`tests/fixtures/cisco-build-artifacts-migration.json` records only repository
+names, aggregate paths, transaction members, trust gates, and fallback state.
+It intentionally contains no Cisco host, credential, profile, job, or artifact
+data.
+
 ## Private Command Interface To Preserve
 
 Provide a private helper with these conceptual subcommands:

@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "canonical_repository": "Joey-Tools/codex-debug-triage",
+  "canonical_merge_changes_installed_routing": false,
+  "private_aggregate_repository": "Joey-Tools/codex-private-workflows",
+  "activation": {
+    "release_kind": "immutable-private-overlay",
+    "atomic": true,
+    "provider": {
+      "source": "personal_codex/skills/cisco-build-artifacts",
+      "target": "skills/cisco-build-artifacts"
+    },
+    "routing_policy": {
+      "source": "personal_codex/AGENTS.md",
+      "target": "AGENTS.md",
+      "remote_build_provider": "skills/cisco-build-artifacts"
+    },
+    "catalog": {
+      "manifest": "personal_codex/private-sync-manifest.json",
+      "active_target": "skills/cisco-build-artifacts",
+      "removed_target": "skills/bug-triage-playbook"
+    },
+    "removed_link": {
+      "source": "personal_codex/skills/bug-triage-playbook",
+      "target": "skills/bug-triage-playbook",
+      "replacement_target": "skills/cisco-build-artifacts"
+    }
+  },
+  "trust_gates": [
+    "private-package-validation",
+    "private-overlay-verifier",
+    "immutable-release-published",
+    "installed-current-pointer-verified"
+  ],
+  "blocked_until_trusted": [
+    "canonical-bug-triage-retirement-pr",
+    "private-consumer-source-sync"
+  ],
+  "unproved_atomicity_fallback": "retain-bug-triage-compat"
+}

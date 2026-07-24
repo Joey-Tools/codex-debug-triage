@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import ast
 import base64
+import binascii
 import importlib.util
 import io
 import json
@@ -23,6 +24,9 @@ from unittest import mock
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SKILL_ROOT = REPO_ROOT / "skills/bug-triage-playbook"
 SCRIPT_PATH = SKILL_ROOT / "scripts/archive_triage.py"
+MIGRATION_FIXTURE_PATH = (
+    REPO_ROOT / "tests/fixtures/cisco-build-artifacts-migration.json"
+)
 SPEC = importlib.util.spec_from_file_location("archive_triage", SCRIPT_PATH)
 MODULE = importlib.util.module_from_spec(SPEC)
 assert SPEC is not None
@@ -53,6 +57,74 @@ class ArchiveTriageTests(unittest.TestCase):
         self.assertIn(MODULE.ZIP64_EOCD_SIGNATURE, archive_bytes)
         self.assertIn(MODULE.ZIP64_LOCATOR_SIGNATURE, archive_bytes)
         return archive_path
+
+    def _make_local_zero_zip64_descriptor_archive(
+        self,
+        directory: Path,
+    ) -> tuple[Path, str]:
+        member_name = "logs/zip64-descriptor.log"
+        raw_name = member_name.encode("utf-8")
+        payload = b"zip64 descriptor\n"
+        crc = binascii.crc32(payload) & MODULE.UINT32_MAX
+        flags = MODULE.DATA_DESCRIPTOR_FLAG | MODULE.UTF8_FILENAME_FLAG
+        local_header = struct.pack(
+            "<4s5H3L2H",
+            MODULE.LOCAL_FILE_HEADER_SIGNATURE,
+            MODULE.ZIP64_MIN_VERSION,
+            flags,
+            zipfile.ZIP_STORED,
+            0,
+            0,
+            0,
+            0,
+            0,
+            len(raw_name),
+            0,
+        )
+        descriptor = MODULE.DATA_DESCRIPTOR_SIGNATURE + struct.pack(
+            "<LQQ",
+            crc,
+            len(payload),
+            len(payload),
+        )
+        central_start = (
+            len(local_header) + len(raw_name) + len(payload) + len(descriptor)
+        )
+        central_extra = struct.pack(
+            "<HHQQ",
+            MODULE.ZIP64_EXTRA_FIELD_ID,
+            16,
+            len(payload),
+            len(payload),
+        )
+        central_header = bytearray(MODULE.CENTRAL_DIRECTORY_HEADER_SIZE)
+        central_header[:4] = MODULE.CENTRAL_DIRECTORY_SIGNATURE
+        struct.pack_into("<H", central_header, 4, MODULE.ZIP64_MIN_VERSION)
+        struct.pack_into("<H", central_header, 6, MODULE.ZIP64_MIN_VERSION)
+        struct.pack_into("<H", central_header, 8, flags)
+        struct.pack_into("<H", central_header, 10, zipfile.ZIP_STORED)
+        struct.pack_into("<L", central_header, 16, crc)
+        struct.pack_into("<L", central_header, 20, MODULE.UINT32_MAX)
+        struct.pack_into("<L", central_header, 24, MODULE.UINT32_MAX)
+        struct.pack_into("<H", central_header, 28, len(raw_name))
+        struct.pack_into("<H", central_header, 30, len(central_extra))
+        central_record = bytes(central_header) + raw_name + central_extra
+        eocd = struct.pack(
+            "<4s4H2LH",
+            MODULE.EOCD_SIGNATURE,
+            0,
+            0,
+            1,
+            1,
+            len(central_record),
+            central_start,
+            0,
+        )
+        archive_path = directory / "local-zero-zip64-descriptor.zip"
+        archive_path.write_bytes(
+            local_header + raw_name + payload + descriptor + central_record + eocd
+        )
+        return archive_path, member_name
 
     def _make_zip64_metadata_archive(
         self,
@@ -204,6 +276,17 @@ class ArchiveTriageTests(unittest.TestCase):
                 zip64_eocd_offset + len(prefix),
             )
         archive_path.write_bytes(prefix + data)
+
+    def _first_local_record_bytes(self, archive_path: Path) -> bytes:
+        with zipfile.ZipFile(archive_path) as archive:
+            infos = sorted(archive.infolist(), key=lambda info: info.header_offset)
+            self.assertTrue(infos)
+            record_end = infos[1].header_offset if len(infos) > 1 else archive.start_dir
+            first_offset = infos[0].header_offset
+        data = archive_path.read_bytes()
+        self.assertEqual(first_offset, 0)
+        self.assertGreater(record_end, first_offset)
+        return data[first_offset:record_end]
 
     def _corrupt_member_payload_tail(
         self,
@@ -961,6 +1044,48 @@ class ArchiveTriageTests(unittest.TestCase):
             stderr.getvalue(),
         )
 
+    def test_prefixed_classic_archive_rejects_copied_valid_local_record(
+        self,
+    ) -> None:
+        selected_name = "logs/selected.log"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            archive_path = Path(temp_dir) / "copied-prefix-classic.zip"
+            with zipfile.ZipFile(archive_path, "w") as archive:
+                archive.writestr("logs/unused.log", "unused\n")
+                archive.writestr(selected_name, "selected\n")
+            valid_prefix = self._first_local_record_bytes(archive_path)
+            self._prepend_and_rebase_archive(
+                archive_path,
+                valid_prefix,
+                forged_zero_ordinal=1,
+            )
+            with zipfile.ZipFile(archive_path) as archive:
+                self.assertEqual(archive.read(selected_name), b"selected\n")
+
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            real_zipfile = zipfile.ZipFile
+            with mock.patch.object(
+                MODULE.zipfile,
+                "ZipFile",
+                wraps=real_zipfile,
+            ) as constructor:
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    rc = MODULE.cmd_zip_show(
+                        self._show_args(
+                            archive_path,
+                            member=selected_name,
+                        )
+                    )
+
+        self.assertEqual(rc, 1)
+        constructor.assert_not_called()
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn(
+            "unexplained bytes between local records",
+            stderr.getvalue(),
+        )
+
     def test_prefixed_empty_archive_with_rebased_offset_is_rejected_before_zipfile(
         self,
     ) -> None:
@@ -1215,6 +1340,53 @@ class ArchiveTriageTests(unittest.TestCase):
         self.assertEqual(stdout.getvalue(), "")
         self.assertIn(
             "first local record has an invalid local-file-header signature",
+            stderr.getvalue(),
+        )
+
+    def test_prefixed_zip64_archive_rejects_copied_valid_local_record(
+        self,
+    ) -> None:
+        selected_name = "logs/selected-zip64.log"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            archive_path = Path(temp_dir) / "copied-prefix-zip64.zip"
+            with mock.patch.object(zipfile, "ZIP_FILECOUNT_LIMIT", 0):
+                with zipfile.ZipFile(
+                    archive_path,
+                    "w",
+                    allowZip64=True,
+                ) as archive:
+                    archive.writestr("logs/unused-zip64.log", "unused\n")
+                    archive.writestr(selected_name, "selected\n")
+            valid_prefix = self._first_local_record_bytes(archive_path)
+            self._prepend_and_rebase_archive(
+                archive_path,
+                valid_prefix,
+                forged_zero_ordinal=1,
+            )
+            with zipfile.ZipFile(archive_path) as archive:
+                self.assertEqual(archive.read(selected_name), b"selected\n")
+
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            real_zipfile = zipfile.ZipFile
+            with mock.patch.object(
+                MODULE.zipfile,
+                "ZipFile",
+                wraps=real_zipfile,
+            ) as constructor:
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    rc = MODULE.cmd_zip_show(
+                        self._show_args(
+                            archive_path,
+                            member=selected_name,
+                        )
+                    )
+
+        self.assertEqual(rc, 1)
+        constructor.assert_not_called()
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn(
+            "unexplained bytes between local records",
             stderr.getvalue(),
         )
 
@@ -1751,6 +1923,30 @@ class ArchiveTriageTests(unittest.TestCase):
 
         self.assertEqual(rc, 0, stderr.getvalue())
         self.assertIn("descriptor", stdout.getvalue())
+
+    def test_zip_show_accepts_local_zero_zip64_data_descriptor(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            archive_path, member_name = self._make_local_zero_zip64_descriptor_archive(
+                Path(temp_dir)
+            )
+            with zipfile.ZipFile(archive_path) as archive:
+                info = archive.getinfo(member_name)
+                self.assertEqual(info.extract_version, MODULE.ZIP64_MIN_VERSION)
+                self.assertEqual(info.file_size, len(b"zip64 descriptor\n"))
+                self.assertEqual(info.compress_size, len(b"zip64 descriptor\n"))
+
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                rc = MODULE.cmd_zip_show(
+                    self._show_args(
+                        archive_path,
+                        member=member_name,
+                    )
+                )
+
+        self.assertEqual(rc, 0, stderr.getvalue())
+        self.assertIn("zip64 descriptor", stdout.getvalue())
 
     def test_member_payload_cannot_overlap_next_local_record(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2558,6 +2754,9 @@ class BugTriageDocumentationTests(unittest.TestCase):
         self.assertIn("and 100,000 lines", recipe)
         self.assertIn("protects archive object identity", recipe)
         self.assertIn("Before constructing Python `ZipInfo` objects", recipe)
+        self.assertIn("binds each central record to\none matching local record", recipe)
+        self.assertIn("without gaps or unreferenced\nrecords", recipe)
+        self.assertIn("local and central ZIP64\nextra/version/size", recipe)
         self.assertIn("accepts only stored and DEFLATE members", recipe)
         self.assertIn("rejects those\nmethods before opening a decompressor", recipe)
         self.assertIn("absence of trailing compressed data", recipe)
@@ -2617,7 +2816,72 @@ class BugTriageDocumentationTests(unittest.TestCase):
         self.assertIn("initial exact origin before reading", migration)
         self.assertIn("re-walk from the\n   held trusted-root", migration)
         self.assertIn("published / durability-unverified", migration)
+        self.assertIn("source history only", migration)
+        self.assertIn("One candidate immutable private-overlay release", migration)
+        self.assertIn("same release", migration)
+        self.assertIn("Keep both the canonical bug-triage retirement PR", migration)
+        self.assertIn("retain a compatible\n`bug-triage-playbook` route", migration)
         self.assertIn("Do not copy private fixtures", migration)
+
+    def test_private_migration_fixture_binds_atomic_aggregate_cutover(self) -> None:
+        fixture = json.loads(MIGRATION_FIXTURE_PATH.read_text(encoding="utf-8"))
+
+        self.assertEqual(fixture["schema_version"], 1)
+        self.assertEqual(
+            fixture["canonical_repository"],
+            "Joey-Tools/codex-debug-triage",
+        )
+        self.assertFalse(fixture["canonical_merge_changes_installed_routing"])
+        self.assertEqual(
+            fixture["private_aggregate_repository"],
+            "Joey-Tools/codex-private-workflows",
+        )
+        activation = fixture["activation"]
+        self.assertEqual(activation["release_kind"], "immutable-private-overlay")
+        self.assertTrue(activation["atomic"])
+        self.assertEqual(
+            activation["provider"],
+            {
+                "source": "personal_codex/skills/cisco-build-artifacts",
+                "target": "skills/cisco-build-artifacts",
+            },
+        )
+        self.assertEqual(
+            activation["routing_policy"]["target"],
+            "AGENTS.md",
+        )
+        self.assertEqual(
+            activation["catalog"],
+            {
+                "manifest": "personal_codex/private-sync-manifest.json",
+                "active_target": "skills/cisco-build-artifacts",
+                "removed_target": "skills/bug-triage-playbook",
+            },
+        )
+        self.assertEqual(
+            activation["removed_link"]["replacement_target"],
+            "skills/cisco-build-artifacts",
+        )
+        self.assertEqual(
+            fixture["blocked_until_trusted"],
+            [
+                "canonical-bug-triage-retirement-pr",
+                "private-consumer-source-sync",
+            ],
+        )
+        self.assertEqual(
+            fixture["unproved_atomicity_fallback"],
+            "retain-bug-triage-compat",
+        )
+        self.assertEqual(
+            fixture["trust_gates"],
+            [
+                "private-package-validation",
+                "private-overlay-verifier",
+                "immutable-release-published",
+                "installed-current-pointer-verified",
+            ],
+        )
 
 
 if __name__ == "__main__":
