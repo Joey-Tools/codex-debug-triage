@@ -2847,8 +2847,12 @@ class BugTriageDocumentationTests(unittest.TestCase):
             },
         )
         self.assertEqual(
-            activation["routing_policy"]["target"],
-            "AGENTS.md",
+            activation["routing_policy"],
+            {
+                "source": "personal_codex/AGENTS.md",
+                "target": "AGENTS.md",
+                "remote_build_provider": "skills/cisco-build-artifacts",
+            },
         )
         self.assertEqual(
             activation["catalog"],
@@ -2859,8 +2863,12 @@ class BugTriageDocumentationTests(unittest.TestCase):
             },
         )
         self.assertEqual(
-            activation["removed_link"]["replacement_target"],
-            "skills/cisco-build-artifacts",
+            activation["removed_link"],
+            {
+                "source": "personal_codex/skills/bug-triage-playbook",
+                "target": "skills/bug-triage-playbook",
+                "replacement_target": "skills/cisco-build-artifacts",
+            },
         )
         self.assertEqual(
             fixture["blocked_until_trusted"],
