@@ -113,9 +113,19 @@ These defaults are also immutable hard ceilings: budget flags may only narrow a
 run and values above the hard ceiling fail before the archive is opened. One
 30-second process-timer deadline covers the complete command, including central
 directory validation, decompression, and the validation drain that continues
-after selected output has been truncated. The helper fails closed when the
-platform cannot provide that process timer or when the caller already owns it;
-it never silently replaces an existing timer.
+after selected output has been truncated, bounded success-output publication,
+and the underlying output-stream flush. The helper fails closed when the
+platform cannot provide the required POSIX timer/signal controls, when the main
+thread currently blocks `SIGALRM`, when an alarm is already pending, or when the
+caller already owns the process timer; it never silently replaces an existing
+timer. Shutdown first blocks `SIGALRM`, stops the timer, drains its pending
+alarm, restores the prior handler, and only then restores the caller's signal
+mask. Runtime and argument errors use one terminal-safe line capped at 8,192
+characters. After the deadline first expires, the same process timer repeats at
+a short fixed interval until cleanup so a blocked diagnostic write is
+interrupted rather than retried after timer shutdown. `--encoding` accepts at
+most 64 ASCII letters, digits, dots, underscores, plus signs, or hyphens and
+must resolve through Python's codec registry.
 
 The helper opens the archive once, records the initially accepted file size,
 and holds that file descriptor through member selection and reading. Its

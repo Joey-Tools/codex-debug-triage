@@ -14,10 +14,16 @@ The retired authenticated Jenkins interface and the contract for moving it to
 a separate private `cisco-build-artifacts` skill are documented in
 [`docs/cisco-build-artifacts-migration.md`](docs/cisco-build-artifacts-migration.md).
 That private implementation is intentionally not part of this repository.
+The repository includes only a no-network receipt validator for a future
+private release gate; without an independently trusted exact release/pointer
+receipt, cutover remains `blocked_until_trusted`.
 
 ## Test
 
 ```bash
-python3 -m py_compile skills/bug-triage-playbook/scripts/archive_triage.py tests/test_archive_triage.py
+python3 -m py_compile \
+  skills/bug-triage-playbook/scripts/archive_triage.py \
+  scripts/validate_cisco_cutover_receipt.py \
+  tests/test_archive_triage.py
 python3 -m unittest tests.test_archive_triage
 ```

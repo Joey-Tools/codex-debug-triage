@@ -27,8 +27,9 @@ after an authoritative artifact is available locally. Its
 network or authentication work. That local helper keeps its own conservative
 defaults as immutable hard ceilings and applies one process-timer deadline to
 central-directory validation, decompression, and the post-selection validation
-drain; the private provider must preserve or tighten those local archive
-properties when it delegates inspection.
+drain, bounded output publication, and the underlying output flush; the private
+provider must preserve or tighten those local archive properties when it
+delegates inspection.
 
 GitHub Actions and pull-request checks bypass both skills and stay with the
 GitHub provider workflow named in the generic skill's provider boundary.
@@ -75,6 +76,60 @@ The non-private cutover fixture at
 names, aggregate paths, transaction members, trust gates, and fallback state.
 It intentionally contains no Cisco host, credential, profile, job, or artifact
 data.
+
+## Exact Release And Pointer Receipt Admission
+
+This repository cannot prove that a private overlay was published or that an
+installed `current` pointer moved. It therefore stores no fabricated completion
+receipt. The fixture's `receipt_admission.status_without_receipt` remains
+`blocked_until_trusted`, so the canonical retirement PR and private consumer
+source sync are not merge-admitted by this repository alone.
+
+The local, no-network repository gate at
+`scripts/validate_cisco_cutover_receipt.py` gives the future private overlay
+gate a machine-verifiable admission boundary without adding Cisco behavior to
+the installed generic skill. The gate
+must obtain the receipt through the authenticated
+`Joey-Tools/codex-private-workflows/.github/workflows/release.yml` release
+workflow and must supply four expectations from an independent trusted source,
+not copy them from the receipt:
+
+- the exact canonical candidate commit
+- the exact private release commit
+- the exact private release-manifest SHA-256
+- the exact SHA-256 of the receipt bytes
+
+Invoke it only after those values are pinned:
+
+```text
+python3 scripts/validate_cisco_cutover_receipt.py \
+  --contract tests/fixtures/cisco-build-artifacts-migration.json \
+  --receipt <trusted-receipt.json> \
+  --expected-canonical-commit <40-lowercase-hex> \
+  --expected-private-release-commit <40-lowercase-hex> \
+  --expected-release-manifest-sha256 <64-lowercase-hex> \
+  --expected-receipt-sha256 <64-lowercase-hex>
+```
+
+The strict UTF-8 JSON receipt is capped at 65,536 bytes, rejects duplicate keys,
+and must bind all of the following without extra or missing fields:
+
+1. schema version 1, the exact canonical/private repositories and commits, and
+   the exact release-manifest digest
+2. the complete aggregate activation object from the public contract
+3. every trust gate, in contract order, with `status=passed` and the same exact
+   private release commit and manifest digest
+4. `release_target=releases/<private-release-commit>`
+5. an installed pointer named `current` whose target, resolved release commit,
+   and manifest digest all equal that immutable release
+
+Exit 0 with `classification=admitted` is the only machine admission. A missing
+receipt, missing independent expectation, digest mismatch, partial gate set,
+pointer mismatch, malformed JSON, or any schema difference exits 1 with
+`classification=blocked_until_trusted`. The validator proves exact byte and
+field agreement; it does not authenticate where the caller obtained the
+receipt. Authenticated retrieval and the independent expectation values remain
+owned by the private release workflow.
 
 ## Private Command Interface To Preserve
 

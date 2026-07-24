@@ -47,6 +47,8 @@ DEFAULT_MAX_INPUT_LINE_CHARS = 128 * 1024
 DEFAULT_MAX_OUTPUT_LINES = 200
 DEFAULT_MAX_OUTPUT_CHARS = 64 * 1024
 DEFAULT_ARCHIVE_COMMAND_TIMEOUT_SECONDS = 30.0
+DEFAULT_MAX_ENCODING_NAME_CHARS = 64
+DEFAULT_MAX_ERROR_CHARS = 8 * 1024
 
 # These ceilings are intentionally equal to the conservative defaults.  The
 # command-line budget flags may narrow a run, but they must never turn the
@@ -63,13 +65,15 @@ HARD_MAX_INPUT_LINE_CHARS = DEFAULT_MAX_INPUT_LINE_CHARS
 HARD_MAX_OUTPUT_LINES = DEFAULT_MAX_OUTPUT_LINES
 HARD_MAX_OUTPUT_CHARS = DEFAULT_MAX_OUTPUT_CHARS
 HARD_MAX_ARCHIVE_COMMAND_TIMEOUT_SECONDS = DEFAULT_ARCHIVE_COMMAND_TIMEOUT_SECONDS
+HARD_MAX_ENCODING_NAME_CHARS = DEFAULT_MAX_ENCODING_NAME_CHARS
+HARD_MAX_ERROR_CHARS = DEFAULT_MAX_ERROR_CHARS
 DEFAULT_CANDIDATE_REPORT_LIMIT = 20
 DEFAULT_MAX_RAW_MEMBER_NAME_BYTES = 512
 DEFAULT_MAX_ERROR_DETAIL_CHARS = 1_024
-DEFAULT_MAX_AMBIGUITY_REPORT_LINES = DEFAULT_CANDIDATE_REPORT_LIMIT + 2
-DEFAULT_MAX_AMBIGUITY_REPORT_CHARS = DEFAULT_MAX_OUTPUT_CHARS
 AMBIGUITY_NOTICE_RESERVE_CHARS = 128
 TRUNCATION_MARKER = "... [truncated]"
+ARCHIVE_DEADLINE_RETRY_SECONDS = 0.1
+MAX_PENDING_ALARM_DRAINS = 8
 EOCD_SIGNATURE = b"PK\x05\x06"
 EOCD_MIN_SIZE = 22
 EOCD_MAX_COMMENT = 65_535
@@ -152,7 +156,49 @@ class ArchiveCommandDeadline:
             )
         self.deadline = time.monotonic() + timeout_seconds
         self._armed = False
+        self._closing = False
         self._previous_handler: object | None = None
+
+    @staticmethod
+    def _require_signal_support() -> None:
+        required_names = (
+            "SIGALRM",
+            "ITIMER_REAL",
+            "getitimer",
+            "setitimer",
+            "pthread_sigmask",
+            "sigpending",
+            "sigwait",
+            "SIG_BLOCK",
+            "SIG_SETMASK",
+        )
+        if any(not hasattr(signal, name) for name in required_names):
+            raise ArtifactLimitError(
+                "archive command hard deadline is unavailable on this platform"
+            )
+
+    @staticmethod
+    def _drain_pending_alarm() -> None:
+        for _ in range(MAX_PENDING_ALARM_DRAINS):
+            if signal.SIGALRM not in signal.sigpending():
+                return
+            received = signal.sigwait({signal.SIGALRM})
+            if received != signal.SIGALRM:
+                raise ArtifactLimitError(
+                    "archive command received an unexpected signal while "
+                    "draining its deadline alarm"
+                )
+        if signal.SIGALRM in signal.sigpending():
+            raise ArtifactLimitError(
+                "archive command could not drain its pending deadline alarm"
+            )
+
+    def _close_while_alarm_blocked(self) -> None:
+        signal.setitimer(signal.ITIMER_REAL, 0.0)
+        self._drain_pending_alarm()
+        signal.signal(signal.SIGALRM, self._previous_handler)
+        self._previous_handler = None
+        self._armed = False
 
     def arm(self) -> None:
         """Install a process timer so one blocking local read cannot overrun."""
@@ -164,40 +210,76 @@ class ArchiveCommandDeadline:
             raise ArtifactLimitError(
                 "archive command hard deadline requires the main thread"
             )
-        required_names = ("SIGALRM", "ITIMER_REAL", "getitimer", "setitimer")
-        if any(not hasattr(signal, name) for name in required_names):
+        self._require_signal_support()
+        previous_mask = signal.pthread_sigmask(
+            signal.SIG_BLOCK,
+            {signal.SIGALRM},
+        )
+        if signal.SIGALRM in previous_mask:
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
             raise ArtifactLimitError(
-                "archive command hard deadline is unavailable on this platform"
+                "archive command refuses to arm while SIGALRM is blocked"
             )
-        previous_timer = signal.getitimer(signal.ITIMER_REAL)
-        if previous_timer != (0.0, 0.0):
-            raise ArtifactLimitError(
-                "archive command refuses to replace an existing process timer"
-            )
-        self._previous_handler = signal.getsignal(signal.SIGALRM)
+        restore_mask = True
         try:
+            if signal.SIGALRM in signal.sigpending():
+                raise ArtifactLimitError(
+                    "archive command refuses to consume a pre-existing pending SIGALRM"
+                )
+            previous_timer = signal.getitimer(signal.ITIMER_REAL)
+            if previous_timer != (0.0, 0.0):
+                raise ArtifactLimitError(
+                    "archive command refuses to replace an existing process timer"
+                )
+            self._previous_handler = signal.getsignal(signal.SIGALRM)
             signal.signal(signal.SIGALRM, self._raise_timeout)
+            self._armed = True
             remaining = self.deadline - time.monotonic()
             if remaining <= 0:
                 raise ArtifactLimitError(
                     "archive command deadline exceeded during deadline setup"
                 )
-            signal.setitimer(signal.ITIMER_REAL, remaining)
+            signal.setitimer(
+                signal.ITIMER_REAL,
+                remaining,
+                ARCHIVE_DEADLINE_RETRY_SECONDS,
+            )
         except BaseException:
-            signal.signal(signal.SIGALRM, self._previous_handler)
-            self._previous_handler = None
+            if self._armed:
+                try:
+                    self._close_while_alarm_blocked()
+                except BaseException as cleanup_error:
+                    restore_mask = False
+                    raise ArtifactLimitError(
+                        "archive command deadline setup cleanup failed with "
+                        "SIGALRM retained blocked"
+                    ) from cleanup_error
             raise
-        self._armed = True
+        finally:
+            if restore_mask:
+                signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
 
     def close(self) -> None:
         if not self._armed:
             return
-        signal.setitimer(signal.ITIMER_REAL, 0.0)
-        signal.signal(signal.SIGALRM, self._previous_handler)
-        self._previous_handler = None
-        self._armed = False
+        self._closing = True
+        self._require_signal_support()
+        previous_mask = signal.pthread_sigmask(
+            signal.SIG_BLOCK,
+            {signal.SIGALRM},
+        )
+        handler_restored = False
+        try:
+            self._close_while_alarm_blocked()
+            handler_restored = True
+            self._closing = False
+        finally:
+            if handler_restored:
+                signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
 
     def _raise_timeout(self, _signum: int, _frame: object) -> None:
+        if self._closing:
+            return
         raise ArtifactLimitError("archive command deadline exceeded")
 
     def check(self, phase: str) -> None:
@@ -562,10 +644,24 @@ class OutputBudget:
         self.chars += len(rendered) + 1
         return not self.truncated
 
-    def flush(self, stream: io.TextIOBase | None = None) -> None:
+    def flush(
+        self,
+        stream: io.TextIOBase | None = None,
+        *,
+        deadline: ArchiveCommandDeadline | None = None,
+    ) -> None:
         destination = stream if stream is not None else sys.stdout
-        for line in self._buffer:
-            print(line, file=destination)
+        payload = "".join(f"{line}\n" for line in self._buffer)
+        if deadline is not None:
+            deadline.check("output publication")
+        written = destination.write(payload)
+        if written is not None and written != len(payload):
+            raise OSError("output stream accepted only part of the bounded payload")
+        if deadline is not None:
+            deadline.check("output publication")
+        destination.flush()
+        if deadline is not None:
+            deadline.check("output flush")
 
 
 def _nonnegative_int(value: str) -> int:
@@ -610,22 +706,104 @@ def _require_bounded_positive(
         )
 
 
+def _terminal_escape_token(character: str) -> str:
+    if character.isprintable() and not unicodedata.category(character).startswith("C"):
+        return character
+    codepoint = ord(character)
+    if codepoint <= 0xFF:
+        return f"\\x{codepoint:02x}"
+    if codepoint <= 0xFFFF:
+        return f"\\u{codepoint:04x}"
+    return f"\\U{codepoint:08x}"
+
+
 def _escape_terminal_text(value: str) -> str:
+    return "".join(_terminal_escape_token(character) for character in value)
+
+
+def _bounded_terminal_escape(value: str, max_chars: int) -> str:
+    if max_chars < len(TRUNCATION_MARKER):
+        raise ValueError("terminal escape budget is too small")
     escaped: list[str] = []
+    char_count = 0
     for character in value:
-        if character.isprintable() and not unicodedata.category(character).startswith(
-            "C"
-        ):
-            escaped.append(character)
+        token = _terminal_escape_token(character)
+        if char_count + len(token) <= max_chars:
+            escaped.append(token)
+            char_count += len(token)
             continue
-        codepoint = ord(character)
-        if codepoint <= 0xFF:
-            escaped.append(f"\\x{codepoint:02x}")
-        elif codepoint <= 0xFFFF:
-            escaped.append(f"\\u{codepoint:04x}")
-        else:
-            escaped.append(f"\\U{codepoint:08x}")
+        while escaped and char_count + len(TRUNCATION_MARKER) > max_chars:
+            char_count -= len(escaped.pop())
+        escaped.append(TRUNCATION_MARKER)
+        break
     return "".join(escaped)
+
+
+def _write_terminal_line(
+    prefix: str,
+    value: object,
+    *,
+    stream: io.TextIOBase,
+    deadline: ArchiveCommandDeadline | None = None,
+) -> None:
+    max_value_chars = HARD_MAX_ERROR_CHARS - len(prefix) - 1
+    rendered = _bounded_terminal_escape(str(value), max_value_chars)
+    payload = f"{prefix}{rendered}\n"
+    written = stream.write(payload)
+    if written is not None and written != len(payload):
+        raise OSError("diagnostic stream accepted only part of the bounded payload")
+    stream.flush()
+    if deadline is not None and not deadline._armed:
+        raise ArtifactLimitError("diagnostic output escaped the archive command timer")
+
+
+def _emit_error(
+    error: object,
+    *,
+    deadline: ArchiveCommandDeadline | None = None,
+) -> None:
+    _write_terminal_line(
+        "error=",
+        error,
+        stream=sys.stderr,
+        deadline=deadline,
+    )
+
+
+def _emit_notice(
+    notice: str,
+    *,
+    deadline: ArchiveCommandDeadline,
+) -> None:
+    _write_terminal_line(
+        "notice=",
+        notice,
+        stream=sys.stderr,
+        deadline=deadline,
+    )
+
+
+def _validate_encoding_name(value: object) -> str:
+    if not isinstance(value, str):
+        raise ArtifactLimitError("encoding name must be text")
+    if not value:
+        raise ArtifactLimitError("encoding name must not be empty")
+    if len(value) > HARD_MAX_ENCODING_NAME_CHARS:
+        raise ArtifactLimitError(
+            "encoding name exceeds immutable hard max: "
+            f"{len(value)} > {HARD_MAX_ENCODING_NAME_CHARS}"
+        )
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]*", value) is None:
+        raise ArtifactLimitError("encoding name contains unsupported characters")
+    codecs.lookup(value)
+    return value
+
+
+def _encoding_argument(value: str) -> str:
+    try:
+        return _validate_encoding_name(value)
+    except (ArtifactLimitError, LookupError) as error:
+        raise argparse.ArgumentTypeError(str(error)) from error
 
 
 class RegexMatchBudget:
@@ -2318,6 +2496,49 @@ def _archive_errors() -> tuple[type[BaseException], ...]:
     return errors + optional_errors
 
 
+def _run_archive_command(
+    operation: Callable[[ArchiveCommandDeadline], None],
+) -> int:
+    deadline = ArchiveCommandDeadline()
+    command_errors = (Exception,)
+    primary_error: BaseException | None = None
+    error_attempted = False
+    try:
+        deadline.arm()
+        operation(deadline)
+    except command_errors as error:
+        primary_error = error
+        error_attempted = True
+        try:
+            _emit_error(
+                error,
+                deadline=deadline if deadline._armed else None,
+            )
+        except command_errors:
+            pass
+    finally:
+        try:
+            deadline.close()
+        except command_errors as cleanup_error:
+            if deadline._armed and not deadline._closing:
+                try:
+                    deadline.close()
+                except command_errors:
+                    pass
+            if primary_error is None:
+                primary_error = cleanup_error
+                if not error_attempted:
+                    error_attempted = True
+                    try:
+                        _emit_error(
+                            cleanup_error,
+                            deadline=deadline if deadline._armed else None,
+                        )
+                    except command_errors:
+                        pass
+    return 1 if primary_error is not None else 0
+
+
 def _validate_list_args(args: argparse.Namespace) -> None:
     for option_name, value, hard_max in (
         ("limit", args.limit, HARD_MAX_LIST_LIMIT),
@@ -2346,10 +2567,8 @@ def _validate_list_args(args: argparse.Namespace) -> None:
 
 
 def cmd_zip_list(args: argparse.Namespace) -> int:
-    zip_path = pathlib.Path(args.zip_path)
-    deadline = ArchiveCommandDeadline()
-    try:
-        deadline.arm()
+    def operation(deadline: ArchiveCommandDeadline) -> None:
+        zip_path = pathlib.Path(args.zip_path)
         _validate_list_args(args)
         deadline.check("argument validation")
         regex_budget = RegexMatchBudget()
@@ -2393,53 +2612,40 @@ def cmd_zip_list(args: argparse.Namespace) -> int:
                         ):
                             break
                 archive_stream.validate_unchanged()
-    except _archive_errors() + (re.error,) as error:
-        print(f"error={error}", file=sys.stderr)
-        return 1
-    finally:
-        deadline.close()
+        output.flush(deadline=deadline)
+        if output.truncated:
+            _emit_notice(
+                "output truncated by configured entry or character limit",
+                deadline=deadline,
+            )
 
-    output.flush()
-    if output.truncated:
-        print(
-            "notice=output truncated by configured entry or character limit",
-            file=sys.stderr,
-        )
-    return 0
+    return _run_archive_command(operation)
 
 
-def _report_ambiguous_members(matches: list[ArchiveMember]) -> None:
-    lines = ["error=multiple matching members"]
-    char_count = len(lines[0]) + 1
-    report_char_limit = (
-        DEFAULT_MAX_AMBIGUITY_REPORT_CHARS - AMBIGUITY_NOTICE_RESERVE_CHARS
-    )
-    reported = 0
+def _format_ambiguous_members(matches: list[ArchiveMember]) -> str:
+    candidates: list[str] = []
     for member in matches[:DEFAULT_CANDIDATE_REPORT_LIMIT]:
-        candidate = f"member={_render_archive_member(member)}"
+        candidate = _render_archive_member(member)
+        proposed = candidates + [candidate]
+        omitted = len(matches) - len(proposed)
+        rendered = (
+            "multiple matching members; candidates=["
+            f"{','.join(proposed)}]; omitted={omitted}"
+        )
         if (
-            len(lines) >= DEFAULT_MAX_AMBIGUITY_REPORT_LINES - 1
-            or char_count + len(candidate) + 1 > report_char_limit
+            len(rendered) + len("error=") + 1
+            > HARD_MAX_ERROR_CHARS - AMBIGUITY_NOTICE_RESERVE_CHARS
         ):
             break
-        lines.append(candidate)
-        char_count += len(candidate) + 1
-        reported += 1
-
-    omitted = len(matches) - reported
-    if omitted:
-        notice = f"notice=additional matching members omitted: {omitted}"
-        lines.append(notice)
-        char_count += len(notice) + 1
-
-    if (
-        len(lines) > DEFAULT_MAX_AMBIGUITY_REPORT_LINES
-        or char_count > DEFAULT_MAX_AMBIGUITY_REPORT_CHARS
-    ):
+        candidates = proposed
+    omitted = len(matches) - len(candidates)
+    rendered = (
+        "multiple matching members; candidates=["
+        f"{','.join(candidates)}]; omitted={omitted}"
+    )
+    if len(rendered) + len("error=") + 1 > HARD_MAX_ERROR_CHARS:
         raise ArtifactLimitError("ambiguity report exceeds internal budget")
-
-    for line in lines:
-        print(line, file=sys.stderr)
+    return rendered
 
 
 def _validate_show_args(args: argparse.Namespace) -> None:
@@ -2512,14 +2718,12 @@ def _validate_show_args(args: argparse.Namespace) -> None:
             "context exceeds max output lines: "
             f"{args.context} > {args.max_output_lines}"
         )
-    codecs.lookup(args.encoding)
+    _validate_encoding_name(args.encoding)
 
 
 def cmd_zip_show(args: argparse.Namespace) -> int:
-    zip_path = pathlib.Path(args.zip_path)
-    deadline = ArchiveCommandDeadline()
-    try:
-        deadline.arm()
+    def operation(deadline: ArchiveCommandDeadline) -> None:
+        zip_path = pathlib.Path(args.zip_path)
         _validate_show_args(args)
         deadline.check("argument validation")
         regex_budget = RegexMatchBudget()
@@ -2570,16 +2774,13 @@ def cmd_zip_show(args: argparse.Namespace) -> int:
                         member_matcher,
                     )
                     if not matches:
-                        print("error=no matching members", file=sys.stderr)
-                        return 1
+                        raise ArtifactLimitError("no matching members")
                     if len(matches) > 1 and not args.all:
-                        _report_ambiguous_members(matches)
-                        return 1
+                        raise ArtifactLimitError(_format_ambiguous_members(matches))
                     if args.all and len(matches) > args.max_members:
-                        print(
-                            "error=matching members exceed limit: "
+                        raise ArtifactLimitError(
+                            "matching members exceed limit: "
                             f"{len(matches)} > {args.max_members}",
-                            file=sys.stderr,
                         )
                         return 1
 
@@ -2610,23 +2811,28 @@ def cmd_zip_show(args: argparse.Namespace) -> int:
                             aggregate_budget,
                         )
                 archive_stream.validate_unchanged()
-    except _archive_errors() + (re.error,) as error:
-        print(f"error={error}", file=sys.stderr)
-        return 1
-    finally:
-        deadline.close()
+        output.flush(deadline=deadline)
+        if output.truncated:
+            _emit_notice(
+                "output truncated by configured line or character limit",
+                deadline=deadline,
+            )
 
-    output.flush()
-    if output.truncated:
-        print(
-            "notice=output truncated by configured line or character limit",
-            file=sys.stderr,
-        )
-    return 0
+    return _run_archive_command(operation)
+
+
+class TerminalArgumentParser(argparse.ArgumentParser):
+    """Render parser failures as one bounded terminal-safe diagnostic."""
+
+    def error(self, message: str) -> None:
+        try:
+            _emit_error(f"argument error: {message}")
+        finally:
+            raise SystemExit(2)
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = TerminalArgumentParser(
         description="Inspect text members in a local ZIP archive."
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -2691,7 +2897,11 @@ def build_parser() -> argparse.ArgumentParser:
     selection.add_argument("--tail", type=_positive_int, default=0)
     zip_show.add_argument("--ignore-case", action="store_true")
     zip_show.add_argument("--context", type=_nonnegative_int, default=0)
-    zip_show.add_argument("--encoding", default="utf-8")
+    zip_show.add_argument(
+        "--encoding",
+        type=_encoding_argument,
+        default="utf-8",
+    )
     zip_show.add_argument("--line-numbers", action="store_true")
     zip_show.add_argument(
         "--max-archive-bytes",

@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "canonical_repository": "Joey-Tools/codex-debug-triage",
   "canonical_merge_changes_installed_routing": false,
   "private_aggregate_repository": "Joey-Tools/codex-private-workflows",
@@ -36,5 +36,20 @@
     "canonical-bug-triage-retirement-pr",
     "private-consumer-source-sync"
   ],
-  "unproved_atomicity_fallback": "retain-bug-triage-compat"
+  "unproved_atomicity_fallback": "retain-bug-triage-compat",
+  "receipt_admission": {
+    "status_without_receipt": "blocked_until_trusted",
+    "validator": "scripts/validate_cisco_cutover_receipt.py",
+    "receipt_schema_version": 1,
+    "receipt_max_bytes": 65536,
+    "producer_workflow": ".github/workflows/release.yml",
+    "pointer_name": "current",
+    "pointer_target_template": "releases/{private_release_commit}",
+    "required_exact_inputs": [
+      "expected_canonical_commit",
+      "expected_private_release_commit",
+      "expected_release_manifest_sha256",
+      "expected_receipt_sha256"
+    ]
+  }
 }

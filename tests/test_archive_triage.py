@@ -4,11 +4,13 @@ import argparse
 import ast
 import base64
 import binascii
+import hashlib
 import importlib.util
 import io
 import json
 import os
 import shlex
+import signal
 import subprocess
 import struct
 import sys
@@ -24,6 +26,7 @@ from unittest import mock
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SKILL_ROOT = REPO_ROOT / "skills/bug-triage-playbook"
 SCRIPT_PATH = SKILL_ROOT / "scripts/archive_triage.py"
+CUTOVER_VALIDATOR_PATH = REPO_ROOT / "scripts/validate_cisco_cutover_receipt.py"
 MIGRATION_FIXTURE_PATH = (
     REPO_ROOT / "tests/fixtures/cisco-build-artifacts-migration.json"
 )
@@ -603,6 +606,25 @@ class ArchiveTriageTests(unittest.TestCase):
         self.assertEqual(raw_name.decode(encoding), identity["name"])
         return identity
 
+    def _parse_ambiguity_identities(
+        self,
+        rendered: str,
+    ) -> tuple[list[dict[str, object]], int]:
+        lines = rendered.splitlines()
+        self.assertEqual(len(lines), 1)
+        prefix = "error=multiple matching members; candidates="
+        self.assertTrue(lines[0].startswith(prefix), lines[0])
+        candidates_text, separator, omitted_text = lines[0][len(prefix) :].rpartition(
+            "; omitted="
+        )
+        self.assertEqual(separator, "; omitted=")
+        candidates = json.loads(candidates_text)
+        self.assertIsInstance(candidates, list)
+        return (
+            [self._parse_identity(json.dumps(candidate)) for candidate in candidates],
+            int(omitted_text),
+        )
+
     def _list_args(
         self,
         archive_path: Path,
@@ -712,11 +734,8 @@ class ArchiveTriageTests(unittest.TestCase):
                 rc = MODULE.cmd_zip_show(args)
 
         self.assertEqual(rc, 1)
-        lines = stderr.getvalue().splitlines()
-        self.assertEqual(lines[0], "error=multiple matching members")
-        identities = [
-            self._parse_identity(line.removeprefix("member=")) for line in lines[1:]
-        ]
+        identities, omitted = self._parse_ambiguity_identities(stderr.getvalue())
+        self.assertEqual(omitted, 0)
         self.assertEqual(
             [identity["name"] for identity in identities],
             ["logs/console.txt", "logs/worker.log"],
@@ -2391,11 +2410,10 @@ class ArchiveTriageTests(unittest.TestCase):
         )
 
         self.assertEqual(ambiguous_rc, 1)
-        ambiguity_identities = [
-            self._parse_identity(line.removeprefix("member="))
-            for line in ambiguous_stderr.getvalue().splitlines()
-            if line.startswith("member=")
-        ]
+        ambiguity_identities, omitted = self._parse_ambiguity_identities(
+            ambiguous_stderr.getvalue()
+        )
+        self.assertEqual(omitted, 0)
         self.assertEqual(
             [identity["ordinal"] for identity in ambiguity_identities],
             [1, 2],
@@ -2524,19 +2542,15 @@ class ArchiveTriageTests(unittest.TestCase):
 
         self.assertEqual(ambiguous_rc, 1)
         ambiguity_lines = ambiguous_stderr.getvalue().splitlines()
+        self.assertEqual(len(ambiguity_lines), 1)
         self.assertLessEqual(
-            len(ambiguity_lines),
-            MODULE.DEFAULT_MAX_AMBIGUITY_REPORT_LINES,
+            len(ambiguous_stderr.getvalue()), MODULE.HARD_MAX_ERROR_CHARS
         )
-        self.assertLessEqual(
-            len(ambiguous_stderr.getvalue()),
-            MODULE.DEFAULT_MAX_AMBIGUITY_REPORT_CHARS,
+        ambiguity_identities, omitted = self._parse_ambiguity_identities(
+            ambiguous_stderr.getvalue()
         )
-        ambiguous_names = [
-            self._parse_identity(line.removeprefix("member="))["name"]
-            for line in ambiguity_lines
-            if line.startswith("member=")
-        ]
+        self.assertEqual(omitted, 0)
+        ambiguous_names = [identity["name"] for identity in ambiguity_identities]
         self.assertEqual(ambiguous_names, names)
 
         self.assertEqual(show_rc, 0)
@@ -2849,6 +2863,216 @@ class ArchiveTriageTests(unittest.TestCase):
 
         self.assertLess(time.monotonic() - started, 0.5)
 
+    @unittest.skipUnless(
+        all(
+            hasattr(signal, name)
+            for name in (
+                "SIGALRM",
+                "pthread_sigmask",
+                "SIG_BLOCK",
+                "SIG_SETMASK",
+            )
+        ),
+        "POSIX signal masks are required",
+    )
+    def test_archive_command_rejects_blocked_sigalrm_before_archive_open(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            archive_path = self._make_archive(Path(temp_dir))
+            previous_mask = signal.pthread_sigmask(
+                signal.SIG_BLOCK,
+                {signal.SIGALRM},
+            )
+            try:
+                stderr = io.StringIO()
+                with mock.patch.object(MODULE, "_open_pinned_archive") as opener:
+                    with redirect_stderr(stderr):
+                        rc = MODULE.cmd_zip_list(self._list_args(archive_path))
+            finally:
+                signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+
+        self.assertEqual(rc, 1)
+        opener.assert_not_called()
+        self.assertEqual(len(stderr.getvalue().splitlines()), 1)
+        self.assertIn("refuses to arm while SIGALRM is blocked", stderr.getvalue())
+
+    @unittest.skipUnless(
+        all(
+            hasattr(signal, name)
+            for name in (
+                "SIGALRM",
+                "ITIMER_REAL",
+                "pthread_sigmask",
+                "sigpending",
+                "SIG_BLOCK",
+                "SIG_SETMASK",
+            )
+        ),
+        "POSIX pending-signal controls are required",
+    )
+    def test_archive_command_close_drains_alarm_before_restoring_old_handler(
+        self,
+    ) -> None:
+        previous_handler = signal.getsignal(signal.SIGALRM)
+        original_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+        if signal.SIGALRM in original_mask:
+            self.skipTest("SIGALRM was already blocked by the test runner")
+
+        old_handler_calls: list[int] = []
+
+        def old_handler(signum: int, _frame: object) -> None:
+            old_handler_calls.append(signum)
+
+        deadline = MODULE.ArchiveCommandDeadline(0.03)
+        blocked_mask: set[signal.Signals] | None = None
+        try:
+            signal.signal(signal.SIGALRM, old_handler)
+            deadline.arm()
+            blocked_mask = signal.pthread_sigmask(
+                signal.SIG_BLOCK,
+                {signal.SIGALRM},
+            )
+            time.sleep(0.08)
+            self.assertIn(signal.SIGALRM, signal.sigpending())
+
+            deadline.close()
+            self.assertNotIn(signal.SIGALRM, signal.sigpending())
+            self.assertIs(signal.getsignal(signal.SIGALRM), old_handler)
+            signal.pthread_sigmask(signal.SIG_SETMASK, blocked_mask)
+            blocked_mask = None
+            time.sleep(0.02)
+            self.assertEqual(old_handler_calls, [])
+        finally:
+            if deadline._armed:
+                deadline.close()
+            signal.setitimer(signal.ITIMER_REAL, 0.0)
+            if blocked_mask is not None:
+                signal.pthread_sigmask(signal.SIG_SETMASK, blocked_mask)
+            signal.signal(signal.SIGALRM, previous_handler)
+            signal.pthread_sigmask(signal.SIG_SETMASK, original_mask)
+
+    def test_blocking_success_output_flush_stays_under_command_deadline(
+        self,
+    ) -> None:
+        class BlockingFlush(io.StringIO):
+            def flush(self) -> None:
+                time.sleep(1.0)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            archive_path = self._make_archive(Path(temp_dir))
+            deadline = MODULE.ArchiveCommandDeadline(0.05)
+            stdout = BlockingFlush()
+            stderr = io.StringIO()
+            started = time.monotonic()
+            with mock.patch.object(
+                MODULE,
+                "ArchiveCommandDeadline",
+                return_value=deadline,
+            ):
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    rc = MODULE.cmd_zip_list(self._list_args(archive_path))
+            elapsed = time.monotonic() - started
+
+        self.assertEqual(rc, 1)
+        self.assertLess(elapsed, 0.5)
+        self.assertEqual(len(stderr.getvalue().splitlines()), 1)
+        self.assertIn("archive command deadline exceeded", stderr.getvalue())
+
+    def test_blocking_error_output_is_not_retried_outside_command_deadline(
+        self,
+    ) -> None:
+        class BlockingErrorStream(io.StringIO):
+            def write(self, value: str) -> int:
+                time.sleep(1.0)
+                return super().write(value)
+
+        deadline = MODULE.ArchiveCommandDeadline(0.05)
+        stderr = BlockingErrorStream()
+        started = time.monotonic()
+        with mock.patch.object(
+            MODULE,
+            "ArchiveCommandDeadline",
+            return_value=deadline,
+        ):
+            with mock.patch.object(
+                MODULE,
+                "_validate_list_args",
+                side_effect=ValueError("controlled failure"),
+            ):
+                with redirect_stderr(stderr):
+                    rc = MODULE.cmd_zip_list(self._list_args(Path("unused.zip")))
+        elapsed = time.monotonic() - started
+
+        self.assertEqual(rc, 1)
+        self.assertLess(elapsed, 0.5)
+        self.assertEqual(stderr.getvalue(), "")
+
+    def test_runtime_error_is_single_line_terminal_safe_and_hard_capped(
+        self,
+    ) -> None:
+        oversized_error = Exception(f"unsafe\nterminal\x1b{('detail' * 10_000)}")
+        stderr = io.StringIO()
+        with mock.patch.object(
+            MODULE,
+            "_validate_list_args",
+            side_effect=oversized_error,
+        ):
+            with redirect_stderr(stderr):
+                rc = MODULE.cmd_zip_list(self._list_args(Path("unused.zip")))
+
+        self.assertEqual(rc, 1)
+        self.assertEqual(len(stderr.getvalue().splitlines()), 1)
+        self.assertLessEqual(len(stderr.getvalue()), MODULE.HARD_MAX_ERROR_CHARS)
+        self.assertIn(r"\x0a", stderr.getvalue())
+        self.assertIn(r"\x1b", stderr.getvalue())
+        self.assertIn(MODULE.TRUNCATION_MARKER, stderr.getvalue())
+
+    def test_direct_encoding_rejects_control_characters_before_archive_open(
+        self,
+    ) -> None:
+        args = self._show_args(
+            Path("unused.zip"),
+            encoding="utf-8\n\x1b",
+        )
+        stderr = io.StringIO()
+        with mock.patch.object(MODULE, "_open_pinned_archive") as opener:
+            with redirect_stderr(stderr):
+                rc = MODULE.cmd_zip_show(args)
+
+        self.assertEqual(rc, 1)
+        opener.assert_not_called()
+        self.assertEqual(len(stderr.getvalue().splitlines()), 1)
+        self.assertIn(
+            "encoding name contains unsupported characters",
+            stderr.getvalue(),
+        )
+
+    def test_cli_encoding_length_error_is_single_line_and_hard_capped(
+        self,
+    ) -> None:
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPT_PATH),
+                "zip-show",
+                "unused.zip",
+                "console.txt",
+                "--encoding",
+                "x" * (MODULE.HARD_MAX_ENCODING_NAME_CHARS + 1),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(len(result.stderr.splitlines()), 1)
+        self.assertLessEqual(len(result.stderr), MODULE.HARD_MAX_ERROR_CHARS)
+        self.assertIn("encoding name exceeds immutable hard max", result.stderr)
+
     def test_regex_entrypoints_report_invalid_patterns(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             archive_path = self._make_archive(Path(temp_dir))
@@ -2911,6 +3135,94 @@ class ArchiveTriageTests(unittest.TestCase):
 
 
 class BugTriageDocumentationTests(unittest.TestCase):
+    _canonical_commit = "1" * 40
+    _private_release_commit = "2" * 40
+    _release_manifest_sha256 = "3" * 64
+
+    def _matching_cutover_receipt(
+        self,
+        fixture: dict[str, object],
+    ) -> dict[str, object]:
+        release_target = f"releases/{self._private_release_commit}"
+        return {
+            "schema_version": 1,
+            "canonical_repository": fixture["canonical_repository"],
+            "canonical_commit": self._canonical_commit,
+            "private_aggregate_repository": fixture["private_aggregate_repository"],
+            "private_release_commit": self._private_release_commit,
+            "release_manifest_sha256": self._release_manifest_sha256,
+            "release_target": release_target,
+            "activation": fixture["activation"],
+            "gates": [
+                {
+                    "name": name,
+                    "status": "passed",
+                    "private_release_commit": self._private_release_commit,
+                    "release_manifest_sha256": self._release_manifest_sha256,
+                }
+                for name in fixture["trust_gates"]
+            ],
+            "installed_pointer": {
+                "name": "current",
+                "target": release_target,
+                "resolved_release_commit": self._private_release_commit,
+                "release_manifest_sha256": self._release_manifest_sha256,
+            },
+        }
+
+    def _write_cutover_receipt(
+        self,
+        path: Path,
+        receipt: dict[str, object],
+    ) -> str:
+        payload = (
+            json.dumps(
+                receipt,
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            + "\n"
+        ).encode("utf-8")
+        path.write_bytes(payload)
+        return hashlib.sha256(payload).hexdigest()
+
+    def _run_cutover_validator(
+        self,
+        *,
+        contract_path: Path = MIGRATION_FIXTURE_PATH,
+        receipt_path: Path | None = None,
+        receipt_sha256: str | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        command = [
+            sys.executable,
+            str(CUTOVER_VALIDATOR_PATH),
+            "--contract",
+            str(contract_path),
+        ]
+        if receipt_path is not None:
+            command.extend(
+                [
+                    "--receipt",
+                    str(receipt_path),
+                    "--expected-canonical-commit",
+                    self._canonical_commit,
+                    "--expected-private-release-commit",
+                    self._private_release_commit,
+                    "--expected-release-manifest-sha256",
+                    self._release_manifest_sha256,
+                    "--expected-receipt-sha256",
+                    receipt_sha256 or ("0" * 64),
+                ]
+            )
+        return subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+
     def test_skill_is_explicit_only_and_hands_off_provider_work(self) -> None:
         skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
         metadata = (SKILL_ROOT / "agents/openai.yaml").read_text(encoding="utf-8")
@@ -2937,6 +3249,24 @@ class BugTriageDocumentationTests(unittest.TestCase):
         self.assertNotIn("probe-url", generic_text)
         self.assertNotIn("fetch-url", generic_text)
         self.assertNotIn("urllib.request", generic_text)
+
+    def test_cutover_receipt_validator_has_no_network_or_credentials(
+        self,
+    ) -> None:
+        source = CUTOVER_VALIDATOR_PATH.read_text(encoding="utf-8")
+
+        for forbidden in (
+            "urllib",
+            "requests",
+            "http.client",
+            "socket",
+            "JENKINS_ARTIFACT_USER",
+            "JENKINS_ARTIFACT_TOKEN",
+            "--auth-profile",
+            "fetch-url",
+        ):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, source)
 
     def test_local_recipe_budgets_artifact_reads(self) -> None:
         recipe = (SKILL_ROOT / "references/local-artifact-recipes.md").read_text(
@@ -3023,11 +3353,15 @@ class BugTriageDocumentationTests(unittest.TestCase):
         self.assertIn("Keep both the canonical bug-triage retirement PR", migration)
         self.assertIn("retain a compatible\n`bug-triage-playbook` route", migration)
         self.assertIn("Do not copy private fixtures", migration)
+        self.assertIn("stores no fabricated completion\nreceipt", migration)
+        self.assertIn("classification=blocked_until_trusted", migration)
+        self.assertIn("exact SHA-256 of the receipt bytes", migration)
+        self.assertIn("does not authenticate where the caller obtained", migration)
 
     def test_private_migration_fixture_binds_atomic_aggregate_cutover(self) -> None:
         fixture = json.loads(MIGRATION_FIXTURE_PATH.read_text(encoding="utf-8"))
 
-        self.assertEqual(fixture["schema_version"], 1)
+        self.assertEqual(fixture["schema_version"], 2)
         self.assertEqual(
             fixture["canonical_repository"],
             "Joey-Tools/codex-debug-triage",
@@ -3091,6 +3425,135 @@ class BugTriageDocumentationTests(unittest.TestCase):
                 "installed-current-pointer-verified",
             ],
         )
+        self.assertEqual(
+            fixture["receipt_admission"],
+            {
+                "status_without_receipt": "blocked_until_trusted",
+                "validator": ("scripts/validate_cisco_cutover_receipt.py"),
+                "receipt_schema_version": 1,
+                "receipt_max_bytes": 65536,
+                "producer_workflow": ".github/workflows/release.yml",
+                "pointer_name": "current",
+                "pointer_target_template": ("releases/{private_release_commit}"),
+                "required_exact_inputs": [
+                    "expected_canonical_commit",
+                    "expected_private_release_commit",
+                    "expected_release_manifest_sha256",
+                    "expected_receipt_sha256",
+                ],
+            },
+        )
+
+    def test_cutover_validator_without_receipt_remains_blocked(self) -> None:
+        result = self._run_cutover_validator()
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stderr, "")
+        outcome = json.loads(result.stdout)
+        self.assertEqual(outcome["classification"], "blocked_until_trusted")
+        self.assertIn("receipt path was not provided", outcome["reason"])
+
+    def test_cutover_validator_usage_error_is_single_line_machine_output(
+        self,
+    ) -> None:
+        result = subprocess.run(
+            [sys.executable, str(CUTOVER_VALIDATOR_PATH)],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(len(result.stdout.splitlines()), 1)
+        outcome = json.loads(result.stdout)
+        self.assertEqual(outcome["classification"], "blocked_until_trusted")
+        self.assertIn("argument error", outcome["reason"])
+
+    def test_cutover_validator_admits_exact_release_and_pointer_receipt(
+        self,
+    ) -> None:
+        fixture = json.loads(MIGRATION_FIXTURE_PATH.read_text(encoding="utf-8"))
+        receipt = self._matching_cutover_receipt(fixture)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            receipt_path = Path(temp_dir) / "cutover-receipt.json"
+            receipt_sha256 = self._write_cutover_receipt(
+                receipt_path,
+                receipt,
+            )
+            result = self._run_cutover_validator(
+                receipt_path=receipt_path,
+                receipt_sha256=receipt_sha256,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stderr, "")
+        outcome = json.loads(result.stdout)
+        self.assertEqual(outcome["classification"], "admitted")
+        self.assertEqual(
+            outcome["pointer_target"],
+            f"releases/{self._private_release_commit}",
+        )
+        self.assertEqual(outcome["receipt_sha256"], receipt_sha256)
+
+    def test_cutover_validator_rejects_receipt_digest_not_independently_pinned(
+        self,
+    ) -> None:
+        fixture = json.loads(MIGRATION_FIXTURE_PATH.read_text(encoding="utf-8"))
+        receipt = self._matching_cutover_receipt(fixture)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            receipt_path = Path(temp_dir) / "cutover-receipt.json"
+            self._write_cutover_receipt(receipt_path, receipt)
+            result = self._run_cutover_validator(
+                receipt_path=receipt_path,
+                receipt_sha256="4" * 64,
+            )
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        outcome = json.loads(result.stdout)
+        self.assertEqual(outcome["classification"], "blocked_until_trusted")
+        self.assertIn("trusted exact digest", outcome["reason"])
+
+    def test_cutover_validator_rejects_pointer_not_bound_to_release(
+        self,
+    ) -> None:
+        fixture = json.loads(MIGRATION_FIXTURE_PATH.read_text(encoding="utf-8"))
+        receipt = self._matching_cutover_receipt(fixture)
+        receipt["installed_pointer"]["target"] = f"releases/{'4' * 40}"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            receipt_path = Path(temp_dir) / "cutover-receipt.json"
+            receipt_sha256 = self._write_cutover_receipt(
+                receipt_path,
+                receipt,
+            )
+            result = self._run_cutover_validator(
+                receipt_path=receipt_path,
+                receipt_sha256=receipt_sha256,
+            )
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        outcome = json.loads(result.stdout)
+        self.assertEqual(outcome["classification"], "blocked_until_trusted")
+        self.assertIn("installed pointer", outcome["reason"])
+
+    def test_cutover_validator_rejects_weakened_atomic_contract(self) -> None:
+        contract = json.loads(MIGRATION_FIXTURE_PATH.read_text(encoding="utf-8"))
+        contract["activation"]["atomic"] = False
+        with tempfile.TemporaryDirectory() as temp_dir:
+            contract_path = Path(temp_dir) / "weakened-contract.json"
+            contract_path.write_text(
+                json.dumps(contract),
+                encoding="utf-8",
+            )
+            result = self._run_cutover_validator(
+                contract_path=contract_path,
+            )
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        outcome = json.loads(result.stdout)
+        self.assertEqual(outcome["classification"], "blocked_until_trusted")
+        self.assertIn("exact aggregate transaction", outcome["reason"])
 
 
 if __name__ == "__main__":
