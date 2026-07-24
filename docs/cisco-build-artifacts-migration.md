@@ -244,7 +244,14 @@ process because there is no candidate process. It reports static mismatches
 before the terminal authority decision. With the checked-in contract's live
 authority unavailable, even complete static equivalence ends with
 `classification=blocked_until_trusted,reason=pointer-proof-unavailable`; there
-is no target green outcome.
+is no target green outcome. The live doctor follows the same ordering: it
+finishes static collection, performs the final protected-snapshot
+revalidation, and hashes the canonical evidence before asking for pointer
+proof. A pointer-only blocker therefore includes
+`static_equivalence=validated` and its non-null `evidence_sha256`; failures
+before that boundary leave the static claim unset. These fields, together with
+sanitized cleanup-failure evidence when applicable, define doctor receipt
+schema 5.
 
 The enforcement boundary is an active organization-level GitHub ruleset rule
 with `source_type=Organization` and `type=workflows`, not a repository-level
@@ -350,6 +357,31 @@ output is discarded. This is a property-scoped access-policy check, not a
 `ctime` proxy. As with the existing namespace binding, a process deliberately
 acting under the same effective UID is the same filesystem principal and is
 outside a separate-principal isolation claim.
+
+Cleanup preserves two distinct properties. Access-policy stability is checked
+once more before cleanup mutation; a mode or ACL expansion remains
+`collector-inconclusive` even if deletion later succeeds, because deletion
+cannot retroactively prove confidentiality. Object deletion is then bound to
+the retained descriptors rather than to names alone. Each file name must still
+resolve to the retained device/inode before `unlink`, and that exact descriptor
+must report zero links afterward. Configuration, executable, and run
+directories are removed leaf-to-root with retained parent/child descriptors,
+pre-removal identity agreement, and post-removal name absence inside the
+owner-private namespace. A bare `FileNotFoundError` is not proof that a
+previously bound object was removed.
+
+Failed `fchmod`, `unlink`, or `rmdir` operations are never discarded. The
+doctor completes every safe cleanup attempt, returns
+`reason_code=collector-inconclusive`, and records stable operation labels. If
+the exact run directory is still present under the trusted runtime parent, the
+blocked receipt adds `cleanup_failure.retained_runtime` with the verified
+absolute path plus device and inode. No credential bytes, config payload, raw
+error text, or environment data enter that locator. Still-linked bound
+snapshots are listed separately in `cleanup_failure.retained_objects`. A
+fixed last-known path is emitted as verified only after the retained descriptor
+and that path agree on device, inode, and object type. A relocated object is
+reported by exact device/inode with an explicitly unverified last-known path;
+the potentially attacker-chosen current path is not serialized.
 
 On Linux, the explicit `linux-posix-mode-mask-v1` path relies on POSIX access
 ACL effective masks being reflected in the group mode bits already bound by
@@ -464,7 +496,7 @@ python3 scripts/doctor_cisco_cutover_enforcement.py \
   --candidate-head-sha <retirement-head-40-lowercase-hex>
 ```
 
-The admitted doctor receipt has exact fields for the schema/operation,
+The schema-5 admitted doctor receipt has exact fields for the schema/operation,
 contract and collected-evidence SHA-256 digests, collection timestamps and
 page bounds, authenticated account identity, organization/target repository,
 PR number/head repository ID/head SHA, ruleset source/ID, source workflow

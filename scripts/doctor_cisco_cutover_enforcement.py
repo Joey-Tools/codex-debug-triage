@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 import errno
+import fcntl
 import hashlib
 import json
 import os
@@ -23,7 +24,7 @@ from typing import Any, Optional
 
 CONTRACT_SCHEMA_VERSION = 4
 COLLECTOR_SCHEMA_VERSION = 3
-DOCTOR_SCHEMA_VERSION = 4
+DOCTOR_SCHEMA_VERSION = 5
 API_HOST = "github.com"
 API_ROOT = "https://api.github.com"
 API_VERSION = "2026-03-10"
@@ -122,10 +123,12 @@ class EnforcementDoctorError(ValueError):
         reason: str,
         *,
         api_failure: Optional[dict[str, Any]] = None,
+        cleanup_failure: Optional[dict[str, Any]] = None,
     ) -> None:
         super().__init__(reason)
         self.reason_code = reason_code
         self.api_failure = api_failure
+        self.cleanup_failure = cleanup_failure
 
 
 def _blocked(
@@ -133,11 +136,13 @@ def _blocked(
     reason: str,
     *,
     api_failure: Optional[dict[str, Any]] = None,
+    cleanup_failure: Optional[dict[str, Any]] = None,
 ) -> EnforcementDoctorError:
     return EnforcementDoctorError(
         reason_code,
         reason,
         api_failure=api_failure,
+        cleanup_failure=cleanup_failure,
     )
 
 
@@ -833,6 +838,42 @@ def _file_status(status_value: os.stat_result) -> dict[str, int]:
     }
 
 
+def _object_identity(status_value: os.stat_result) -> tuple[int, int]:
+    return (status_value.st_dev, status_value.st_ino)
+
+
+def _binding_identity(binding: dict[str, int]) -> tuple[int, int]:
+    return (binding["device"], binding["inode"])
+
+
+def _verified_descriptor_path(fd: int) -> Optional[pathlib.Path]:
+    candidate: Optional[str] = None
+    try:
+        if sys.platform == "darwin" and hasattr(fcntl, "F_GETPATH"):
+            raw_path = fcntl.fcntl(fd, fcntl.F_GETPATH, b"\0" * 1024)
+            candidate = os.fsdecode(raw_path.split(b"\0", 1)[0])
+        elif sys.platform.startswith("linux"):
+            candidate = os.readlink(f"/proc/self/fd/{fd}")
+    except (OSError, ValueError):
+        return None
+    if candidate is None:
+        return None
+    path = pathlib.Path(candidate)
+    if not path.is_absolute() or path == pathlib.Path("/"):
+        return None
+    try:
+        descriptor = os.fstat(fd)
+        path_status = os.stat(path, follow_symlinks=False)
+    except OSError:
+        return None
+    if (
+        _object_identity(descriptor) != _object_identity(path_status)
+        or stat.S_IFMT(descriptor.st_mode) != stat.S_IFMT(path_status.st_mode)
+    ):
+        return None
+    return path
+
+
 class _DarwinAclRuntime:
     def __init__(self) -> None:
         self._libc = ctypes.CDLL(DARWIN_LIBSYSTEM_PATH, use_errno=True)
@@ -1200,6 +1241,42 @@ class _BoundDirectory:
                 if (
                     _directory_status(child_descriptor) != expected
                     or _directory_status(child_path) != expected
+                ):
+                    raise self._inconclusive()
+        except EnforcementDoctorError:
+            raise
+        except OSError as error:
+            raise self._inconclusive() from error
+
+    def revalidate_identity(self) -> None:
+        """Bind cleanup to the retained directory objects, not mutable policy."""
+        if self._closed or not self._fds:
+            raise _blocked(
+                "collector-inconclusive",
+                f"{self.label} binding is unavailable",
+            )
+        try:
+            for fd, expected in zip(self._fds, self._bindings):
+                current = os.fstat(fd)
+                if (
+                    not stat.S_ISDIR(current.st_mode)
+                    or _object_identity(current) != _binding_identity(expected)
+                ):
+                    raise self._inconclusive()
+            for relation, expected in zip(self._relations, self._bindings[1:]):
+                parent_fd, component, child_fd = relation
+                child_descriptor = os.fstat(child_fd)
+                child_path = os.stat(
+                    component,
+                    dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+                expected_identity = _binding_identity(expected)
+                if (
+                    not stat.S_ISDIR(child_descriptor.st_mode)
+                    or not stat.S_ISDIR(child_path.st_mode)
+                    or _object_identity(child_descriptor) != expected_identity
+                    or _object_identity(child_path) != expected_identity
                 ):
                     raise self._inconclusive()
         except EnforcementDoctorError:
@@ -1717,6 +1794,7 @@ def _create_private_regular_file(
     name: str,
     payload: bytes,
     *,
+    cleanup_anchors: list[dict[str, Any]],
     label: str,
     mode: int,
     max_bytes: int,
@@ -1736,8 +1814,17 @@ def _create_private_regular_file(
         | getattr(os, "O_CLOEXEC", 0)
     )
     fd: Optional[int] = None
+    cleanup_anchor: Optional[dict[str, Any]] = None
+    cleanup_anchor_registered = False
     try:
         fd = os.open(name, flags, mode, dir_fd=parent.fd)
+        cleanup_anchor = {
+            "fd": fd,
+            "label": label,
+            "last_known_path": parent.path / name,
+        }
+        cleanup_anchors.append(cleanup_anchor)
+        cleanup_anchor_registered = True
         descriptor = os.fstat(fd)
         path_status = os.stat(
             name,
@@ -1776,6 +1863,16 @@ def _create_private_regular_file(
                 "collector-unavailable",
                 f"{label} could not be bound after creation",
             )
+        parent.revalidate()
+        bound_file = _BoundRegularFile(
+            parent,
+            name,
+            label=label,
+            max_bytes=max_bytes,
+        )
+        cleanup_anchors.remove(cleanup_anchor)
+        cleanup_anchor_registered = False
+        return bound_file
     except EnforcementDoctorError:
         raise
     except OSError as error:
@@ -1784,18 +1881,11 @@ def _create_private_regular_file(
             f"{label} could not be created safely",
         ) from error
     finally:
-        if fd is not None:
+        if fd is not None and not cleanup_anchor_registered:
             try:
                 os.close(fd)
             except OSError:
                 pass
-    parent.revalidate()
-    return _BoundRegularFile(
-        parent,
-        name,
-        label=label,
-        max_bytes=max_bytes,
-    )
 
 
 def _write_all(fd: int, payload: bytes) -> None:
@@ -1924,11 +2014,13 @@ class GitHubApiClient:
         self._source_global_config_file: Optional[_BoundRegularFile] = None
         self._snapshot_hosts_file: Optional[_BoundRegularFile] = None
         self._snapshot_global_config_file: Optional[_BoundRegularFile] = None
+        self._provisional_cleanup_objects: list[dict[str, Any]] = []
         self._source_fd: Optional[int] = None
         self._snapshot_fd: Optional[int] = None
         self._source_access_policy_binding: Optional[tuple[str, int, str]] = None
         self._snapshot_access_policy_binding: Optional[tuple[str, int, str]] = None
         self._closed = False
+        self._collector_inconclusive_reported = False
         self._pinned = False
         self._run_name = ""
         self._execution_cwd = ""
@@ -1966,8 +2058,10 @@ class GitHubApiClient:
             self._config_snapshot_directory.set_owner_mode(0o500)
             self._executable_snapshot_directory.set_owner_mode(0o500)
             self._revalidate_snapshot()
-        except BaseException:
-            self._cleanup_noexcept()
+        except BaseException as initialization_error:
+            cleanup_error = self._cleanup_noexcept()
+            if cleanup_error is not None:
+                raise cleanup_error from initialization_error
             raise
         self.calls = 0
         self.total_bytes = 0
@@ -2058,6 +2152,7 @@ class GitHubApiClient:
             self._config_snapshot_directory,
             "hosts.yml",
             minimal_hosts,
+            cleanup_anchors=self._provisional_cleanup_objects,
             label="GitHub CLI private hosts.yml snapshot",
             mode=0o400,
             max_bytes=MAX_GH_CONFIG_BYTES,
@@ -2066,6 +2161,7 @@ class GitHubApiClient:
             self._config_snapshot_directory,
             "config.yml",
             GH_SNAPSHOT_CONFIG,
+            cleanup_anchors=self._provisional_cleanup_objects,
             label="GitHub CLI private config.yml snapshot",
             mode=0o400,
             max_bytes=MAX_GH_CONFIG_BYTES,
@@ -2339,6 +2435,7 @@ class GitHubApiClient:
                 os.close(source_fd)
 
     def _collector_inconclusive(self) -> EnforcementDoctorError:
+        self._collector_inconclusive_reported = True
         return _blocked(
             "collector-inconclusive",
             "pinned GitHub CLI snapshot could not be revalidated",
@@ -2438,10 +2535,555 @@ class GitHubApiClient:
     def revalidate_for_admission(self) -> None:
         self._revalidate_snapshot()
 
+    def _cleanup_file_binding(
+        self,
+        bound_file: Optional[_BoundRegularFile],
+        path: pathlib.Path,
+    ) -> tuple[Optional[int], Optional[dict[str, int]]]:
+        if bound_file is not None:
+            return bound_file.fd, bound_file.binding
+        for anchor in self._provisional_cleanup_objects:
+            if anchor["last_known_path"] != path:
+                continue
+            fd = anchor["fd"]
+            try:
+                return fd, _file_status(os.fstat(fd))
+            except OSError:
+                return fd, None
+        return None, None
+
+    @staticmethod
+    def _prepare_directory_for_cleanup(directory: _BoundDirectory) -> None:
+        # Cleanup protects object identity. A mode or ACL drift is an access-
+        # policy change, not an object replacement, so it must not redirect
+        # fchmod or the later dirfd-relative removals to another object.
+        directory.revalidate_identity()
+        os.fchmod(directory.fd, 0o700)
+        descriptor = os.fstat(directory.fd)
+        if (
+            not stat.S_ISDIR(descriptor.st_mode)
+            or descriptor.st_uid != os.geteuid()
+            or stat.S_IMODE(descriptor.st_mode) != 0o700
+            or _object_identity(descriptor)
+            != _binding_identity(directory._bindings[-1])
+        ):
+            raise directory._inconclusive()
+        directory.revalidate_identity()
+
+    @staticmethod
+    def _unlink_cleanup_file(
+        parent: _BoundDirectory,
+        name: str,
+        *,
+        label: str,
+        bound_fd: Optional[int],
+        expected_binding: Optional[dict[str, int]],
+    ) -> None:
+        parent.revalidate_identity()
+        cleanup_fd = bound_fd
+        temporary_fd: Optional[int] = None
+        try:
+            if cleanup_fd is None:
+                flags = (
+                    os.O_RDONLY
+                    | os.O_NOFOLLOW
+                    | os.O_NONBLOCK
+                    | getattr(os, "O_CLOEXEC", 0)
+                )
+                try:
+                    temporary_fd = os.open(name, flags, dir_fd=parent.fd)
+                except FileNotFoundError:
+                    return
+                cleanup_fd = temporary_fd
+                descriptor = os.fstat(cleanup_fd)
+                path_status = os.stat(
+                    name,
+                    dir_fd=parent.fd,
+                    follow_symlinks=False,
+                )
+                if (
+                    not stat.S_ISREG(descriptor.st_mode)
+                    or not stat.S_ISREG(path_status.st_mode)
+                    or _object_identity(descriptor) != _object_identity(path_status)
+                ):
+                    raise _blocked(
+                        "collector-inconclusive",
+                        f"{label} cleanup identity is unstable",
+                    )
+                expected_identity = _object_identity(descriptor)
+            else:
+                if expected_binding is None:
+                    raise _blocked(
+                        "collector-inconclusive",
+                        f"{label} cleanup binding is unavailable",
+                    )
+                expected_identity = _binding_identity(expected_binding)
+
+            descriptor_before = os.fstat(cleanup_fd)
+            try:
+                path_before = os.stat(
+                    name,
+                    dir_fd=parent.fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                if (
+                    _object_identity(descriptor_before) == expected_identity
+                    and descriptor_before.st_nlink == 0
+                ):
+                    return
+                raise
+            if (
+                not stat.S_ISREG(descriptor_before.st_mode)
+                or not stat.S_ISREG(path_before.st_mode)
+                or _object_identity(descriptor_before) != expected_identity
+                or _object_identity(path_before) != expected_identity
+            ):
+                raise _blocked(
+                    "collector-inconclusive",
+                    f"{label} cleanup identity changed",
+                )
+            os.unlink(name, dir_fd=parent.fd)
+            descriptor_after = os.fstat(cleanup_fd)
+            if (
+                not stat.S_ISREG(descriptor_after.st_mode)
+                or _object_identity(descriptor_after) != expected_identity
+                or descriptor_after.st_nlink != 0
+            ):
+                raise _blocked(
+                    "collector-inconclusive",
+                    f"{label} unlink could not be proven",
+                )
+            try:
+                os.stat(
+                    name,
+                    dir_fd=parent.fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                pass
+            else:
+                raise _blocked(
+                    "collector-inconclusive",
+                    f"{label} name was repopulated during cleanup",
+                )
+            parent.revalidate_identity()
+        finally:
+            if temporary_fd is not None:
+                try:
+                    os.close(temporary_fd)
+                except OSError:
+                    pass
+
+    @staticmethod
+    def _remove_cleanup_directory(
+        parent: _BoundDirectory,
+        name: str,
+        *,
+        label: str,
+        child: Optional[_BoundDirectory],
+    ) -> None:
+        parent.revalidate_identity()
+        child_fd: Optional[int] = None
+        temporary_fd: Optional[int] = None
+        try:
+            if child is None:
+                flags = (
+                    os.O_RDONLY
+                    | os.O_DIRECTORY
+                    | os.O_NOFOLLOW
+                    | os.O_NONBLOCK
+                    | getattr(os, "O_CLOEXEC", 0)
+                )
+                try:
+                    temporary_fd = os.open(name, flags, dir_fd=parent.fd)
+                except FileNotFoundError:
+                    return
+                child_fd = temporary_fd
+                expected_identity = _object_identity(os.fstat(child_fd))
+            else:
+                child.revalidate_identity()
+                child_fd = child.fd
+                expected_identity = _binding_identity(child._bindings[-1])
+
+            descriptor_before = os.fstat(child_fd)
+            path_before = os.stat(
+                name,
+                dir_fd=parent.fd,
+                follow_symlinks=False,
+            )
+            if (
+                not stat.S_ISDIR(descriptor_before.st_mode)
+                or not stat.S_ISDIR(path_before.st_mode)
+                or _object_identity(descriptor_before) != expected_identity
+                or _object_identity(path_before) != expected_identity
+            ):
+                raise _blocked(
+                    "collector-inconclusive",
+                    f"{label} cleanup identity changed",
+                )
+            os.rmdir(name, dir_fd=parent.fd)
+            try:
+                os.stat(
+                    name,
+                    dir_fd=parent.fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                pass
+            else:
+                raise _blocked(
+                    "collector-inconclusive",
+                    f"{label} name was repopulated during cleanup",
+                )
+            parent.revalidate_identity()
+        finally:
+            if temporary_fd is not None:
+                try:
+                    os.close(temporary_fd)
+                except OSError:
+                    pass
+
+    def _retained_runtime_locator(self) -> Optional[dict[str, Any]]:
+        if (
+            self._runtime_parent is None
+            or self._run_directory is None
+            or not self._run_name
+        ):
+            return None
+        try:
+            descriptor = os.fstat(self._run_directory.fd)
+        except OSError:
+            return {
+                "last_known_path": os.fspath(self._run_directory.path),
+                "path_binding": "unverified",
+            }
+        locator: dict[str, Any] = {
+            "device": descriptor.st_dev,
+            "inode": descriptor.st_ino,
+            "links": descriptor.st_nlink,
+            "last_known_path": os.fspath(self._run_directory.path),
+            "path_binding": "unverified",
+        }
+        try:
+            self._runtime_parent.revalidate_identity()
+            path_status = os.stat(
+                self._run_name,
+                dir_fd=self._runtime_parent.fd,
+                follow_symlinks=False,
+            )
+        except (EnforcementDoctorError, OSError):
+            return locator
+        if (
+            stat.S_ISDIR(descriptor.st_mode)
+            and stat.S_ISDIR(path_status.st_mode)
+            and _object_identity(descriptor) == _object_identity(path_status)
+        ):
+            locator.pop("last_known_path")
+            locator["path"] = os.fspath(self._run_directory.path)
+            locator["path_binding"] = "verified"
+        return locator
+
+    @staticmethod
+    def _retained_object_locator(
+        fd: Optional[int],
+        *,
+        label: str,
+        last_known_path: pathlib.Path,
+    ) -> Optional[dict[str, Any]]:
+        if fd is None:
+            return None
+        try:
+            descriptor = os.fstat(fd)
+        except OSError:
+            return {
+                "label": label,
+                "last_known_path": os.fspath(last_known_path),
+                "path_binding": "unverified",
+            }
+        if stat.S_ISREG(descriptor.st_mode) and descriptor.st_nlink == 0:
+            return None
+        current_path = _verified_descriptor_path(fd)
+        if current_path is None and stat.S_ISDIR(descriptor.st_mode):
+            # Darwin retains the pre-removal directory path and link count on
+            # an open fd. Failure to resolve that path to the same inode is the
+            # portable evidence that the removed directory is not locatable.
+            return None
+        locator: dict[str, Any] = {
+            "device": descriptor.st_dev,
+            "inode": descriptor.st_ino,
+            "label": label,
+            "links": descriptor.st_nlink,
+            "last_known_path": os.fspath(last_known_path),
+            "path_binding": "unverified",
+        }
+        if current_path is not None:
+            if current_path == last_known_path:
+                locator.pop("last_known_path")
+                locator["path"] = os.fspath(current_path)
+                locator["path_binding"] = "verified"
+        return locator
+
+    def _retained_cleanup_objects(self) -> list[dict[str, Any]]:
+        if self._run_directory is not None:
+            run_path = self._run_directory.path
+        elif self._execution_cwd:
+            run_path = pathlib.Path(self._execution_cwd)
+        else:
+            return []
+        candidates = tuple(
+            (
+                anchor["fd"],
+                anchor["label"],
+                anchor["last_known_path"],
+            )
+            for anchor in self._provisional_cleanup_objects
+        ) + (
+            (
+                None
+                if self._snapshot_hosts_file is None
+                else self._snapshot_hosts_file.fd,
+                "GitHub CLI private hosts.yml snapshot",
+                (
+                    run_path / "config" / "hosts.yml"
+                    if self._config_snapshot_directory is None
+                    else self._config_snapshot_directory.path / "hosts.yml"
+                ),
+            ),
+            (
+                None
+                if self._snapshot_global_config_file is None
+                else self._snapshot_global_config_file.fd,
+                "GitHub CLI private config.yml snapshot",
+                (
+                    run_path / "config" / "config.yml"
+                    if self._config_snapshot_directory is None
+                    else self._config_snapshot_directory.path / "config.yml"
+                ),
+            ),
+            (
+                self._snapshot_fd,
+                "GitHub CLI executable snapshot",
+                (
+                    run_path / "bin" / "gh"
+                    if self._executable_snapshot_directory is None
+                    else self._executable_snapshot_directory.path / "gh"
+                ),
+            ),
+            (
+                None
+                if self._config_snapshot_directory is None
+                else self._config_snapshot_directory.fd,
+                "GitHub CLI private config snapshot directory",
+                (
+                    run_path / "config"
+                    if self._config_snapshot_directory is None
+                    else self._config_snapshot_directory.path
+                ),
+            ),
+            (
+                None
+                if self._executable_snapshot_directory is None
+                else self._executable_snapshot_directory.fd,
+                "GitHub CLI private executable snapshot directory",
+                (
+                    run_path / "bin"
+                    if self._executable_snapshot_directory is None
+                    else self._executable_snapshot_directory.path
+                ),
+            ),
+            (
+                None if self._run_directory is None else self._run_directory.fd,
+                "GitHub CLI private run directory",
+                run_path,
+            ),
+        )
+        retained: list[dict[str, Any]] = []
+        for fd, label, last_known_path in candidates:
+            locator = self._retained_object_locator(
+                fd,
+                label=label,
+                last_known_path=last_known_path,
+            )
+            if locator is not None:
+                retained.append(locator)
+        return retained
+
     def close(self) -> None:
         if self._closed:
             return
+        cleanup_failures: list[str] = []
+        cleanup_proofs: list[bool] = []
+        if self._pinned:
+            previously_reported_inconclusive = (
+                self._collector_inconclusive_reported
+            )
+            try:
+                self._revalidate_snapshot()
+            except Exception:
+                # Deletion can still be identity-bound and complete after an
+                # access-policy anomaly, but it cannot undo a confidentiality
+                # or execution-policy expansion that existed before cleanup.
+                if not previously_reported_inconclusive:
+                    cleanup_failures.append("pre-cleanup-revalidation")
         self._closed = True
+
+        def attempt(
+            label: str,
+            action: Any,
+            *,
+            proof_required: bool,
+        ) -> bool:
+            try:
+                action()
+            except Exception:
+                cleanup_failures.append(label)
+                if proof_required:
+                    cleanup_proofs.append(False)
+                return False
+            else:
+                if proof_required:
+                    cleanup_proofs.append(True)
+                return True
+
+        if self._config_snapshot_directory is not None:
+            attempt(
+                "config-directory-owner-mode",
+                lambda: self._prepare_directory_for_cleanup(
+                    self._config_snapshot_directory
+                ),
+                proof_required=False,
+            )
+            for name, bound_file, label in (
+                (
+                    "hosts.yml",
+                    self._snapshot_hosts_file,
+                    "GitHub CLI private hosts.yml snapshot",
+                ),
+                (
+                    "config.yml",
+                    self._snapshot_global_config_file,
+                    "GitHub CLI private config.yml snapshot",
+                ),
+            ):
+                bound_fd, expected_binding = self._cleanup_file_binding(
+                    bound_file,
+                    self._config_snapshot_directory.path / name,
+                )
+                attempt(
+                    f"unlink-{name}",
+                    lambda name=name,
+                    label=label,
+                    bound_fd=bound_fd,
+                    expected_binding=expected_binding: (
+                        self._unlink_cleanup_file(
+                            self._config_snapshot_directory,
+                            name,
+                            label=label,
+                            bound_fd=bound_fd,
+                            expected_binding=expected_binding,
+                        )
+                    ),
+                    proof_required=True,
+                )
+
+        if self._executable_snapshot_directory is not None:
+            attempt(
+                "executable-directory-owner-mode",
+                lambda: self._prepare_directory_for_cleanup(
+                    self._executable_snapshot_directory
+                ),
+                proof_required=False,
+            )
+            attempt(
+                "unlink-gh",
+                lambda: self._unlink_cleanup_file(
+                    self._executable_snapshot_directory,
+                    "gh",
+                    label="GitHub CLI executable snapshot",
+                    bound_fd=self._snapshot_fd,
+                    expected_binding=getattr(self, "_snapshot_binding", None),
+                ),
+                proof_required=True,
+            )
+
+        run_directory_removed = self._run_directory is None
+        if self._run_directory is not None:
+            if self._config_snapshot_directory is None:
+                attempt(
+                    "remove-config-directory",
+                    lambda: self._remove_cleanup_directory(
+                        self._run_directory,
+                        "config",
+                        label="GitHub CLI private config snapshot directory",
+                        child=None,
+                    ),
+                    proof_required=True,
+                )
+            else:
+                attempt(
+                    "remove-config-directory",
+                    lambda: self._remove_cleanup_directory(
+                        self._run_directory,
+                        "config",
+                        label="GitHub CLI private config snapshot directory",
+                        child=self._config_snapshot_directory,
+                    ),
+                    proof_required=True,
+                )
+            if self._executable_snapshot_directory is None:
+                attempt(
+                    "remove-bin-directory",
+                    lambda: self._remove_cleanup_directory(
+                        self._run_directory,
+                        "bin",
+                        label="GitHub CLI private executable snapshot directory",
+                        child=None,
+                    ),
+                    proof_required=True,
+                )
+            else:
+                attempt(
+                    "remove-bin-directory",
+                    lambda: self._remove_cleanup_directory(
+                        self._run_directory,
+                        "bin",
+                        label="GitHub CLI private executable snapshot directory",
+                        child=self._executable_snapshot_directory,
+                    ),
+                    proof_required=True,
+                )
+            if self._runtime_parent is None or not self._run_name:
+                cleanup_failures.append("remove-run-directory")
+                cleanup_proofs.append(False)
+            else:
+                run_directory_removed = attempt(
+                    "remove-run-directory",
+                    lambda: self._remove_cleanup_directory(
+                        self._runtime_parent,
+                        self._run_name,
+                        label="GitHub CLI private run directory",
+                        child=self._run_directory,
+                    ),
+                    proof_required=True,
+                )
+
+        cleanup_proven = all(cleanup_proofs)
+        retained_locator = (
+            None
+            if run_directory_removed
+            else self._retained_runtime_locator()
+        )
+        retained_objects = (
+            [] if cleanup_proven else self._retained_cleanup_objects()
+        )
+
+        for anchor in self._provisional_cleanup_objects:
+            try:
+                os.close(anchor["fd"])
+            except OSError:
+                cleanup_failures.append("close-provisional-cleanup-object")
+        self._provisional_cleanup_objects.clear()
         for bound_file in (
             self._source_hosts_file,
             self._source_global_config_file,
@@ -2453,69 +3095,55 @@ class GitHubApiClient:
         if self._source_fd is not None:
             try:
                 os.close(self._source_fd)
+            except OSError:
+                cleanup_failures.append("close-source-executable")
             finally:
                 self._source_fd = None
         if self._snapshot_fd is not None:
             try:
                 os.close(self._snapshot_fd)
+            except OSError:
+                cleanup_failures.append("close-executable-snapshot")
             finally:
                 self._snapshot_fd = None
         if self._config_snapshot_directory is not None:
-            try:
-                os.fchmod(self._config_snapshot_directory.fd, 0o700)
-            except OSError:
-                pass
-            for name in ("hosts.yml", "config.yml"):
-                try:
-                    os.unlink(name, dir_fd=self._config_snapshot_directory.fd)
-                except FileNotFoundError:
-                    pass
-                except OSError:
-                    pass
             self._config_snapshot_directory.close()
             self._config_snapshot_directory = None
         if self._source_config_directory is not None:
             self._source_config_directory.close()
             self._source_config_directory = None
         if self._executable_snapshot_directory is not None:
-            try:
-                os.fchmod(self._executable_snapshot_directory.fd, 0o700)
-            except OSError:
-                pass
-            try:
-                os.unlink("gh", dir_fd=self._executable_snapshot_directory.fd)
-            except FileNotFoundError:
-                pass
-            except OSError:
-                pass
             self._executable_snapshot_directory.close()
             self._executable_snapshot_directory = None
         if self._run_directory is not None:
-            for name in ("config", "bin"):
-                try:
-                    os.rmdir(name, dir_fd=self._run_directory.fd)
-                except FileNotFoundError:
-                    pass
-                except OSError:
-                    pass
             self._run_directory.close()
             self._run_directory = None
-        if self._runtime_parent is not None and self._run_name:
-            try:
-                os.rmdir(self._run_name, dir_fd=self._runtime_parent.fd)
-            except FileNotFoundError:
-                pass
-            except OSError:
-                pass
         if self._runtime_parent is not None:
             self._runtime_parent.close()
             self._runtime_parent = None
+        if cleanup_failures or not cleanup_proven:
+            cleanup_failure: dict[str, Any] = {
+                "cleanup_proof": (
+                    "complete" if cleanup_proven else "inconclusive"
+                ),
+                "failed_operations": sorted(set(cleanup_failures)),
+            }
+            if retained_locator is not None:
+                cleanup_failure["retained_runtime"] = retained_locator
+            if retained_objects:
+                cleanup_failure["retained_objects"] = retained_objects
+            raise _blocked(
+                "collector-inconclusive",
+                "GitHub CLI private snapshot policy or cleanup could not be proven",
+                cleanup_failure=cleanup_failure,
+            )
 
-    def _cleanup_noexcept(self) -> None:
+    def _cleanup_noexcept(self) -> Optional[EnforcementDoctorError]:
         try:
             self.close()
-        except BaseException:
-            pass
+        except EnforcementDoctorError as error:
+            return error
+        return None
 
     def __enter__(self) -> GitHubApiClient:
         return self
@@ -4530,16 +5158,18 @@ def main() -> int:
     args = build_parser().parse_args()
     contract_sha256 = None
     evidence_sha256 = None
+    static_equivalence = None
     try:
         contract, contract_sha256 = _read_json(args.contract, label="contract")
+        loaded_contract = _load_contract(contract)
         with GitHubApiClient(
             args.gh_executable,
             args.expected_gh_sha256,
             args.gh_config_dir,
         ) as client:
-            evidence, admission = collect_and_validate(
+            evidence, admission = _collect_and_validate_static(
                 client,
-                contract,
+                loaded_contract,
                 expected_run_attempt=args.expected_run_attempt,
                 expected_run_id=args.expected_run_id,
                 expected_ruleset_id=args.expected_ruleset_id,
@@ -4548,10 +5178,12 @@ def main() -> int:
                 candidate_head_sha=args.candidate_head_sha,
                 pull_request_number=args.pull_request_number,
             )
+            client.revalidate_for_admission()
             evidence_sha256 = hashlib.sha256(
                 _canonical_json_bytes(evidence)
             ).hexdigest()
-            client.revalidate_for_admission()
+            static_equivalence = "validated"
+            _require_pointer_proof(loaded_contract)
     except EnforcementDoctorError as error:
         blocked_receipt = {
             "classification": "blocked_until_trusted",
@@ -4561,9 +5193,12 @@ def main() -> int:
             "reason": str(error),
             "reason_code": error.reason_code,
             "schema_version": DOCTOR_SCHEMA_VERSION,
+            "static_equivalence": static_equivalence,
         }
         if error.api_failure is not None:
             blocked_receipt["api_failure"] = error.api_failure
+        if error.cleanup_failure is not None:
+            blocked_receipt["cleanup_failure"] = error.cleanup_failure
         print(
             json.dumps(
                 blocked_receipt,
@@ -4626,6 +5261,7 @@ def main() -> int:
                     "target": selected_ruleset["target"],
                 },
                 "schema_version": DOCTOR_SCHEMA_VERSION,
+                "static_equivalence": static_equivalence,
                 "trusted_execution": {
                     "selection": {
                         "expected_run_attempt": args.expected_run_attempt,

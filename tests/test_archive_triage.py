@@ -11,6 +11,7 @@ import importlib.util
 import io
 import json
 import os
+import shutil
 import shlex
 import signal
 import struct
@@ -6564,6 +6565,563 @@ class BugTriageDocumentationTests(unittest.TestCase):
                     actual_response = client.get_json("/user")
                     self.assertEqual(actual_response["login"], "fixture")
 
+    def test_enforcement_gh_cleanup_removes_identity_bound_policy_drift(
+        self,
+    ) -> None:
+        with owner_controlled_temp_root() as temp_root:
+            trusted_gh = temp_root / "trusted-gh"
+            trusted_payload = b"#!/bin/sh\nexit 0\n"
+            trusted_gh.write_bytes(trusted_payload)
+            trusted_gh.chmod(0o700)
+            config_dir, runtime_parent = self._make_private_gh_config(temp_root)
+            client = ENFORCEMENT_MODULE.GitHubApiClient(
+                trusted_gh,
+                hashlib.sha256(trusted_payload).hexdigest(),
+                config_dir,
+                runtime_parent=runtime_parent,
+            )
+            run_path = client._run_directory.path
+            snapshot_hosts = client._config_snapshot_directory.path / "hosts.yml"
+            snapshot_hosts.chmod(0o644)
+
+            with self.assertRaises(
+                ENFORCEMENT_MODULE.EnforcementDoctorError
+            ) as raised:
+                client.close()
+
+            self.assertEqual(
+                raised.exception.reason_code,
+                "collector-inconclusive",
+            )
+            self.assertEqual(
+                raised.exception.cleanup_failure["cleanup_proof"],
+                "complete",
+            )
+            self.assertIn(
+                "pre-cleanup-revalidation",
+                raised.exception.cleanup_failure["failed_operations"],
+            )
+            self.assertNotIn(
+                "retained_runtime",
+                raised.exception.cleanup_failure,
+            )
+            self.assertFalse(run_path.exists())
+
+    def test_enforcement_gh_cleanup_reports_unlink_failure_locator(
+        self,
+    ) -> None:
+        with owner_controlled_temp_root() as temp_root:
+            trusted_gh = temp_root / "trusted-gh"
+            trusted_payload = b"#!/bin/sh\nexit 0\n"
+            trusted_gh.write_bytes(trusted_payload)
+            trusted_gh.chmod(0o700)
+            config_dir, runtime_parent = self._make_private_gh_config(
+                temp_root,
+                hosts_payload=(
+                    "github.com:\n"
+                    "    git_protocol: https\n"
+                    "    users:\n"
+                    "        fixture-admin:\n"
+                    f"            oauth_token: {SYNTHETIC_ACCESS_TOKEN}\n"
+                    "    user: fixture-admin\n"
+                    f"    oauth_token: {SYNTHETIC_ACCESS_TOKEN}\n"
+                ),
+            )
+            client = ENFORCEMENT_MODULE.GitHubApiClient(
+                trusted_gh,
+                hashlib.sha256(trusted_payload).hexdigest(),
+                config_dir,
+                runtime_parent=runtime_parent,
+            )
+            run_path = client._run_directory.path
+            run_status = run_path.stat()
+            snapshot_hosts = client._config_snapshot_directory.path / "hosts.yml"
+            snapshot_hosts.chmod(0o644)
+            config_fd = client._config_snapshot_directory.fd
+            original_unlink = os.unlink
+
+            def reject_token_unlink(
+                path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+                *,
+                dir_fd: int | None = None,
+            ) -> None:
+                if path == "hosts.yml" and dir_fd == config_fd:
+                    raise PermissionError(errno.EACCES, "fixture unlink failure")
+                original_unlink(path, dir_fd=dir_fd)
+
+            try:
+                with mock.patch.object(
+                    ENFORCEMENT_MODULE.os,
+                    "unlink",
+                    side_effect=reject_token_unlink,
+                ):
+                    with self.assertRaises(
+                        ENFORCEMENT_MODULE.EnforcementDoctorError
+                    ) as raised:
+                        client.close()
+
+                self.assertEqual(
+                    raised.exception.reason_code,
+                    "collector-inconclusive",
+                )
+                cleanup = raised.exception.cleanup_failure
+                self.assertEqual(cleanup["cleanup_proof"], "inconclusive")
+                self.assertIn("pre-cleanup-revalidation", cleanup["failed_operations"])
+                self.assertIn("unlink-hosts.yml", cleanup["failed_operations"])
+                self.assertIn(
+                    "remove-config-directory",
+                    cleanup["failed_operations"],
+                )
+                self.assertIn("remove-run-directory", cleanup["failed_operations"])
+                locator = cleanup["retained_runtime"]
+                self.assertEqual(locator["path"], str(run_path))
+                self.assertEqual(locator["path_binding"], "verified")
+                self.assertEqual(locator["device"], run_status.st_dev)
+                self.assertEqual(locator["inode"], run_status.st_ino)
+                self.assertTrue(snapshot_hosts.exists())
+            finally:
+                if run_path.exists():
+                    shutil.rmtree(run_path)
+
+    def test_enforcement_gh_cleanup_does_not_trust_missing_bound_name(
+        self,
+    ) -> None:
+        with owner_controlled_temp_root() as temp_root:
+            trusted_gh = temp_root / "trusted-gh"
+            trusted_payload = b"#!/bin/sh\nexit 0\n"
+            trusted_gh.write_bytes(trusted_payload)
+            trusted_gh.chmod(0o700)
+            config_dir, runtime_parent = self._make_private_gh_config(
+                temp_root,
+                hosts_payload=(
+                    "github.com:\n"
+                    "    git_protocol: https\n"
+                    "    users:\n"
+                    "        fixture-admin:\n"
+                    f"            oauth_token: {SYNTHETIC_ACCESS_TOKEN}\n"
+                    "    user: fixture-admin\n"
+                    f"    oauth_token: {SYNTHETIC_ACCESS_TOKEN}\n"
+                ),
+            )
+            client = ENFORCEMENT_MODULE.GitHubApiClient(
+                trusted_gh,
+                hashlib.sha256(trusted_payload).hexdigest(),
+                config_dir,
+                runtime_parent=runtime_parent,
+            )
+            snapshot_hosts = client._config_snapshot_directory.path / "hosts.yml"
+            relocated_hosts = temp_root / "relocated-hosts.yml"
+            expected_status = snapshot_hosts.stat()
+            client._config_snapshot_directory.set_owner_mode(0o700)
+            snapshot_hosts.rename(relocated_hosts)
+
+            try:
+                with self.assertRaises(
+                    ENFORCEMENT_MODULE.EnforcementDoctorError
+                ) as raised:
+                    client.close()
+
+                cleanup = raised.exception.cleanup_failure
+                self.assertEqual(cleanup["cleanup_proof"], "inconclusive")
+                self.assertIn("unlink-hosts.yml", cleanup["failed_operations"])
+                hosts_locators = [
+                    locator
+                    for locator in cleanup["retained_objects"]
+                    if locator["label"]
+                    == "GitHub CLI private hosts.yml snapshot"
+                ]
+                self.assertEqual(len(hosts_locators), 1)
+                self.assertEqual(
+                    hosts_locators[0]["device"],
+                    expected_status.st_dev,
+                )
+                self.assertEqual(
+                    hosts_locators[0]["inode"],
+                    expected_status.st_ino,
+                )
+                self.assertEqual(
+                    hosts_locators[0]["path_binding"],
+                    "unverified",
+                )
+                self.assertNotIn("path", hosts_locators[0])
+            finally:
+                if relocated_hosts.exists():
+                    relocated_hosts.unlink()
+
+    def test_enforcement_gh_cleanup_reports_rmdir_failure_locator(
+        self,
+    ) -> None:
+        with owner_controlled_temp_root() as temp_root:
+            trusted_gh = temp_root / "trusted-gh"
+            trusted_payload = b"#!/bin/sh\nexit 0\n"
+            trusted_gh.write_bytes(trusted_payload)
+            trusted_gh.chmod(0o700)
+            config_dir, runtime_parent = self._make_private_gh_config(temp_root)
+            client = ENFORCEMENT_MODULE.GitHubApiClient(
+                trusted_gh,
+                hashlib.sha256(trusted_payload).hexdigest(),
+                config_dir,
+                runtime_parent=runtime_parent,
+            )
+            run_path = client._run_directory.path
+            run_status = run_path.stat()
+            run_name = client._run_name
+            runtime_parent_fd = client._runtime_parent.fd
+            original_rmdir = os.rmdir
+
+            def reject_run_rmdir(
+                path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+                *,
+                dir_fd: int | None = None,
+            ) -> None:
+                if path == run_name and dir_fd == runtime_parent_fd:
+                    raise PermissionError(errno.EACCES, "fixture rmdir failure")
+                original_rmdir(path, dir_fd=dir_fd)
+
+            try:
+                with mock.patch.object(
+                    ENFORCEMENT_MODULE.os,
+                    "rmdir",
+                    side_effect=reject_run_rmdir,
+                ):
+                    with self.assertRaises(
+                        ENFORCEMENT_MODULE.EnforcementDoctorError
+                    ) as raised:
+                        client.close()
+
+                cleanup = raised.exception.cleanup_failure
+                self.assertEqual(cleanup["cleanup_proof"], "inconclusive")
+                self.assertEqual(
+                    cleanup["failed_operations"],
+                    ["remove-run-directory"],
+                )
+                locator = cleanup["retained_runtime"]
+                self.assertEqual(locator["path"], str(run_path))
+                self.assertEqual(locator["path_binding"], "verified")
+                self.assertEqual(locator["device"], run_status.st_dev)
+                self.assertEqual(locator["inode"], run_status.st_ino)
+                self.assertEqual(list(run_path.iterdir()), [])
+            finally:
+                if run_path.exists():
+                    run_path.rmdir()
+
+    def test_enforcement_gh_cleanup_reports_fchmod_failure_locator(
+        self,
+    ) -> None:
+        with owner_controlled_temp_root() as temp_root:
+            trusted_gh = temp_root / "trusted-gh"
+            trusted_payload = b"#!/bin/sh\nexit 0\n"
+            trusted_gh.write_bytes(trusted_payload)
+            trusted_gh.chmod(0o700)
+            config_dir, runtime_parent = self._make_private_gh_config(
+                temp_root,
+                hosts_payload=(
+                    "github.com:\n"
+                    "    git_protocol: https\n"
+                    "    users:\n"
+                    "        fixture-admin:\n"
+                    f"            oauth_token: {SYNTHETIC_ACCESS_TOKEN}\n"
+                    "    user: fixture-admin\n"
+                    f"    oauth_token: {SYNTHETIC_ACCESS_TOKEN}\n"
+                ),
+            )
+            client = ENFORCEMENT_MODULE.GitHubApiClient(
+                trusted_gh,
+                hashlib.sha256(trusted_payload).hexdigest(),
+                config_dir,
+                runtime_parent=runtime_parent,
+            )
+            run_path = client._run_directory.path
+            config_snapshot = client._config_snapshot_directory.path
+            config_fd = client._config_snapshot_directory.fd
+            original_fchmod = os.fchmod
+
+            def reject_config_fchmod(fd: int, mode: int) -> None:
+                if fd == config_fd:
+                    raise PermissionError(errno.EACCES, "fixture fchmod failure")
+                original_fchmod(fd, mode)
+
+            try:
+                with mock.patch.object(
+                    ENFORCEMENT_MODULE.os,
+                    "fchmod",
+                    side_effect=reject_config_fchmod,
+                ):
+                    with self.assertRaises(
+                        ENFORCEMENT_MODULE.EnforcementDoctorError
+                    ) as raised:
+                        client.close()
+
+                cleanup = raised.exception.cleanup_failure
+                self.assertEqual(cleanup["cleanup_proof"], "inconclusive")
+                self.assertIn(
+                    "config-directory-owner-mode",
+                    cleanup["failed_operations"],
+                )
+                self.assertEqual(
+                    cleanup["retained_runtime"]["path"],
+                    str(run_path),
+                )
+                self.assertEqual(
+                    cleanup["retained_runtime"]["path_binding"],
+                    "verified",
+                )
+            finally:
+                if config_snapshot.exists():
+                    config_snapshot.chmod(0o700)
+                if run_path.exists():
+                    shutil.rmtree(run_path)
+
+    def test_enforcement_gh_constructor_reports_cleanup_failure_locator(
+        self,
+    ) -> None:
+        with owner_controlled_temp_root() as temp_root:
+            trusted_gh = temp_root / "trusted-gh"
+            trusted_payload = b"#!/bin/sh\nexit 0\n"
+            trusted_gh.write_bytes(trusted_payload)
+            trusted_gh.chmod(0o700)
+            config_dir, runtime_parent = self._make_private_gh_config(
+                temp_root,
+                hosts_payload=(
+                    "github.com:\n"
+                    "    git_protocol: https\n"
+                    "    users:\n"
+                    "        fixture-admin:\n"
+                    f"            oauth_token: {SYNTHETIC_ACCESS_TOKEN}\n"
+                    "    user: fixture-admin\n"
+                    f"    oauth_token: {SYNTHETIC_ACCESS_TOKEN}\n"
+                ),
+            )
+            original_bound_regular_file = ENFORCEMENT_MODULE._BoundRegularFile
+            original_unlink = os.unlink
+            created_config_status: dict[str, os.stat_result] = {}
+
+            def fail_global_snapshot_binding(
+                parent: object,
+                name: str,
+                **kwargs: object,
+            ) -> object:
+                if (
+                    name == "config.yml"
+                    and parent.path.name == "config"
+                    and parent.path.parent.parent == runtime_parent
+                ):
+                    created_config_status["value"] = (
+                        parent.path / name
+                    ).stat()
+                    raise ENFORCEMENT_MODULE._blocked(
+                        "collector-unavailable",
+                        "fixture config snapshot binding failure",
+                    )
+                return original_bound_regular_file(parent, name, **kwargs)
+
+            def reject_config_unlink(
+                path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+                *,
+                dir_fd: int | None = None,
+            ) -> None:
+                if path == "config.yml":
+                    raise PermissionError(errno.EACCES, "fixture unlink failure")
+                original_unlink(path, dir_fd=dir_fd)
+
+            run_path: Path | None = None
+            try:
+                with mock.patch.object(
+                    ENFORCEMENT_MODULE,
+                    "_BoundRegularFile",
+                    side_effect=fail_global_snapshot_binding,
+                ):
+                    with mock.patch.object(
+                        ENFORCEMENT_MODULE.os,
+                        "unlink",
+                        side_effect=reject_config_unlink,
+                    ):
+                        with self.assertRaises(
+                            ENFORCEMENT_MODULE.EnforcementDoctorError
+                        ) as raised:
+                            ENFORCEMENT_MODULE.GitHubApiClient(
+                                trusted_gh,
+                                hashlib.sha256(trusted_payload).hexdigest(),
+                                config_dir,
+                                runtime_parent=runtime_parent,
+                            )
+
+                self.assertEqual(
+                    raised.exception.reason_code,
+                    "collector-inconclusive",
+                )
+                self.assertIsInstance(
+                    raised.exception.__cause__,
+                    ENFORCEMENT_MODULE.EnforcementDoctorError,
+                )
+                self.assertEqual(
+                    raised.exception.__cause__.reason_code,
+                    "collector-unavailable",
+                )
+                cleanup = raised.exception.cleanup_failure
+                self.assertEqual(cleanup["cleanup_proof"], "inconclusive")
+                self.assertIn("unlink-config.yml", cleanup["failed_operations"])
+                locator = cleanup["retained_runtime"]
+                self.assertEqual(locator["path_binding"], "verified")
+                run_path = Path(locator["path"])
+                self.assertTrue(
+                    (run_path / "config" / "config.yml").exists()
+                )
+                config_locators = [
+                    retained
+                    for retained in cleanup["retained_objects"]
+                    if retained["label"]
+                    == "GitHub CLI private config.yml snapshot"
+                ]
+                self.assertEqual(len(config_locators), 1)
+                self.assertEqual(
+                    config_locators[0]["device"],
+                    created_config_status["value"].st_dev,
+                )
+                self.assertEqual(
+                    config_locators[0]["inode"],
+                    created_config_status["value"].st_ino,
+                )
+                self.assertEqual(config_locators[0]["path_binding"], "verified")
+                self.assertEqual(
+                    config_locators[0]["path"],
+                    str(run_path / "config" / "config.yml"),
+                )
+            finally:
+                if run_path is not None and run_path.exists():
+                    shutil.rmtree(run_path)
+
+    @unittest.skipUnless(
+        sys.platform == "darwin",
+        "requires Darwin extended ACLs",
+    )
+    def test_enforcement_gh_cleanup_reports_acl_drift_after_removal(
+        self,
+    ) -> None:
+        with owner_controlled_temp_root() as temp_root:
+            trusted_gh = temp_root / "trusted-gh"
+            trusted_payload = b"#!/bin/sh\nexit 0\n"
+            trusted_gh.write_bytes(trusted_payload)
+            trusted_gh.chmod(0o700)
+            config_dir, runtime_parent = self._make_private_gh_config(
+                temp_root,
+                hosts_payload=(
+                    "github.com:\n"
+                    "    git_protocol: https\n"
+                    "    users:\n"
+                    "        fixture-admin:\n"
+                    f"            oauth_token: {SYNTHETIC_ACCESS_TOKEN}\n"
+                    "    user: fixture-admin\n"
+                    f"    oauth_token: {SYNTHETIC_ACCESS_TOKEN}\n"
+                ),
+            )
+            client = ENFORCEMENT_MODULE.GitHubApiClient(
+                trusted_gh,
+                hashlib.sha256(trusted_payload).hexdigest(),
+                config_dir,
+                runtime_parent=runtime_parent,
+            )
+            run_path = client._run_directory.path
+            snapshot_hosts = client._config_snapshot_directory.path / "hosts.yml"
+            self._set_darwin_acl(snapshot_hosts, "everyone allow read")
+            try:
+                with self.assertRaises(
+                    ENFORCEMENT_MODULE.EnforcementDoctorError
+                ) as raised:
+                    client.close()
+
+                self.assertEqual(
+                    raised.exception.reason_code,
+                    "collector-inconclusive",
+                )
+                cleanup = raised.exception.cleanup_failure
+                self.assertEqual(cleanup["cleanup_proof"], "complete")
+                self.assertEqual(
+                    cleanup["failed_operations"],
+                    ["pre-cleanup-revalidation"],
+                )
+                self.assertNotIn("retained_runtime", cleanup)
+                self.assertFalse(run_path.exists())
+            finally:
+                if snapshot_hosts.exists():
+                    self._clear_darwin_acl(snapshot_hosts)
+                if run_path.exists():
+                    shutil.rmtree(run_path)
+
+    @unittest.skipUnless(
+        sys.platform == "darwin",
+        "requires Darwin extended ACLs",
+    )
+    def test_enforcement_gh_cleanup_reports_acl_drift_with_unlink_failure(
+        self,
+    ) -> None:
+        with owner_controlled_temp_root() as temp_root:
+            trusted_gh = temp_root / "trusted-gh"
+            trusted_payload = b"#!/bin/sh\nexit 0\n"
+            trusted_gh.write_bytes(trusted_payload)
+            trusted_gh.chmod(0o700)
+            config_dir, runtime_parent = self._make_private_gh_config(
+                temp_root,
+                hosts_payload=(
+                    "github.com:\n"
+                    "    git_protocol: https\n"
+                    "    users:\n"
+                    "        fixture-admin:\n"
+                    f"            oauth_token: {SYNTHETIC_ACCESS_TOKEN}\n"
+                    "    user: fixture-admin\n"
+                    f"    oauth_token: {SYNTHETIC_ACCESS_TOKEN}\n"
+                ),
+            )
+            client = ENFORCEMENT_MODULE.GitHubApiClient(
+                trusted_gh,
+                hashlib.sha256(trusted_payload).hexdigest(),
+                config_dir,
+                runtime_parent=runtime_parent,
+            )
+            run_path = client._run_directory.path
+            snapshot_hosts = client._config_snapshot_directory.path / "hosts.yml"
+            config_fd = client._config_snapshot_directory.fd
+            original_unlink = os.unlink
+            self._set_darwin_acl(snapshot_hosts, "everyone allow read")
+
+            def reject_token_unlink(
+                path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+                *,
+                dir_fd: int | None = None,
+            ) -> None:
+                if path == "hosts.yml" and dir_fd == config_fd:
+                    raise PermissionError(errno.EACCES, "fixture unlink failure")
+                original_unlink(path, dir_fd=dir_fd)
+
+            try:
+                with mock.patch.object(
+                    ENFORCEMENT_MODULE.os,
+                    "unlink",
+                    side_effect=reject_token_unlink,
+                ):
+                    with self.assertRaises(
+                        ENFORCEMENT_MODULE.EnforcementDoctorError
+                    ) as raised:
+                        client.close()
+
+                cleanup = raised.exception.cleanup_failure
+                self.assertEqual(cleanup["cleanup_proof"], "inconclusive")
+                self.assertIn("pre-cleanup-revalidation", cleanup["failed_operations"])
+                self.assertIn("unlink-hosts.yml", cleanup["failed_operations"])
+                self.assertEqual(
+                    cleanup["retained_runtime"]["path"],
+                    str(run_path),
+                )
+                self.assertEqual(
+                    cleanup["retained_runtime"]["path_binding"],
+                    "verified",
+                )
+            finally:
+                if snapshot_hosts.exists():
+                    self._clear_darwin_acl(snapshot_hosts)
+                if run_path.exists():
+                    shutil.rmtree(run_path)
+
     def test_enforcement_gh_linux_owner_controlled_root_reaches_success_path(
         self,
     ) -> None:
@@ -6722,13 +7280,14 @@ class BugTriageDocumentationTests(unittest.TestCase):
                     trusted_gh.write_bytes(trusted_payload)
                     trusted_gh.chmod(0o700)
                     config_dir, runtime_parent = self._make_private_gh_config(temp_root)
-                    with ENFORCEMENT_MODULE.GitHubApiClient(
+                    client = ENFORCEMENT_MODULE.GitHubApiClient(
                         trusted_gh,
                         hashlib.sha256(trusted_payload).hexdigest(),
                         config_dir,
                         runtime_parent=runtime_parent,
-                    ) as client:
-
+                    )
+                    cleanup_error = None
+                    try:
                         def drift_after_exec(
                             command: list[str],
                             **kwargs: object,
@@ -6750,6 +7309,37 @@ class BugTriageDocumentationTests(unittest.TestCase):
                             raised.exception.reason_code,
                             "collector-inconclusive",
                         )
+                    finally:
+                        try:
+                            client.close()
+                        except ENFORCEMENT_MODULE.EnforcementDoctorError as error:
+                            cleanup_error = error
+
+                    if label == "snapshot-path":
+                        self.assertIsNotNone(cleanup_error)
+                        self.assertEqual(
+                            cleanup_error.reason_code,
+                            "collector-inconclusive",
+                        )
+                        executable_locators = [
+                            locator
+                            for locator in cleanup_error.cleanup_failure[
+                                "retained_objects"
+                            ]
+                            if locator["label"]
+                            == "GitHub CLI executable snapshot"
+                        ]
+                        self.assertEqual(len(executable_locators), 1)
+                        self.assertEqual(
+                            executable_locators[0]["path_binding"],
+                            "unverified",
+                        )
+                        self.assertEqual(
+                            Path(executable_locators[0]["last_known_path"]).name,
+                            "gh",
+                        )
+                    else:
+                        self.assertIsNone(cleanup_error)
 
     @unittest.skipUnless(
         sys.platform == "darwin",
@@ -7112,13 +7702,14 @@ class BugTriageDocumentationTests(unittest.TestCase):
                     trusted_gh.write_bytes(trusted_payload)
                     trusted_gh.chmod(0o700)
                     config_dir, runtime_parent = self._make_private_gh_config(temp_root)
-                    with ENFORCEMENT_MODULE.GitHubApiClient(
+                    client = ENFORCEMENT_MODULE.GitHubApiClient(
                         trusted_gh,
                         hashlib.sha256(trusted_payload).hexdigest(),
                         config_dir,
                         runtime_parent=runtime_parent,
-                    ) as client:
-
+                    )
+                    cleanup_error = None
+                    try:
                         def drift_during_execution(
                             command: list[str],
                             **kwargs: object,
@@ -7141,6 +7732,33 @@ class BugTriageDocumentationTests(unittest.TestCase):
                             raised.exception.reason_code,
                             "collector-inconclusive",
                         )
+                    finally:
+                        try:
+                            client.close()
+                        except ENFORCEMENT_MODULE.EnforcementDoctorError as error:
+                            cleanup_error = error
+
+                    if label == "snapshot-hosts":
+                        self.assertIsNotNone(cleanup_error)
+                        hosts_locators = [
+                            locator
+                            for locator in cleanup_error.cleanup_failure[
+                                "retained_objects"
+                            ]
+                            if locator["label"]
+                            == "GitHub CLI private hosts.yml snapshot"
+                        ]
+                        self.assertEqual(len(hosts_locators), 1)
+                        self.assertEqual(
+                            hosts_locators[0]["path_binding"],
+                            "unverified",
+                        )
+                        self.assertEqual(
+                            Path(hosts_locators[0]["last_known_path"]).name,
+                            "hosts.yml",
+                        )
+                    else:
+                        self.assertIsNone(cleanup_error)
 
     def test_enforcement_gh_snapshot_excludes_non_github_authentication(
         self,
@@ -7358,6 +7976,16 @@ class BugTriageDocumentationTests(unittest.TestCase):
                 "failure_kind": "permission",
                 "http_status": 403,
             },
+            cleanup_failure={
+                "cleanup_proof": "inconclusive",
+                "failed_operations": ["remove-run-directory"],
+                "retained_runtime": {
+                    "device": 42,
+                    "inode": 84,
+                    "path": "/fixed/runtime/run-fixture",
+                    "path_binding": "verified",
+                },
+            },
         )
         output = io.StringIO()
         with mock.patch.object(
@@ -7371,6 +7999,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
 
         self.assertEqual(return_code, 1)
         outcome = json.loads(output.getvalue())
+        self.assertEqual(outcome["schema_version"], 5)
         self.assertEqual(outcome["reason_code"], "blocked-permission")
         self.assertEqual(
             outcome["api_failure"],
@@ -7380,6 +8009,17 @@ class BugTriageDocumentationTests(unittest.TestCase):
                 "http_status": 403,
             },
         )
+        self.assertEqual(
+            outcome["cleanup_failure"]["retained_runtime"],
+            {
+                "device": 42,
+                "inode": 84,
+                "path": "/fixed/runtime/run-fixture",
+                "path_binding": "verified",
+            },
+        )
+        self.assertIsNone(outcome["evidence_sha256"])
+        self.assertIsNone(outcome["static_equivalence"])
         self.assertNotIn("command", outcome)
         self.assertNotIn("headers", outcome)
         self.assertNotIn("token", output.getvalue().lower())
@@ -7387,6 +8027,30 @@ class BugTriageDocumentationTests(unittest.TestCase):
     def test_enforcement_doctor_cli_receipt_binds_native_objects(
         self,
     ) -> None:
+        expected_client = self._matching_live_api_client()
+        contract = json.loads(
+            CUTOVER_ENFORCEMENT_CONTRACT_PATH.read_text(encoding="utf-8")
+        )
+        fixed_time = "2026-07-25T12:34:56Z"
+        with mock.patch.object(
+            ENFORCEMENT_MODULE,
+            "_utc_now",
+            return_value=fixed_time,
+        ):
+            expected_evidence, _ = ENFORCEMENT_MODULE._collect_and_validate_static(
+                expected_client,
+                contract,
+                expected_run_attempt=1,
+                expected_run_id=10101,
+                expected_ruleset_id=self._ruleset_id,
+                expected_workflow_id=self._workflow_id,
+                expected_workflow_sha=self._workflow_source_commit,
+                candidate_head_sha=self._canonical_commit,
+                pull_request_number=7,
+            )
+        expected_evidence_sha256 = hashlib.sha256(
+            ENFORCEMENT_MODULE._canonical_json_bytes(expected_evidence)
+        ).hexdigest()
         client = self._matching_live_api_client()
         arguments = [
             str(CUTOVER_ENFORCEMENT_DOCTOR_PATH),
@@ -7419,14 +8083,25 @@ class BugTriageDocumentationTests(unittest.TestCase):
             "GitHubApiClient",
             return_value=client,
         ):
-            with mock.patch.object(sys, "argv", arguments):
-                with redirect_stdout(output):
-                    return_code = ENFORCEMENT_MODULE.main()
+            with mock.patch.object(
+                ENFORCEMENT_MODULE,
+                "_utc_now",
+                return_value=fixed_time,
+            ):
+                with mock.patch.object(sys, "argv", arguments):
+                    with redirect_stdout(output):
+                        return_code = ENFORCEMENT_MODULE.main()
 
         self.assertEqual(return_code, 1)
         outcome = json.loads(output.getvalue())
         self.assertEqual(outcome["classification"], "blocked_until_trusted")
+        self.assertEqual(outcome["schema_version"], 5)
         self.assertEqual(outcome["reason_code"], "pointer-proof-unavailable")
+        self.assertEqual(outcome["static_equivalence"], "validated")
+        self.assertEqual(
+            outcome["evidence_sha256"],
+            expected_evidence_sha256,
+        )
         self.assertEqual(client.auth_calls, 1)
         self.assertTrue(client.calls)
         variable_endpoint = "/repos/Joey-Tools/codex-debug-triage/actions/variables"

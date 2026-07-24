@@ -98,6 +98,29 @@ Jenkins entrypoint stays installed. With the checked-in
 `private-live-authority-not-configured` policy, that compatibility route
 therefore remains mandatory.
 
+Doctor receipt schema 5 adds the static-equivalence boundary and sanitized
+cleanup-failure evidence. Snapshot cleanup keeps the credential, executable,
+and directory descriptors open while it removes their exact bound objects
+from leaf to root. Credential creation registers a provisional descriptor
+before content is written, so a binding failure before the normal snapshot
+member is published still retains the exact object identity through cleanup.
+File unlink proof requires the retained inode to reach zero links; directory
+removal is issued relative to the retained owner-private parent only after
+path/descriptor identity agrees. A pre-cleanup ACL or mode drift, or any failed
+`fchmod`, `unlink`, or `rmdir`, is `collector-inconclusive` rather than a
+silent best-effort cleanup. When the run directory remains bound at its
+trusted name, the blocked receipt includes a sanitized
+`cleanup_failure.retained_runtime` locator with its absolute path, device,
+inode, and verified path-binding state. Any still-linked bound or provisional
+snapshot also appears in `retained_objects` with its exact device/inode. Its
+fixed last-known path is marked verified only while it still resolves to that
+object; a relocated object never publishes its new potentially
+attacker-chosen path and retains an explicitly unverified last-known path
+instead.
+When static collection and its final snapshot revalidation succeeded before
+the unavailable pointer gate, that same blocked receipt preserves
+`static_equivalence=validated` and the canonical `evidence_sha256`.
+
 ## Test
 
 ```bash
