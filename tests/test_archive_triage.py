@@ -27,6 +27,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 SKILL_ROOT = REPO_ROOT / "skills/bug-triage-playbook"
 SCRIPT_PATH = SKILL_ROOT / "scripts/archive_triage.py"
 CUTOVER_VALIDATOR_PATH = REPO_ROOT / "scripts/validate_cisco_cutover_receipt.py"
+CUTOVER_CI_GATE_PATH = REPO_ROOT / "scripts/run_cisco_cutover_ci_gate.py"
 MIGRATION_FIXTURE_PATH = (
     REPO_ROOT / "tests/fixtures/cisco-build-artifacts-migration.json"
 )
@@ -2875,7 +2876,7 @@ class ArchiveTriageTests(unittest.TestCase):
                 MODULE.HARD_MAX_ARCHIVE_COMMAND_TIMEOUT_SECONDS + 1.0
             )
 
-    def test_archive_command_timer_interrupts_one_blocking_operation(self) -> None:
+    def test_archive_command_timer_wiring_interrupts_python_sleep(self) -> None:
         deadline = MODULE.ArchiveCommandDeadline(0.05)
         started = time.monotonic()
         try:
@@ -2889,6 +2890,145 @@ class ArchiveTriageTests(unittest.TestCase):
             deadline.close()
 
         self.assertLess(time.monotonic() - started, 0.5)
+
+    def test_deadline_state_never_trusts_stale_armed_or_closing_flags(
+        self,
+    ) -> None:
+        deadline = MODULE.ArchiveCommandDeadline()
+        deadline._armed = True
+        deadline._diagnostic_timer_safe = True
+
+        deadline._closing = True
+        self.assertFalse(deadline.timer_backed_diagnostics_safe())
+
+        deadline._closing = False
+        deadline._armed = False
+        self.assertFalse(deadline.timer_backed_diagnostics_safe())
+
+        deadline._armed = True
+        deadline._diagnostic_timer_safe = False
+        self.assertFalse(deadline.timer_backed_diagnostics_safe())
+
+    def test_deadline_cleanup_failures_disable_timer_backed_diagnostics(
+        self,
+    ) -> None:
+        failure_cases = (
+            "setitimer",
+            "drain",
+            "handler",
+            "mask",
+        )
+        for failure_case in failure_cases:
+            with self.subTest(failure=failure_case):
+                deadline = MODULE.ArchiveCommandDeadline()
+                deadline._armed = True
+                deadline._diagnostic_timer_safe = True
+                deadline._previous_handler = signal.SIG_DFL
+
+                def setitimer(
+                    _which: int,
+                    _seconds: float,
+                ) -> None:
+                    if failure_case == "setitimer":
+                        raise OSError(errno.EIO, "injected setitimer failure")
+
+                def drain() -> None:
+                    if failure_case == "drain":
+                        raise OSError(errno.EIO, "injected drain failure")
+
+                def install_handler(
+                    _signal_number: int,
+                    _handler: object,
+                ) -> None:
+                    if failure_case == "handler":
+                        raise OSError(errno.EIO, "injected handler failure")
+
+                mask_calls = 0
+
+                def change_mask(
+                    _operation: int,
+                    _signals: object,
+                ) -> set[signal.Signals]:
+                    nonlocal mask_calls
+                    mask_calls += 1
+                    if failure_case == "mask" and mask_calls == 2:
+                        raise OSError(errno.EIO, "injected mask restore failure")
+                    return set()
+
+                with (
+                    mock.patch.object(
+                        deadline,
+                        "_require_signal_support",
+                    ),
+                    mock.patch.object(
+                        deadline,
+                        "_drain_pending_alarm",
+                        side_effect=drain,
+                    ),
+                    mock.patch.object(
+                        MODULE.signal,
+                        "setitimer",
+                        side_effect=setitimer,
+                    ),
+                    mock.patch.object(
+                        MODULE.signal,
+                        "signal",
+                        side_effect=install_handler,
+                    ),
+                    mock.patch.object(
+                        MODULE.signal,
+                        "pthread_sigmask",
+                        side_effect=change_mask,
+                    ),
+                    self.assertRaises(OSError),
+                ):
+                    deadline.close()
+
+                self.assertTrue(deadline._closing)
+                self.assertFalse(deadline.timer_backed_diagnostics_safe())
+
+    def test_deadline_arm_mask_restore_failure_never_enables_diagnostics(
+        self,
+    ) -> None:
+        deadline = MODULE.ArchiveCommandDeadline()
+        mask_calls = 0
+
+        def change_mask(
+            _operation: int,
+            _signals: object,
+        ) -> set[signal.Signals]:
+            nonlocal mask_calls
+            mask_calls += 1
+            if mask_calls == 2:
+                raise OSError(errno.EIO, "injected mask restore failure")
+            return set()
+
+        with (
+            mock.patch.object(deadline, "_require_signal_support"),
+            mock.patch.object(MODULE.signal, "sigpending", return_value=set()),
+            mock.patch.object(
+                MODULE.signal,
+                "getitimer",
+                return_value=(0.0, 0.0),
+            ),
+            mock.patch.object(
+                MODULE.signal,
+                "getsignal",
+                return_value=signal.SIG_DFL,
+            ),
+            mock.patch.object(MODULE.signal, "signal"),
+            mock.patch.object(MODULE.signal, "setitimer"),
+            mock.patch.object(
+                MODULE.signal,
+                "pthread_sigmask",
+                side_effect=change_mask,
+            ),
+            self.assertRaisesRegex(OSError, "mask restore"),
+        ):
+            deadline.arm()
+
+        self.assertTrue(deadline._armed)
+        self.assertFalse(deadline.timer_backed_diagnostics_safe())
 
     @unittest.skipUnless(
         all(
@@ -3044,6 +3184,106 @@ class ArchiveTriageTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, 2)
         self.assertLess(time.monotonic() - started, 0.5)
         self.assertEqual(final_flags, original_flags)
+
+    def test_deadline_transition_failures_use_timerless_full_pipe_output(
+        self,
+    ) -> None:
+        failure_cases = (
+            ("arm-setitimer", True),
+            ("close-setitimer", False),
+            ("close-drain", False),
+            ("close-handler", False),
+            ("close-mask", False),
+        )
+
+        for failure_label, fail_on_arm in failure_cases:
+            with self.subTest(failure=failure_label):
+
+                class FailingDeadline:
+                    def __init__(self) -> None:
+                        self._armed = False
+                        self._closing = False
+                        self._diagnostic_timer_safe = False
+
+                    def arm(self) -> None:
+                        self._armed = True
+                        self._diagnostic_timer_safe = True
+                        if fail_on_arm:
+                            raise OSError(errno.EIO, f"injected {failure_label}")
+
+                    def close(self) -> None:
+                        self._diagnostic_timer_safe = False
+                        self._closing = True
+                        if not fail_on_arm:
+                            raise OSError(errno.EIO, f"injected {failure_label}")
+
+                    def timer_backed_diagnostics_safe(self) -> bool:
+                        return (
+                            self._diagnostic_timer_safe
+                            and self._armed
+                            and not self._closing
+                        )
+
+                read_fd, write_fd, writer, original_flags = self._full_pipe_writer()
+                started = time.monotonic()
+                try:
+                    with (
+                        mock.patch.object(
+                            MODULE,
+                            "ArchiveCommandDeadline",
+                            FailingDeadline,
+                        ),
+                        redirect_stderr(writer),
+                    ):
+                        rc = MODULE._run_archive_command(lambda _deadline: None)
+                finally:
+                    writer.close()
+                    final_flags = MODULE._fcntl_get_flags(write_fd)
+                    os.close(write_fd)
+                    os.close(read_fd)
+
+                self.assertEqual(rc, 1)
+                self.assertLess(time.monotonic() - started, 0.5)
+                self.assertEqual(final_flags, original_flags)
+
+    def test_deadline_cleanup_failure_does_not_write_to_character_device(
+        self,
+    ) -> None:
+        class FailingCloseDeadline:
+            def __init__(self) -> None:
+                self._armed = False
+                self._closing = False
+                self._diagnostic_timer_safe = False
+
+            def arm(self) -> None:
+                self._armed = True
+                self._diagnostic_timer_safe = True
+
+            def close(self) -> None:
+                self._diagnostic_timer_safe = False
+                self._closing = True
+                raise OSError(errno.EIO, "injected close failure")
+
+            def timer_backed_diagnostics_safe(self) -> bool:
+                return self._diagnostic_timer_safe and self._armed and not self._closing
+
+        with (
+            open(os.devnull, "w", encoding="utf-8") as stream,
+            mock.patch.object(
+                MODULE,
+                "ArchiveCommandDeadline",
+                FailingCloseDeadline,
+            ),
+            mock.patch.object(MODULE.os, "write") as writer,
+            redirect_stderr(stream),
+        ):
+            started = time.monotonic()
+            rc = MODULE._run_archive_command(lambda _deadline: None)
+            elapsed = time.monotonic() - started
+
+        self.assertEqual(rc, 1)
+        self.assertLess(elapsed, 0.5)
+        writer.assert_not_called()
 
     def test_timerless_publisher_restores_flags_before_selector_close_failure(
         self,
@@ -3446,6 +3686,14 @@ class BugTriageDocumentationTests(unittest.TestCase):
     _canonical_commit = "1" * 40
     _private_release_commit = "2" * 40
     _release_manifest_sha256 = "3" * 64
+    _gate_environment_names = (
+        "CISCO_CUTOVER_RECEIPT_BASE64",
+        "CISCO_CUTOVER_OBSERVED_CANONICAL_COMMIT",
+        "CISCO_CUTOVER_EXPECTED_CANONICAL_COMMIT",
+        "CISCO_CUTOVER_EXPECTED_PRIVATE_RELEASE_COMMIT",
+        "CISCO_CUTOVER_EXPECTED_RELEASE_MANIFEST_SHA256",
+        "CISCO_CUTOVER_EXPECTED_RECEIPT_SHA256",
+    )
 
     def _matching_cutover_receipt(
         self,
@@ -3531,6 +3779,46 @@ class BugTriageDocumentationTests(unittest.TestCase):
             timeout=5,
         )
 
+    def _run_cutover_ci_gate(
+        self,
+        *,
+        receipt_payload: bytes | None = None,
+        receipt_sha256: str | None = None,
+        overrides: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        environment = os.environ.copy()
+        for name in self._gate_environment_names:
+            environment.pop(name, None)
+        if receipt_payload is not None:
+            environment.update(
+                {
+                    "CISCO_CUTOVER_RECEIPT_BASE64": base64.b64encode(
+                        receipt_payload
+                    ).decode("ascii"),
+                    "CISCO_CUTOVER_OBSERVED_CANONICAL_COMMIT": (self._canonical_commit),
+                    "CISCO_CUTOVER_EXPECTED_CANONICAL_COMMIT": (self._canonical_commit),
+                    "CISCO_CUTOVER_EXPECTED_PRIVATE_RELEASE_COMMIT": (
+                        self._private_release_commit
+                    ),
+                    "CISCO_CUTOVER_EXPECTED_RELEASE_MANIFEST_SHA256": (
+                        self._release_manifest_sha256
+                    ),
+                    "CISCO_CUTOVER_EXPECTED_RECEIPT_SHA256": (
+                        receipt_sha256 or hashlib.sha256(receipt_payload).hexdigest()
+                    ),
+                }
+            )
+        if overrides:
+            environment.update(overrides)
+        return subprocess.run(
+            [sys.executable, str(CUTOVER_CI_GATE_PATH)],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            env=environment,
+        )
+
     def test_skill_is_explicit_only_and_hands_off_provider_work(self) -> None:
         skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
         metadata = (SKILL_ROOT / "agents/openai.yaml").read_text(encoding="utf-8")
@@ -3589,12 +3877,15 @@ class BugTriageDocumentationTests(unittest.TestCase):
         self.assertIn("reject archive files above 256 MiB", recipe)
         self.assertIn("and 100,000 lines", recipe)
         self.assertIn("immutable hard ceilings", recipe)
-        self.assertIn("30-second process-timer deadline", recipe)
+        self.assertIn("30-second in-process `ITIMER_REAL` budget", recipe)
+        self.assertIn("best-effort interruption mechanism", recipe)
+        self.assertIn("cannot guarantee interruption of NFS, FUSE", recipe)
+        self.assertIn("external wall-clock supervisor", recipe)
         self.assertIn("validation drain", recipe)
-        self.assertIn("temporarily enables\n`O_NONBLOCK`", recipe)
-        self.assertIn("validated FIFO, socket, or terminal descriptor", recipe)
-        self.assertIn("monotonic 100-millisecond poll\nbudget", recipe)
-        self.assertIn("original descriptor blocking state", recipe)
+        self.assertIn("temporarily enables `O_NONBLOCK`", recipe)
+        self.assertIn("FIFO, socket, or terminal descriptor", recipe)
+        self.assertIn("monotonic 100-millisecond poll budget", recipe)
+        self.assertIn("descriptor blocking state", recipe)
         self.assertIn("protects archive object identity", recipe)
         self.assertIn("Before constructing Python `ZipInfo` objects", recipe)
         self.assertIn("binds each central record to\none matching local record", recipe)
@@ -3674,6 +3965,94 @@ class BugTriageDocumentationTests(unittest.TestCase):
         self.assertIn("limits integers to 64 digits", migration)
         self.assertIn("require exact JSON scalar and container types", migration)
         self.assertIn("does not authenticate where the caller obtained", migration)
+        self.assertIn("Required CI Gate And Exact Unblocking Inputs", migration)
+        self.assertIn("has no success default", migration)
+        self.assertIn("structurally blocked", migration)
+
+    def test_ci_cutover_gate_is_unskippable_and_independently_configured(
+        self,
+    ) -> None:
+        workflow = (REPO_ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        gate_source = CUTOVER_CI_GATE_PATH.read_text(encoding="utf-8")
+
+        self.assertIn("run: python3 scripts/run_cisco_cutover_ci_gate.py", workflow)
+        self.assertNotIn("continue-on-error", workflow)
+        self.assertIn(
+            "CISCO_CUTOVER_OBSERVED_CANONICAL_COMMIT: "
+            "${{ github.event.pull_request.head.sha || github.sha }}",
+            workflow,
+        )
+        for name in self._gate_environment_names:
+            with self.subTest(environment=name):
+                if name != "CISCO_CUTOVER_OBSERVED_CANONICAL_COMMIT":
+                    self.assertIn(f"{name}: ${{{{ vars.{name} }}}}", workflow)
+                self.assertIn(name, gate_source)
+        self.assertIn("validate_cisco_cutover_receipt.py", gate_source)
+        self.assertNotIn(self._canonical_commit, gate_source)
+        self.assertNotIn(self._private_release_commit, gate_source)
+        self.assertNotIn(self._release_manifest_sha256, gate_source)
+
+    def test_ci_cutover_gate_cannot_green_without_trusted_inputs(self) -> None:
+        result = self._run_cutover_ci_gate()
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stderr, "")
+        outcome = json.loads(result.stdout)
+        self.assertEqual(outcome["classification"], "blocked_until_trusted")
+        self.assertIn("is missing", outcome["reason"])
+
+    def test_ci_cutover_gate_rejects_placeholder_expectations(self) -> None:
+        receipt_payload = b"{}\n"
+        for placeholder in ("placeholder", "<unset>", "0" * 40):
+            with self.subTest(placeholder=placeholder):
+                result = self._run_cutover_ci_gate(
+                    receipt_payload=receipt_payload,
+                    overrides={"CISCO_CUTOVER_EXPECTED_CANONICAL_COMMIT": placeholder},
+                )
+
+                self.assertEqual(result.returncode, 1, result.stderr)
+                outcome = json.loads(result.stdout)
+                self.assertEqual(
+                    outcome["classification"],
+                    "blocked_until_trusted",
+                )
+                self.assertIn("is a placeholder", outcome["reason"])
+
+    def test_ci_cutover_gate_rejects_stale_canonical_expectation(self) -> None:
+        result = self._run_cutover_ci_gate(
+            receipt_payload=b"{}\n",
+            overrides={
+                "CISCO_CUTOVER_OBSERVED_CANONICAL_COMMIT": "4" * 40,
+            },
+        )
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        outcome = json.loads(result.stdout)
+        self.assertEqual(outcome["classification"], "blocked_until_trusted")
+        self.assertIn("does not match the workflow candidate", outcome["reason"])
+
+    def test_ci_cutover_gate_can_admit_one_exact_trusted_receipt(self) -> None:
+        fixture = json.loads(MIGRATION_FIXTURE_PATH.read_text(encoding="utf-8"))
+        receipt = self._matching_cutover_receipt(fixture)
+        receipt_payload = (
+            json.dumps(
+                receipt,
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            + "\n"
+        ).encode("utf-8")
+        result = self._run_cutover_ci_gate(receipt_payload=receipt_payload)
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stderr, "")
+        outcome = json.loads(result.stdout)
+        self.assertEqual(outcome["classification"], "admitted")
+        self.assertEqual(
+            outcome["receipt_sha256"],
+            hashlib.sha256(receipt_payload).hexdigest(),
+        )
 
     def test_private_migration_fixture_binds_atomic_aggregate_cutover(self) -> None:
         fixture = json.loads(MIGRATION_FIXTURE_PATH.read_text(encoding="utf-8"))

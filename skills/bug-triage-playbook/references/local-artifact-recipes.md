@@ -111,29 +111,36 @@ and 100,000 lines; cap an input line at 131,072 characters; cap selected members
 at 32 MiB total; and cap displayed output at 200 lines and 65,536 characters.
 These defaults are also immutable hard ceilings: budget flags may only narrow a
 run and values above the hard ceiling fail before the archive is opened. One
-30-second process-timer deadline covers the complete command, including central
-directory validation, decompression, and the validation drain that continues
-after selected output has been truncated, bounded success-output publication,
-and the underlying output-stream flush. The helper fails closed when the
-platform cannot provide the required POSIX timer/signal controls, when the main
-thread currently blocks `SIGALRM`, when an alarm is already pending, or when the
-caller already owns the process timer; it never silently replaces an existing
-timer. Shutdown first blocks `SIGALRM`, stops the timer, drains its pending
-alarm, restores the prior handler, and only then restores the caller's signal
-mask. Runtime and argument errors use one terminal-safe line capped at 8,192
-characters. After the deadline first expires, the same process timer repeats at
-a short fixed interval until cleanup so a blocked diagnostic write is
-interrupted rather than retried after timer shutdown. If the timer cannot be
-armed because `SIGALRM` is blocked or pending or another timer is active, the
-error path avoids ordinary stream writes and flushes. It temporarily enables
-`O_NONBLOCK` only on a validated FIFO, socket, or terminal descriptor,
-publishes at most one bounded line under a monotonic 100-millisecond poll
-budget, and restores the caller's original descriptor blocking state under a
-separate bounded cleanup budget. Interrupted `fcntl` setup and restoration
-cannot retry indefinitely; when no safe descriptor is available it returns
-without risking a blocking diagnostic. `--encoding` accepts at most 64 ASCII
-letters, digits, dots, underscores, plus signs, or hyphens and must resolve
-through Python's codec registry.
+30-second in-process `ITIMER_REAL` budget covers the complete command when the
+operating system returns control to Python, including central-directory
+validation, decompression, the validation drain that continues after selected
+output has been truncated, bounded success-output publication, and the
+underlying output-stream flush. This is a best-effort interruption mechanism,
+not a hard syscall deadline: it cannot guarantee interruption of NFS, FUSE,
+File Provider, uninterruptible, or automatically restarted system calls. A
+caller that requires a hard return deadline must run the helper in a separate
+terminate-able process under an external wall-clock supervisor with
+process-group cleanup.
+
+The helper fails closed when the platform cannot provide the required POSIX
+timer/signal controls, when the main thread currently blocks `SIGALRM`, when an
+alarm is already pending, or when the caller already owns the process timer; it
+never silently replaces an existing timer. Shutdown first blocks `SIGALRM`,
+stops the timer, drains its pending alarm, restores the prior handler, and only
+then restores the caller's signal mask. Runtime and argument errors use one
+terminal-safe line capped at 8,192 characters. After the deadline first expires,
+the same process timer repeats at a short fixed interval until cleanup so an
+ordinary interruptible diagnostic write can be interrupted. If timer setup,
+close, pending-alarm drain, handler restoration, or signal-mask restoration
+fails, the error path never trusts `_armed` alone and avoids ordinary stream
+writes and flushes. It temporarily enables `O_NONBLOCK` only on a validated
+FIFO, socket, or terminal descriptor, publishes at most one bounded line under
+a monotonic 100-millisecond poll budget, and restores the caller's original
+descriptor blocking state under a separate bounded cleanup budget. Interrupted
+`fcntl` setup and restoration cannot retry indefinitely; when no safe
+descriptor is available it returns without risking a blocking diagnostic.
+`--encoding` accepts at most 64 ASCII letters, digits, dots, underscores, plus
+signs, or hyphens and must resolve through Python's codec registry.
 
 The helper opens the archive once, records the initially accepted file size,
 and holds that file descriptor through member selection and reading. Its

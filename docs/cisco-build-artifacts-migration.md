@@ -25,11 +25,15 @@ The public `bug-triage-playbook` owns only the downstream reasoning workflow
 after an authoritative artifact is available locally. Its
 `scripts/archive_triage.py` helper may inspect local ZIP members but performs no
 network or authentication work. That local helper keeps its own conservative
-defaults as immutable hard ceilings and applies one process-timer deadline to
-central-directory validation, decompression, and the post-selection validation
-drain, bounded output publication, and the underlying output flush; the private
-provider must preserve or tighten those local archive properties when it
-delegates inspection.
+size and count defaults as immutable hard ceilings. Its in-process
+`ITIMER_REAL` budget is best effort: it covers central-directory validation,
+decompression, the post-selection validation drain, bounded output publication,
+and the underlying output flush when the operating system returns control to
+Python, but it cannot guarantee interruption of NFS, FUSE, File Provider,
+uninterruptible, or automatically restarted system calls. A private provider
+that requires a hard return deadline must launch the local helper in a
+terminate-able isolated process under an external wall-clock supervisor and
+must preserve or tighten the helper's size and count ceilings.
 
 GitHub Actions and pull-request checks bypass both skills and stay with the
 GitHub provider workflow named in the generic skill's provider boundary.
@@ -139,6 +143,43 @@ pointer mismatch, malformed JSON, or any schema difference exits 1 with
 field agreement; it does not authenticate where the caller obtained the
 receipt. Authenticated retrieval and the independent expectation values remain
 owned by the private release workflow.
+
+### Required CI Gate And Exact Unblocking Inputs
+
+Every Python matrix leg in `.github/workflows/ci.yml` runs
+`scripts/run_cisco_cutover_ci_gate.py` after the repository tests. The runner
+stages the bounded receipt bytes and invokes
+`scripts/validate_cisco_cutover_receipt.py`; it has no success default,
+`continue-on-error`, placeholder identity, or receipt synthesized from the
+expected values. Exit 0 from the validator with `classification=admitted` is the
+only green outcome.
+
+The gate intentionally remains red until the authenticated private release
+workflow has produced a real receipt and a repository administrator has pinned
+these non-secret GitHub Actions repository variables independently:
+
+- `CISCO_CUTOVER_RECEIPT_BASE64`: exact Base64 of the producer-authored receipt
+- `CISCO_CUTOVER_EXPECTED_CANONICAL_COMMIT`: final signed canonical candidate
+  commit
+- `CISCO_CUTOVER_EXPECTED_PRIVATE_RELEASE_COMMIT`: immutable private release
+  commit
+- `CISCO_CUTOVER_EXPECTED_RELEASE_MANIFEST_SHA256`: exact private release
+  manifest digest
+- `CISCO_CUTOVER_EXPECTED_RECEIPT_SHA256`: exact digest of the decoded receipt
+  bytes
+
+Do not derive any `EXPECTED_*` value from `CISCO_CUTOVER_RECEIPT_BASE64`.
+The runner additionally compares `CISCO_CUTOVER_EXPECTED_CANONICAL_COMMIT`
+against the GitHub event's exact pull-request head SHA (or the push SHA outside
+a pull request), so a valid old receipt and stale repository variable cannot
+admit a different candidate.
+Missing, empty, recognizable placeholder, all-zero, malformed, stale, or
+mismatched values keep the job red. Branch protection must require every
+`test` matrix check that contains this step, and any release automation for
+this repository must consume the same successful CI conclusion. If those
+GitHub-side requirements or the five inputs cannot yet be configured, the
+retirement change is structurally blocked; do not weaken or skip the step and
+do not add a fabricated receipt to make it green.
 
 ## Private Command Interface To Preserve
 

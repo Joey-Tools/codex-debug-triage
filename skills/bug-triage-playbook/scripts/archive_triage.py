@@ -149,7 +149,7 @@ class MemberReadError(ValueError):
 
 
 class ArchiveCommandDeadline:
-    """Apply one immutable wall-clock budget to an archive command."""
+    """Apply one in-process best-effort wall-clock budget to a command."""
 
     def __init__(
         self,
@@ -167,6 +167,7 @@ class ArchiveCommandDeadline:
         self.deadline = time.monotonic() + timeout_seconds
         self._armed = False
         self._closing = False
+        self._diagnostic_timer_safe = False
         self._previous_handler: object | None = None
 
     @staticmethod
@@ -184,7 +185,7 @@ class ArchiveCommandDeadline:
         )
         if any(not hasattr(signal, name) for name in required_names):
             raise ArtifactLimitError(
-                "archive command hard deadline is unavailable on this platform"
+                "archive command in-process deadline is unavailable on this platform"
             )
 
     @staticmethod
@@ -204,6 +205,7 @@ class ArchiveCommandDeadline:
             )
 
     def _close_while_alarm_blocked(self) -> None:
+        self._diagnostic_timer_safe = False
         signal.setitimer(signal.ITIMER_REAL, 0.0)
         self._drain_pending_alarm()
         signal.signal(signal.SIGALRM, self._previous_handler)
@@ -211,14 +213,14 @@ class ArchiveCommandDeadline:
         self._armed = False
 
     def arm(self) -> None:
-        """Install a process timer so one blocking local read cannot overrun."""
+        """Install a timer that can interrupt ordinary interruptible operations."""
 
         self.check("deadline setup")
         if self._armed:
             raise ArtifactLimitError("archive command deadline is already armed")
         if threading.current_thread() is not threading.main_thread():
             raise ArtifactLimitError(
-                "archive command hard deadline requires the main thread"
+                "archive command in-process deadline requires the main thread"
             )
         self._require_signal_support()
         previous_mask = signal.pthread_sigmask(
@@ -268,10 +270,14 @@ class ArchiveCommandDeadline:
         finally:
             if restore_mask:
                 signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+                if self._armed:
+                    self._diagnostic_timer_safe = True
 
     def close(self) -> None:
         if not self._armed:
+            self._diagnostic_timer_safe = False
             return
+        self._diagnostic_timer_safe = False
         self._closing = True
         self._require_signal_support()
         previous_mask = signal.pthread_sigmask(
@@ -282,10 +288,15 @@ class ArchiveCommandDeadline:
         try:
             self._close_while_alarm_blocked()
             handler_restored = True
-            self._closing = False
         finally:
             if handler_restored:
                 signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+                self._closing = False
+
+    def timer_backed_diagnostics_safe(self) -> bool:
+        """Return whether an ordinary stream write still has timer protection."""
+
+        return self._diagnostic_timer_safe and self._armed and not self._closing
 
     def _raise_timeout(self, _signum: int, _frame: object) -> None:
         if self._closing:
@@ -924,14 +935,14 @@ def _write_terminal_line(
     max_value_chars = HARD_MAX_ERROR_CHARS - len(prefix) - 1
     rendered = _bounded_terminal_escape(str(value), max_value_chars)
     payload = f"{prefix}{rendered}\n"
-    if deadline is None:
+    if deadline is None or not deadline.timer_backed_diagnostics_safe():
         _publish_terminal_line_without_timer(payload, stream)
         return
     written = stream.write(payload)
     if written is not None and written != len(payload):
         raise OSError("diagnostic stream accepted only part of the bounded payload")
     stream.flush()
-    if deadline is not None and not deadline._armed:
+    if not deadline.timer_backed_diagnostics_safe():
         raise ArtifactLimitError("diagnostic output escaped the archive command timer")
 
 
@@ -2680,17 +2691,17 @@ def _run_archive_command(
     deadline = ArchiveCommandDeadline()
     command_errors = (Exception,)
     primary_error: BaseException | None = None
-    error_attempted = False
+    arm_completed = False
     try:
         deadline.arm()
+        arm_completed = True
         operation(deadline)
     except command_errors as error:
         primary_error = error
-        error_attempted = True
         try:
             _emit_error(
                 error,
-                deadline=deadline if deadline._armed else None,
+                deadline=deadline if arm_completed else None,
             )
         except command_errors:
             pass
@@ -2698,22 +2709,12 @@ def _run_archive_command(
         try:
             deadline.close()
         except command_errors as cleanup_error:
-            if deadline._armed and not deadline._closing:
-                try:
-                    deadline.close()
-                except command_errors:
-                    pass
             if primary_error is None:
                 primary_error = cleanup_error
-                if not error_attempted:
-                    error_attempted = True
-                    try:
-                        _emit_error(
-                            cleanup_error,
-                            deadline=deadline if deadline._armed else None,
-                        )
-                    except command_errors:
-                        pass
+            try:
+                _emit_error(cleanup_error)
+            except command_errors:
+                pass
     return 1 if primary_error is not None else 0
 
 

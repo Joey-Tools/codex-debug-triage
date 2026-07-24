@@ -17,12 +17,16 @@ That private implementation is intentionally not part of this repository.
 The repository includes only a no-network receipt validator for a future
 private release gate; without an independently trusted exact release/pointer
 receipt, cutover remains `blocked_until_trusted`.
+The CI gate is intentionally red until the authenticated private release
+receipt and all four independently pinned expected identities are configured;
+it contains no placeholder success path.
 
 ## Test
 
 ```bash
 python3 -m py_compile \
   skills/bug-triage-playbook/scripts/archive_triage.py \
+  scripts/run_cisco_cutover_ci_gate.py \
   scripts/validate_cisco_cutover_receipt.py \
   tests/test_archive_triage.py
 python3 -m unittest tests.test_archive_triage
