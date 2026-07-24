@@ -1065,7 +1065,6 @@ class IsolatedRegexMatcher:
             stderr=subprocess.DEVNULL,
             bufsize=0,
             close_fds=True,
-            start_new_session=True,
         )
         try:
             if self._process.stdin is None:

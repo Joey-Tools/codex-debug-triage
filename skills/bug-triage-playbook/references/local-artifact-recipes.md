@@ -169,9 +169,14 @@ CRC, local-header metadata, and any data descriptor before buffered output is
 published.
 
 User-provided member, listing, and line-filter regular expressions run only in
-terminable isolated workers under per-match and command-wide deadlines.
-Decoded member text escapes terminal control and non-printing characters before
-output character accounting and publication.
+terminable isolated workers under per-match and command-wide deadlines. A
+worker inherits the helper's process group; it must never call `setsid` or
+start a new session. A caller that needs a hard external return bound should
+start the helper in one dedicated process group and apply TERM/KILL to that
+whole group, which then contains both the helper and any catastrophic-regex
+worker. Internal timeout cleanup still terminates and reaps the individual
+worker. Decoded member text escapes terminal control and non-printing
+characters before output character accounting and publication.
 
 ## 5. Report Decisive Evidence
 

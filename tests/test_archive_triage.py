@@ -27,7 +27,9 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 SKILL_ROOT = REPO_ROOT / "skills/bug-triage-playbook"
 SCRIPT_PATH = SKILL_ROOT / "scripts/archive_triage.py"
 CUTOVER_VALIDATOR_PATH = REPO_ROOT / "scripts/validate_cisco_cutover_receipt.py"
-CUTOVER_CI_GATE_PATH = REPO_ROOT / "scripts/run_cisco_cutover_ci_gate.py"
+CUTOVER_TRUSTED_WORKFLOW_PATH = (
+    REPO_ROOT / ".github/workflows/cisco-cutover-admission.yml"
+)
 MIGRATION_FIXTURE_PATH = (
     REPO_ROOT / "tests/fixtures/cisco-build-artifacts-migration.json"
 )
@@ -1781,6 +1783,140 @@ class ArchiveTriageTests(unittest.TestCase):
 
         assert process is not None
         self.assertIsNotNone(process.poll())
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(os, "killpg"),
+        "process-group containment requires POSIX",
+    )
+    def test_external_group_termination_reaps_catastrophic_regex_worker(
+        self,
+    ) -> None:
+        launcher = "\n".join(
+            (
+                "import importlib.util",
+                "import os",
+                "import pathlib",
+                "import sys",
+                "path = pathlib.Path(sys.argv[1])",
+                "metadata_path = pathlib.Path(sys.argv[2])",
+                (
+                    "spec = importlib.util.spec_from_file_location("
+                    "'archive_triage_group_test', path)"
+                ),
+                "module = importlib.util.module_from_spec(spec)",
+                "sys.modules[spec.name] = module",
+                "spec.loader.exec_module(module)",
+                "module.DEFAULT_REGEX_MATCH_TIMEOUT_SECONDS = 30.0",
+                "module.DEFAULT_REGEX_AGGREGATE_TIMEOUT_SECONDS = 30.0",
+                "real_popen = module.subprocess.Popen",
+                "def tracking_popen(*args, **kwargs):",
+                "    process = real_popen(*args, **kwargs)",
+                "    command = args[0] if args else kwargs.get('args', ())",
+                "    if module.REGEX_WORKER_ARG in command:",
+                (
+                    "        metadata_path.write_text("
+                    "f'{process.pid} {os.getpgid(process.pid)}\\n')"
+                ),
+                "    return process",
+                "module.subprocess.Popen = tracking_popen",
+                "sys.argv = [str(path), *sys.argv[3:]]",
+                "raise SystemExit(module.main())",
+            )
+        )
+
+        def process_exists(pid: int) -> bool:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return False
+            except PermissionError:
+                return True
+            return True
+
+        def process_group_exists(pgid: int) -> bool:
+            try:
+                os.killpg(pgid, 0)
+            except ProcessLookupError:
+                return False
+            except PermissionError:
+                return True
+            return True
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            archive_path = Path(temp_dir) / "external-group-kill.zip"
+            with zipfile.ZipFile(archive_path, "w") as archive:
+                archive.writestr(("a" * 400) + "!", "hostile\n")
+
+            for termination_signal in (signal.SIGTERM, signal.SIGKILL):
+                with self.subTest(signal=termination_signal.name):
+                    metadata_path = (
+                        Path(temp_dir)
+                        / f"worker-{termination_signal.name.lower()}.txt"
+                    )
+                    process = subprocess.Popen(
+                        [
+                            sys.executable,
+                            "-c",
+                            launcher,
+                            str(SCRIPT_PATH),
+                            str(metadata_path),
+                            "zip-list",
+                            str(archive_path),
+                            "--match",
+                            r"(a+)+$",
+                        ],
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        close_fds=True,
+                        start_new_session=True,
+                    )
+                    helper_pgid = process.pid
+                    worker_pid = None
+                    worker_pgid = None
+                    try:
+                        discovery_deadline = time.monotonic() + 2.0
+                        while time.monotonic() < discovery_deadline:
+                            if metadata_path.is_file():
+                                fields = metadata_path.read_text(
+                                    encoding="utf-8"
+                                ).split()
+                                if len(fields) == 2:
+                                    worker_pid, worker_pgid = map(int, fields)
+                                    break
+                            if process.poll() is not None:
+                                break
+                            time.sleep(0.01)
+
+                        self.assertIsNotNone(
+                            worker_pid,
+                            "catastrophic regex worker did not start",
+                        )
+                        assert worker_pid is not None
+                        assert worker_pgid is not None
+                        self.assertEqual(worker_pgid, helper_pgid)
+                        self.assertTrue(process_exists(worker_pid))
+                        time.sleep(0.05)
+                        self.assertIsNone(process.poll())
+
+                        os.killpg(helper_pgid, termination_signal)
+                        process.wait(timeout=2)
+
+                        reap_deadline = time.monotonic() + 2.0
+                        worker_still_exists = True
+                        group_still_exists = True
+                        while time.monotonic() < reap_deadline:
+                            worker_still_exists = process_exists(worker_pid)
+                            group_still_exists = process_group_exists(helper_pgid)
+                            if not worker_still_exists and not group_still_exists:
+                                break
+                            time.sleep(0.01)
+                        self.assertFalse(worker_still_exists)
+                        self.assertFalse(group_still_exists)
+                    finally:
+                        if process.poll() is None:
+                            os.killpg(helper_pgid, signal.SIGKILL)
+                            process.wait(timeout=2)
 
     def test_regex_worker_crash_is_a_bounded_failure(self) -> None:
         budget = MODULE.RegexMatchBudget()
@@ -3686,9 +3822,12 @@ class BugTriageDocumentationTests(unittest.TestCase):
     _canonical_commit = "1" * 40
     _private_release_commit = "2" * 40
     _release_manifest_sha256 = "3" * 64
-    _gate_environment_names = (
+    _trusted_gate_environment_names = (
+        "EVENT_REPOSITORY",
+        "PR_BASE_REF",
+        "PR_HEAD_REPOSITORY",
+        "PR_HEAD_SHA",
         "CISCO_CUTOVER_RECEIPT_BASE64",
-        "CISCO_CUTOVER_OBSERVED_CANONICAL_COMMIT",
         "CISCO_CUTOVER_EXPECTED_CANONICAL_COMMIT",
         "CISCO_CUTOVER_EXPECTED_PRIVATE_RELEASE_COMMIT",
         "CISCO_CUTOVER_EXPECTED_RELEASE_MANIFEST_SHA256",
@@ -3779,72 +3918,106 @@ class BugTriageDocumentationTests(unittest.TestCase):
             timeout=5,
         )
 
-    def _run_cutover_ci_gate(
+    def _trusted_workflow_program(self) -> str:
+        workflow = CUTOVER_TRUSTED_WORKFLOW_PATH.read_text(encoding="utf-8")
+        start_marker = "          python3 - <<'PY'\n"
+        end_marker = "\n          PY\n"
+        self.assertEqual(workflow.count(start_marker), 1)
+        self.assertEqual(workflow.count(end_marker), 1)
+        embedded = workflow.split(start_marker, 1)[1].split(end_marker, 1)[0]
+        lines = embedded.splitlines()
+        self.assertTrue(lines)
+        self.assertTrue(
+            all(not line or line.startswith("          ") for line in lines)
+        )
+        return "\n".join(
+            line[10:] if line else ""
+            for line in lines
+        )
+
+    def _trusted_workflow_environment(
         self,
         *,
-        receipt_payload: bytes | None = None,
+        receipt_payload: bytes,
         receipt_sha256: str | None = None,
         overrides: dict[str, str] | None = None,
-    ) -> subprocess.CompletedProcess[str]:
+    ) -> dict[str, str]:
         environment = os.environ.copy()
-        for name in self._gate_environment_names:
+        for name in self._trusted_gate_environment_names:
             environment.pop(name, None)
-        if receipt_payload is not None:
-            environment.update(
-                {
-                    "CISCO_CUTOVER_RECEIPT_BASE64": base64.b64encode(
-                        receipt_payload
-                    ).decode("ascii"),
-                    "CISCO_CUTOVER_OBSERVED_CANONICAL_COMMIT": (self._canonical_commit),
-                    "CISCO_CUTOVER_EXPECTED_CANONICAL_COMMIT": (self._canonical_commit),
-                    "CISCO_CUTOVER_EXPECTED_PRIVATE_RELEASE_COMMIT": (
-                        self._private_release_commit
-                    ),
-                    "CISCO_CUTOVER_EXPECTED_RELEASE_MANIFEST_SHA256": (
-                        self._release_manifest_sha256
-                    ),
-                    "CISCO_CUTOVER_EXPECTED_RECEIPT_SHA256": (
-                        receipt_sha256 or hashlib.sha256(receipt_payload).hexdigest()
-                    ),
-                }
-            )
+        environment.update(
+            {
+                "GITHUB_REPOSITORY": "Joey-Tools/codex-debug-triage",
+                "EVENT_REPOSITORY": "Joey-Tools/codex-debug-triage",
+                "PR_BASE_REF": "master",
+                "PR_HEAD_REPOSITORY": "Joey-Tools/codex-debug-triage",
+                "PR_HEAD_SHA": self._canonical_commit,
+                "CISCO_CUTOVER_RECEIPT_BASE64": base64.b64encode(
+                    receipt_payload
+                ).decode("ascii"),
+                "CISCO_CUTOVER_EXPECTED_CANONICAL_COMMIT": self._canonical_commit,
+                "CISCO_CUTOVER_EXPECTED_PRIVATE_RELEASE_COMMIT": (
+                    self._private_release_commit
+                ),
+                "CISCO_CUTOVER_EXPECTED_RELEASE_MANIFEST_SHA256": (
+                    self._release_manifest_sha256
+                ),
+                "CISCO_CUTOVER_EXPECTED_RECEIPT_SHA256": (
+                    receipt_sha256 or hashlib.sha256(receipt_payload).hexdigest()
+                ),
+            }
+        )
         if overrides:
             environment.update(overrides)
+        return environment
+
+    def _run_trusted_workflow_program(
+        self,
+        *,
+        environment: dict[str, str],
+        cwd: Path,
+    ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            [sys.executable, str(CUTOVER_CI_GATE_PATH)],
+            [sys.executable, "-c", self._trusted_workflow_program()],
             check=False,
             capture_output=True,
             text=True,
             timeout=5,
             env=environment,
+            cwd=cwd,
         )
 
-    def test_skill_is_explicit_only_and_hands_off_provider_work(self) -> None:
+    def test_bootstrap_retains_legacy_jenkins_entrypoint(self) -> None:
         skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
-        metadata = (SKILL_ROOT / "agents/openai.yaml").read_text(encoding="utf-8")
+        readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
 
-        self.assertIn("Optional, explicitly invoked framework", skill)
-        self.assertIn("In environments with the GitHub plugin", skill)
-        self.assertIn("Actions belongs to that plugin", skill)
-        self.assertIn("skill or tool. That owner", skill)
-        self.assertIn("allow_implicit_invocation: false", metadata)
+        self.assertIn("jenkins_artifact_probe.py", skill)
+        self.assertIn("scripts/archive_triage.py", skill)
+        self.assertIn("references/local-artifact-recipes.md", skill)
+        self.assertTrue(
+            (SKILL_ROOT / "references/jenkins-artifact-recipes.md").is_file()
+        )
+        self.assertTrue(
+            (SKILL_ROOT / "scripts/jenkins_artifact_probe.py").is_file()
+        )
+        self.assertTrue((REPO_ROOT / "tests/test_jenkins_artifact_probe.py").is_file())
+        self.assertIn("retains the existing Jenkins", readme)
 
-    def test_generic_skill_has_no_remote_auth_helper_contract(self) -> None:
-        generic_files = [
-            SKILL_ROOT / "SKILL.md",
+    def test_local_archive_helper_has_no_remote_auth_contract(self) -> None:
+        local_files = [
             SKILL_ROOT / "references/local-artifact-recipes.md",
             SKILL_ROOT / "scripts/archive_triage.py",
         ]
-        generic_text = "\n".join(
-            path.read_text(encoding="utf-8") for path in generic_files
+        local_text = "\n".join(
+            path.read_text(encoding="utf-8") for path in local_files
         )
 
-        self.assertNotIn("JENKINS_ARTIFACT_USER", generic_text)
-        self.assertNotIn("JENKINS_ARTIFACT_TOKEN", generic_text)
-        self.assertNotIn("--auth-profile", generic_text)
-        self.assertNotIn("probe-url", generic_text)
-        self.assertNotIn("fetch-url", generic_text)
-        self.assertNotIn("urllib.request", generic_text)
+        self.assertNotIn("JENKINS_ARTIFACT_USER", local_text)
+        self.assertNotIn("JENKINS_ARTIFACT_TOKEN", local_text)
+        self.assertNotIn("--auth-profile", local_text)
+        self.assertNotIn("probe-url", local_text)
+        self.assertNotIn("fetch-url", local_text)
+        self.assertNotIn("urllib.request", local_text)
 
     def test_cutover_receipt_validator_has_no_network_or_credentials(
         self,
@@ -3881,6 +4054,9 @@ class BugTriageDocumentationTests(unittest.TestCase):
         self.assertIn("best-effort interruption mechanism", recipe)
         self.assertIn("cannot guarantee interruption of NFS, FUSE", recipe)
         self.assertIn("external wall-clock supervisor", recipe)
+        self.assertIn("inherits the helper's process group", recipe)
+        self.assertIn("must never call `setsid`", recipe)
+        self.assertIn("apply TERM/KILL to that", recipe)
         self.assertIn("validation drain", recipe)
         self.assertIn("temporarily enables `O_NONBLOCK`", recipe)
         self.assertIn("FIFO, socket, or terminal descriptor", recipe)
@@ -3965,35 +4141,72 @@ class BugTriageDocumentationTests(unittest.TestCase):
         self.assertIn("limits integers to 64 digits", migration)
         self.assertIn("require exact JSON scalar and container types", migration)
         self.assertIn("does not authenticate where the caller obtained", migration)
-        self.assertIn("Required CI Gate And Exact Unblocking Inputs", migration)
-        self.assertIn("has no success default", migration)
-        self.assertIn("structurally blocked", migration)
+        self.assertIn(
+            "Protected-Base Admission And Exact Unblocking Inputs",
+            migration,
+        )
+        self.assertIn("performs no checkout", migration)
+        self.assertIn("executes no candidate script", migration)
+        self.assertIn(
+            "cannot protect the pull request that first introduces it",
+            migration,
+        )
+        self.assertIn("minimum\nordinary PR-merge sequence", migration)
+        self.assertIn("restores the Jenkins entrypoint", migration)
 
-    def test_ci_cutover_gate_is_unskippable_and_independently_configured(
+    def test_trusted_cutover_workflow_has_no_candidate_execution_path(
         self,
     ) -> None:
-        workflow = (REPO_ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
-        gate_source = CUTOVER_CI_GATE_PATH.read_text(encoding="utf-8")
+        workflow = CUTOVER_TRUSTED_WORKFLOW_PATH.read_text(encoding="utf-8")
+        regular_ci = (REPO_ROOT / ".github/workflows/ci.yml").read_text(
+            encoding="utf-8"
+        )
+        program = self._trusted_workflow_program()
+        compile(program, str(CUTOVER_TRUSTED_WORKFLOW_PATH), "exec")
 
-        self.assertIn("run: python3 scripts/run_cisco_cutover_ci_gate.py", workflow)
-        self.assertNotIn("continue-on-error", workflow)
+        self.assertIn("pull_request_target:", workflow)
+        self.assertIn("name: cisco-cutover-admission", workflow)
+        self.assertIn("permissions:\n  contents: read", workflow)
         self.assertIn(
-            "CISCO_CUTOVER_OBSERVED_CANONICAL_COMMIT: "
-            "${{ github.event.pull_request.head.sha || github.sha }}",
+            "EVENT_REPOSITORY: ${{ github.event.repository.full_name }}",
             workflow,
         )
-        for name in self._gate_environment_names:
+        self.assertIn(
+            "PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}",
+            workflow,
+        )
+        for forbidden in (
+            "actions/checkout",
+            "uses:",
+            "download-artifact",
+            "run_cisco_cutover_ci_gate.py",
+            "validate_cisco_cutover_receipt.py",
+            "secrets.",
+            "github.event.pull_request.body",
+            "github.event.pull_request.title",
+        ):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, workflow)
+        for name in self._trusted_gate_environment_names:
             with self.subTest(environment=name):
-                if name != "CISCO_CUTOVER_OBSERVED_CANONICAL_COMMIT":
+                if name.startswith("CISCO_CUTOVER_"):
                     self.assertIn(f"{name}: ${{{{ vars.{name} }}}}", workflow)
-                self.assertIn(name, gate_source)
-        self.assertIn("validate_cisco_cutover_receipt.py", gate_source)
-        self.assertNotIn(self._canonical_commit, gate_source)
-        self.assertNotIn(self._private_release_commit, gate_source)
-        self.assertNotIn(self._release_manifest_sha256, gate_source)
+                self.assertIn(name, program)
+        self.assertNotIn("CISCO_CUTOVER_", regular_ci)
+        self.assertIn("tests.test_jenkins_artifact_probe", regular_ci)
 
-    def test_ci_cutover_gate_cannot_green_without_trusted_inputs(self) -> None:
-        result = self._run_cutover_ci_gate()
+    def test_trusted_cutover_workflow_cannot_green_without_inputs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            environment = os.environ.copy()
+            for name in self._trusted_gate_environment_names:
+                environment.pop(name, None)
+            environment["GITHUB_REPOSITORY"] = (
+                "Joey-Tools/codex-debug-triage"
+            )
+            result = self._run_trusted_workflow_program(
+                environment=environment,
+                cwd=Path(temp_dir),
+            )
 
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertEqual(result.stderr, "")
@@ -4001,37 +4214,9 @@ class BugTriageDocumentationTests(unittest.TestCase):
         self.assertEqual(outcome["classification"], "blocked_until_trusted")
         self.assertIn("is missing", outcome["reason"])
 
-    def test_ci_cutover_gate_rejects_placeholder_expectations(self) -> None:
-        receipt_payload = b"{}\n"
-        for placeholder in ("placeholder", "<unset>", "0" * 40):
-            with self.subTest(placeholder=placeholder):
-                result = self._run_cutover_ci_gate(
-                    receipt_payload=receipt_payload,
-                    overrides={"CISCO_CUTOVER_EXPECTED_CANONICAL_COMMIT": placeholder},
-                )
-
-                self.assertEqual(result.returncode, 1, result.stderr)
-                outcome = json.loads(result.stdout)
-                self.assertEqual(
-                    outcome["classification"],
-                    "blocked_until_trusted",
-                )
-                self.assertIn("is a placeholder", outcome["reason"])
-
-    def test_ci_cutover_gate_rejects_stale_canonical_expectation(self) -> None:
-        result = self._run_cutover_ci_gate(
-            receipt_payload=b"{}\n",
-            overrides={
-                "CISCO_CUTOVER_OBSERVED_CANONICAL_COMMIT": "4" * 40,
-            },
-        )
-
-        self.assertEqual(result.returncode, 1, result.stderr)
-        outcome = json.loads(result.stdout)
-        self.assertEqual(outcome["classification"], "blocked_until_trusted")
-        self.assertIn("does not match the workflow candidate", outcome["reason"])
-
-    def test_ci_cutover_gate_can_admit_one_exact_trusted_receipt(self) -> None:
+    def test_trusted_cutover_workflow_rejects_identity_and_binding_drift(
+        self,
+    ) -> None:
         fixture = json.loads(MIGRATION_FIXTURE_PATH.read_text(encoding="utf-8"))
         receipt = self._matching_cutover_receipt(fixture)
         receipt_payload = (
@@ -4043,16 +4228,133 @@ class BugTriageDocumentationTests(unittest.TestCase):
             )
             + "\n"
         ).encode("utf-8")
-        result = self._run_cutover_ci_gate(receipt_payload=receipt_payload)
+        cases = {
+            "runner-repository": {
+                "GITHUB_REPOSITORY": "attacker/example",
+            },
+            "event-repository": {
+                "EVENT_REPOSITORY": "attacker/example",
+            },
+            "head-repository": {
+                "PR_HEAD_REPOSITORY": "attacker/example",
+            },
+            "base-ref": {
+                "PR_BASE_REF": "attacker-base",
+            },
+            "head-sha": {
+                "PR_HEAD_SHA": "4" * 40,
+            },
+            "expected-canonical": {
+                "CISCO_CUTOVER_EXPECTED_CANONICAL_COMMIT": "4" * 40,
+            },
+            "receipt-digest": {
+                "CISCO_CUTOVER_EXPECTED_RECEIPT_SHA256": "4" * 64,
+            },
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            for label, overrides in cases.items():
+                with self.subTest(drift=label):
+                    environment = self._trusted_workflow_environment(
+                        receipt_payload=receipt_payload,
+                        overrides=overrides,
+                    )
+                    result = self._run_trusted_workflow_program(
+                        environment=environment,
+                        cwd=Path(temp_dir),
+                    )
+
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    outcome = json.loads(result.stdout)
+                    self.assertEqual(
+                        outcome["classification"],
+                        "blocked_until_trusted",
+                    )
+
+    def test_trusted_cutover_workflow_ignores_malicious_candidate_files(
+        self,
+    ) -> None:
+        fixture = json.loads(MIGRATION_FIXTURE_PATH.read_text(encoding="utf-8"))
+        receipt = self._matching_cutover_receipt(fixture)
+        receipt_payload = (
+            json.dumps(
+                receipt,
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            + "\n"
+        ).encode("utf-8")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            trusted_cwd = temp_root / "trusted-runner"
+            candidate = temp_root / "candidate"
+            trusted_cwd.mkdir()
+            (candidate / ".github/workflows").mkdir(parents=True)
+            (candidate / "scripts").mkdir()
+            (candidate / "tests").mkdir()
+            marker = temp_root / "candidate-executed"
+            malicious = (
+                "from pathlib import Path\n"
+                f"Path({str(marker)!r}).write_text('executed')\n"
+                "raise SystemExit(0)\n"
+            )
+            (
+                candidate / ".github/workflows/cisco-cutover-admission.yml"
+            ).write_text(
+                "name: attacker\non: pull_request_target\njobs: {}\n",
+                encoding="utf-8",
+            )
+            (
+                candidate / "scripts/validate_cisco_cutover_receipt.py"
+            ).write_text(malicious, encoding="utf-8")
+            (candidate / "tests/test_archive_triage.py").write_text(
+                malicious,
+                encoding="utf-8",
+            )
+            environment = self._trusted_workflow_environment(
+                receipt_payload=receipt_payload,
+                overrides={"GITHUB_WORKSPACE": str(candidate)},
+            )
+            result = self._run_trusted_workflow_program(
+                environment=environment,
+                cwd=trusted_cwd,
+            )
+            candidate_executed = marker.exists()
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(result.stderr, "")
+        self.assertFalse(candidate_executed)
         outcome = json.loads(result.stdout)
         self.assertEqual(outcome["classification"], "admitted")
         self.assertEqual(
             outcome["receipt_sha256"],
             hashlib.sha256(receipt_payload).hexdigest(),
         )
+
+    def test_trusted_cutover_workflow_rejects_placeholder_expectations(
+        self,
+    ) -> None:
+        for placeholder in ("placeholder", "<unset>", "0" * 40):
+            with self.subTest(placeholder=placeholder):
+                environment = self._trusted_workflow_environment(
+                    receipt_payload=b"{}\n",
+                    overrides={
+                        "CISCO_CUTOVER_EXPECTED_CANONICAL_COMMIT": placeholder
+                    },
+                )
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    result = self._run_trusted_workflow_program(
+                        environment=environment,
+                        cwd=Path(temp_dir),
+                    )
+
+                self.assertEqual(result.returncode, 1, result.stderr)
+                outcome = json.loads(result.stdout)
+                self.assertEqual(
+                    outcome["classification"],
+                    "blocked_until_trusted",
+                )
+                self.assertIn("is a placeholder", outcome["reason"])
 
     def test_private_migration_fixture_binds_atomic_aggregate_cutover(self) -> None:
         fixture = json.loads(MIGRATION_FIXTURE_PATH.read_text(encoding="utf-8"))

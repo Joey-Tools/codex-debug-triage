@@ -1,6 +1,4 @@
 interface:
-  display_name: "Optional Bug Triage Playbook"
-  short_description: "Explicit manual triage for provided logs and archives."
-  default_prompt: "Use $bug-triage-playbook to rank root-cause hypotheses from these provided local logs or archives."
-policy:
-  allow_implicit_invocation: false
+  display_name: "Bug Triage Playbook"
+  short_description: "Investigate logs, regressions, and root-cause hypotheses."
+  default_prompt: "Use $bug-triage-playbook to structure root-cause analysis from logs, failures, or regressions."

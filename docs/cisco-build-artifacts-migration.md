@@ -89,11 +89,13 @@ receipt. The fixture's `receipt_admission.status_without_receipt` remains
 `blocked_until_trusted`, so the canonical retirement PR and private consumer
 source sync are not merge-admitted by this repository alone.
 
-The local, no-network repository gate at
-`scripts/validate_cisco_cutover_receipt.py` gives the future private overlay
-gate a machine-verifiable admission boundary without adding Cisco behavior to
-the installed generic skill. The gate
-must obtain the receipt through the authenticated
+The local, no-network diagnostic at
+`scripts/validate_cisco_cutover_receipt.py` gives maintainers a
+machine-verifiable receipt-equivalence check without adding Cisco behavior to
+the installed generic skill. Because a pull request can modify this script and
+its tests, running it from a candidate checkout is never a merge or release
+admission. The independently trusted base workflow described below embeds its
+own verifier and must obtain the receipt through the authenticated
 `Joey-Tools/codex-private-workflows/.github/workflows/release.yml` release
 workflow and must supply four expectations from an independent trusted source,
 not copy them from the receipt:
@@ -144,15 +146,21 @@ field agreement; it does not authenticate where the caller obtained the
 receipt. Authenticated retrieval and the independent expectation values remain
 owned by the private release workflow.
 
-### Required CI Gate And Exact Unblocking Inputs
+### Protected-Base Admission And Exact Unblocking Inputs
 
-Every Python matrix leg in `.github/workflows/ci.yml` runs
-`scripts/run_cisco_cutover_ci_gate.py` after the repository tests. The runner
-stages the bounded receipt bytes and invokes
-`scripts/validate_cisco_cutover_receipt.py`; it has no success default,
-`continue-on-error`, placeholder identity, or receipt synthesized from the
-expected values. Exit 0 from the validator with `classification=admitted` is the
-only green outcome.
+The only merge admission is the exact `cisco-cutover-admission` context
+produced by `.github/workflows/cisco-cutover-admission.yml` after that workflow
+already exists on the protected default branch. It uses
+`pull_request_target`, performs no checkout, invokes no action, downloads no
+artifact, and executes no candidate script, test, import, or generated file.
+The verifier is self-contained in the base-owned workflow bytes. Candidate
+changes to `ci.yml`, this local validator, tests, or a same-named workflow
+therefore cannot change the job that evaluates the candidate.
+
+The base job binds the exact target/event/head repository, `master` base ref,
+and service-authored pull-request head SHA before validating the receipt. It
+exposes no secret or token to a candidate process because there is no candidate
+process. Exit 0 with `classification=admitted` is its only green outcome.
 
 The gate intentionally remains red until the authenticated private release
 workflow has produced a real receipt and a repository administrator has pinned
@@ -169,17 +177,37 @@ these non-secret GitHub Actions repository variables independently:
   bytes
 
 Do not derive any `EXPECTED_*` value from `CISCO_CUTOVER_RECEIPT_BASE64`.
-The runner additionally compares `CISCO_CUTOVER_EXPECTED_CANONICAL_COMMIT`
-against the GitHub event's exact pull-request head SHA (or the push SHA outside
-a pull request), so a valid old receipt and stale repository variable cannot
-admit a different candidate.
-Missing, empty, recognizable placeholder, all-zero, malformed, stale, or
-mismatched values keep the job red. Branch protection must require every
-`test` matrix check that contains this step, and any release automation for
-this repository must consume the same successful CI conclusion. If those
-GitHub-side requirements or the five inputs cannot yet be configured, the
-retirement change is structurally blocked; do not weaken or skip the step and
-do not add a fabricated receipt to make it green.
+The base verifier compares `CISCO_CUTOVER_EXPECTED_CANONICAL_COMMIT` against
+the exact event head SHA, so a valid old receipt and stale repository variable
+cannot admit a different candidate. Missing, empty, recognizable placeholder,
+all-zero, malformed, stale, or mismatched values keep the context red.
+
+This workflow cannot protect the pull request that first introduces it:
+`pull_request_target` loads workflow bytes from the current base. The minimum
+ordinary PR-merge sequence is therefore:
+
+1. Keep the old Jenkins skill route, helper, reference, and tests intact.
+   Separately review and merge a compatibility/bootstrap PR that installs this
+   workflow on `master`; a branch containing the workflow is not proof that the
+   base owns it.
+2. Confirm the workflow file is present on protected `master`, then update the
+   repository ruleset to require the exact `cisco-cutover-admission` context
+   with no bypass. Until both facts hold, keep every retirement PR draft or
+   otherwise blocked.
+3. Publish and verify the real private overlay, obtain its producer-authored
+   receipt, and independently configure the receipt plus all four expectation
+   variables. Do not add a fabricated receipt or derive expectations from it.
+4. Create a separate retirement PR from the updated protected base, freeze its
+   final head, bind the receipt and canonical expectation to that exact head,
+   and require the base-owned context to return `admitted`.
+5. Only then merge the retirement PR and allow the private consumer source-sync
+   step. Any head change requires a newly bound receipt/expectation set.
+
+This branch restores the Jenkins entrypoint so it can be used only as the
+compatibility/bootstrap change. If it remains described or treated as the
+retirement PR, it must stay draft/blocked until steps 1 and 2 have completed in
+a separate base merge. Do not weaken or skip the context to collapse the two
+merges into one.
 
 ## Private Command Interface To Preserve
 

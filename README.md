@@ -1,33 +1,37 @@
 # Codex Debug Triage
 
-An optional public playbook for manually turning provided logs, crash reports,
-test output, and downloaded archives into ranked root-cause hypotheses.
+An optional public playbook for turning logs, crash reports, test output, and
+build artifacts into ranked root-cause hypotheses.
 
-The bundled skill is explicit-invocation only. It does not own authenticated
-artifact retrieval, provider-specific credentials, or private host policy.
-Provider-specific CI triage stays with the corresponding provider workflow.
-The local helper only inspects ZIP files that are already on disk.
+This bootstrap release deliberately retains the existing Jenkins entrypoint,
+reference, routing, and tests while adding the bounded local ZIP helper. The
+Jenkins route cannot be retired until the independently trusted cutover
+admission workflow is installed on the protected default branch.
 
 ## Private Migration
 
-The retired authenticated Jenkins interface and the contract for moving it to
+The proposed authenticated Jenkins retirement and the contract for moving it to
 a separate private `cisco-build-artifacts` skill are documented in
 [`docs/cisco-build-artifacts-migration.md`](docs/cisco-build-artifacts-migration.md).
 That private implementation is intentionally not part of this repository.
-The repository includes only a no-network receipt validator for a future
-private release gate; without an independently trusted exact release/pointer
-receipt, cutover remains `blocked_until_trusted`.
-The CI gate is intentionally red until the authenticated private release
-receipt and all four independently pinned expected identities are configured;
-it contains no placeholder success path.
+`.github/workflows/cisco-cutover-admission.yml` is a self-contained
+`pull_request_target` gate with no candidate checkout or candidate code
+execution. A copy added by a pull request does not protect that same pull
+request: it becomes authoritative only after a separately reviewed bootstrap
+merge places it on the protected base and the repository ruleset requires the
+exact `cisco-cutover-admission` context. Until then, retirement remains
+`blocked_until_trusted` and the Jenkins entrypoint stays installed.
 
 ## Test
 
 ```bash
 python3 -m py_compile \
+  skills/bug-triage-playbook/scripts/jenkins_artifact_probe.py \
   skills/bug-triage-playbook/scripts/archive_triage.py \
-  scripts/run_cisco_cutover_ci_gate.py \
   scripts/validate_cisco_cutover_receipt.py \
-  tests/test_archive_triage.py
-python3 -m unittest tests.test_archive_triage
+  tests/test_archive_triage.py \
+  tests/test_jenkins_artifact_probe.py
+python3 -m unittest \
+  tests.test_archive_triage \
+  tests.test_jenkins_artifact_probe
 ```

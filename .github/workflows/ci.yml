@@ -26,19 +26,13 @@ jobs:
       - name: Compile Python helpers
         run: |
           python3 -m py_compile \
+            skills/bug-triage-playbook/scripts/jenkins_artifact_probe.py \
             skills/bug-triage-playbook/scripts/archive_triage.py \
-            scripts/run_cisco_cutover_ci_gate.py \
             scripts/validate_cisco_cutover_receipt.py \
-            tests/test_archive_triage.py
+            tests/test_archive_triage.py \
+            tests/test_jenkins_artifact_probe.py
       - name: Run tests
         run: |
-          python3 -m unittest tests.test_archive_triage
-      - name: Require admitted Cisco provider cutover
-        env:
-          CISCO_CUTOVER_RECEIPT_BASE64: ${{ vars.CISCO_CUTOVER_RECEIPT_BASE64 }}
-          CISCO_CUTOVER_OBSERVED_CANONICAL_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
-          CISCO_CUTOVER_EXPECTED_CANONICAL_COMMIT: ${{ vars.CISCO_CUTOVER_EXPECTED_CANONICAL_COMMIT }}
-          CISCO_CUTOVER_EXPECTED_PRIVATE_RELEASE_COMMIT: ${{ vars.CISCO_CUTOVER_EXPECTED_PRIVATE_RELEASE_COMMIT }}
-          CISCO_CUTOVER_EXPECTED_RELEASE_MANIFEST_SHA256: ${{ vars.CISCO_CUTOVER_EXPECTED_RELEASE_MANIFEST_SHA256 }}
-          CISCO_CUTOVER_EXPECTED_RECEIPT_SHA256: ${{ vars.CISCO_CUTOVER_EXPECTED_RECEIPT_SHA256 }}
-        run: python3 scripts/run_cisco_cutover_ci_gate.py
+          python3 -m unittest \
+            tests.test_archive_triage \
+            tests.test_jenkins_artifact_probe

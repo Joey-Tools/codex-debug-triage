@@ -1,0 +1,401 @@
+name: Cisco Cutover Admission
+
+on:
+  pull_request_target:
+    types:
+      - opened
+      - reopened
+      - ready_for_review
+      - synchronize
+
+permissions:
+  contents: read
+
+jobs:
+  cisco-cutover-admission:
+    name: cisco-cutover-admission
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Validate trusted release and pointer receipt
+        shell: bash --noprofile --norc -euo pipefail {0}
+        env:
+          EVENT_REPOSITORY: ${{ github.event.repository.full_name }}
+          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          PR_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          CISCO_CUTOVER_RECEIPT_BASE64: ${{ vars.CISCO_CUTOVER_RECEIPT_BASE64 }}
+          CISCO_CUTOVER_EXPECTED_CANONICAL_COMMIT: ${{ vars.CISCO_CUTOVER_EXPECTED_CANONICAL_COMMIT }}
+          CISCO_CUTOVER_EXPECTED_PRIVATE_RELEASE_COMMIT: ${{ vars.CISCO_CUTOVER_EXPECTED_PRIVATE_RELEASE_COMMIT }}
+          CISCO_CUTOVER_EXPECTED_RELEASE_MANIFEST_SHA256: ${{ vars.CISCO_CUTOVER_EXPECTED_RELEASE_MANIFEST_SHA256 }}
+          CISCO_CUTOVER_EXPECTED_RECEIPT_SHA256: ${{ vars.CISCO_CUTOVER_EXPECTED_RECEIPT_SHA256 }}
+        run: |
+          python3 - <<'PY'
+          import base64
+          import binascii
+          import hashlib
+          import json
+          import os
+          import re
+          import sys
+
+          EXPECTED_REPOSITORY = "Joey-Tools/codex-debug-triage"
+          EXPECTED_PRIVATE_REPOSITORY = "Joey-Tools/codex-private-workflows"
+          EXPECTED_BASE_REF = "master"
+          MAX_RECEIPT_BYTES = 64 * 1024
+          MAX_RECEIPT_BASE64_CHARS = 4 * ((MAX_RECEIPT_BYTES + 2) // 3)
+          MAX_JSON_DEPTH = 64
+          MAX_JSON_NODES = 4_096
+          MAX_JSON_CONTAINER_ITEMS = 1_024
+          MAX_JSON_INTEGER_DIGITS = 64
+          MAX_JSON_STRING_CHARS = 32 * 1024
+          SHA1_PATTERN = re.compile(r"[0-9a-f]{40}")
+          SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
+          PLACEHOLDERS = frozenset(
+              {
+                  "change-me",
+                  "changeme",
+                  "missing",
+                  "none",
+                  "placeholder",
+                  "todo",
+                  "unset",
+              }
+          )
+          EXPECTED_ACTIVATION = {
+              "release_kind": "immutable-private-overlay",
+              "atomic": True,
+              "provider": {
+                  "source": "personal_codex/skills/cisco-build-artifacts",
+                  "target": "skills/cisco-build-artifacts",
+              },
+              "routing_policy": {
+                  "source": "personal_codex/AGENTS.md",
+                  "target": "AGENTS.md",
+                  "remote_build_provider": "skills/cisco-build-artifacts",
+              },
+              "catalog": {
+                  "manifest": "personal_codex/private-sync-manifest.json",
+                  "active_target": "skills/cisco-build-artifacts",
+                  "removed_target": "skills/bug-triage-playbook",
+              },
+              "removed_link": {
+                  "source": "personal_codex/skills/bug-triage-playbook",
+                  "target": "skills/bug-triage-playbook",
+                  "replacement_target": "skills/cisco-build-artifacts",
+              },
+          }
+          EXPECTED_GATES = [
+              "private-package-validation",
+              "private-overlay-verifier",
+              "immutable-release-published",
+              "installed-current-pointer-verified",
+          ]
+
+
+          class AdmissionError(ValueError):
+              pass
+
+
+          def blocked(reason):
+              print(
+                  json.dumps(
+                      {
+                          "classification": "blocked_until_trusted",
+                          "reason": reason,
+                      },
+                      ensure_ascii=True,
+                      separators=(",", ":"),
+                      sort_keys=True,
+                  )
+              )
+              return 1
+
+
+          def required_environment(name):
+              value = os.environ.get(name)
+              if value is None or not value.strip():
+                  raise AdmissionError(f"required trusted input {name} is missing")
+              normalized = value.strip().lower()
+              if (
+                  normalized in PLACEHOLDERS
+                  or normalized.startswith("<")
+                  or normalized.startswith("$" + "{{")
+                  or set(normalized) == {"0"}
+              ):
+                  raise AdmissionError(
+                      f"required trusted input {name} is a placeholder"
+                  )
+              return value
+
+
+          def require_sha(value, pattern, label):
+              if type(value) is not str or pattern.fullmatch(value) is None:
+                  raise AdmissionError(f"{label} must be exact lowercase hex")
+              if set(value) == {"0"}:
+                  raise AdmissionError(f"{label} must not be all-zero")
+              return value
+
+
+          def reject_float(_value):
+              raise AdmissionError("JSON floating-point values are forbidden")
+
+
+          def reject_constant(_value):
+              raise AdmissionError("non-finite JSON values are forbidden")
+
+
+          def parse_integer(value):
+              if len(value.removeprefix("-")) > MAX_JSON_INTEGER_DIGITS:
+                  raise AdmissionError("JSON integer exceeds max digits")
+              return int(value)
+
+
+          def object_without_duplicates(pairs):
+              result = {}
+              for key, value in pairs:
+                  if key in result:
+                      raise AdmissionError(f"duplicate JSON key: {key}")
+                  result[key] = value
+              return result
+
+
+          def check_json_resources(parsed):
+              pending = [(parsed, 1)]
+              nodes = 0
+              while pending:
+                  value, depth = pending.pop()
+                  nodes += 1
+                  if nodes > MAX_JSON_NODES:
+                      raise AdmissionError("receipt exceeds max JSON nodes")
+                  if type(value) is dict:
+                      if depth > MAX_JSON_DEPTH:
+                          raise AdmissionError("receipt exceeds max JSON depth")
+                      if len(value) > MAX_JSON_CONTAINER_ITEMS:
+                          raise AdmissionError("receipt object exceeds max items")
+                      for key, item in value.items():
+                          if type(key) is not str:
+                              raise AdmissionError("receipt key must be text")
+                          if len(key) > MAX_JSON_STRING_CHARS:
+                              raise AdmissionError(
+                                  "receipt key exceeds max characters"
+                              )
+                          pending.append((item, depth + 1))
+                  elif type(value) is list:
+                      if depth > MAX_JSON_DEPTH:
+                          raise AdmissionError("receipt exceeds max JSON depth")
+                      if len(value) > MAX_JSON_CONTAINER_ITEMS:
+                          raise AdmissionError("receipt array exceeds max items")
+                      for item in value:
+                          pending.append((item, depth + 1))
+                  elif type(value) is str:
+                      if len(value) > MAX_JSON_STRING_CHARS:
+                          raise AdmissionError(
+                              "receipt string exceeds max characters"
+                          )
+                  elif type(value) not in (int, bool, type(None)):
+                      raise AdmissionError("receipt has unsupported JSON value")
+
+
+          def parse_receipt(encoded):
+              if len(encoded) > MAX_RECEIPT_BASE64_CHARS:
+                  raise AdmissionError("trusted receipt Base64 exceeds max characters")
+              try:
+                  payload = base64.b64decode(encoded, validate=True)
+              except (binascii.Error, ValueError) as error:
+                  raise AdmissionError(
+                      "trusted receipt Base64 is malformed"
+                  ) from error
+              if not payload:
+                  raise AdmissionError("trusted receipt is empty")
+              if len(payload) > MAX_RECEIPT_BYTES:
+                  raise AdmissionError("trusted receipt exceeds max bytes")
+              try:
+                  decoded = payload.decode("utf-8", errors="strict")
+                  parsed = json.loads(
+                      decoded,
+                      object_pairs_hook=object_without_duplicates,
+                      parse_int=parse_integer,
+                      parse_float=reject_float,
+                      parse_constant=reject_constant,
+                  )
+              except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as error:
+                  raise AdmissionError("trusted receipt is invalid JSON") from error
+              check_json_resources(parsed)
+              if type(parsed) is not dict:
+                  raise AdmissionError("trusted receipt must be a JSON object")
+              return payload, parsed
+
+
+          def exact_keys(value, expected, label):
+              if type(value) is not dict or set(value) != set(expected):
+                  raise AdmissionError(f"{label} fields differ")
+              return value
+
+
+          def exact_equal(actual, expected):
+              if type(actual) is not type(expected):
+                  return False
+              if type(expected) is dict:
+                  return set(actual) == set(expected) and all(
+                      exact_equal(actual[key], expected[key]) for key in expected
+                  )
+              if type(expected) is list:
+                  return len(actual) == len(expected) and all(
+                      exact_equal(left, right)
+                      for left, right in zip(actual, expected)
+                  )
+              return actual == expected
+
+
+          def validate_receipt(receipt, expected):
+              receipt = exact_keys(
+                  receipt,
+                  {
+                      "schema_version",
+                      "canonical_repository",
+                      "canonical_commit",
+                      "private_aggregate_repository",
+                      "private_release_commit",
+                      "release_manifest_sha256",
+                      "release_target",
+                      "activation",
+                      "gates",
+                      "installed_pointer",
+                  },
+                  "receipt",
+              )
+              if type(receipt["schema_version"]) is not int:
+                  raise AdmissionError("receipt schema_version must be an integer")
+              if receipt["schema_version"] != 1:
+                  raise AdmissionError("receipt schema_version differs")
+              if receipt["canonical_repository"] != EXPECTED_REPOSITORY:
+                  raise AdmissionError("receipt canonical repository differs")
+              if receipt["canonical_commit"] != expected["canonical_commit"]:
+                  raise AdmissionError("receipt canonical commit differs")
+              if receipt["private_aggregate_repository"] != EXPECTED_PRIVATE_REPOSITORY:
+                  raise AdmissionError("receipt private repository differs")
+              if receipt["private_release_commit"] != expected["private_release"]:
+                  raise AdmissionError("receipt private release differs")
+              if receipt["release_manifest_sha256"] != expected["manifest_sha256"]:
+                  raise AdmissionError("receipt manifest digest differs")
+              release_target = f"releases/{expected['private_release']}"
+              if receipt["release_target"] != release_target:
+                  raise AdmissionError("receipt release target differs")
+              if not exact_equal(receipt["activation"], EXPECTED_ACTIVATION):
+                  raise AdmissionError("receipt activation differs")
+              gates = receipt["gates"]
+              if type(gates) is not list or len(gates) != len(EXPECTED_GATES):
+                  raise AdmissionError("receipt gate set differs")
+              for gate, expected_name in zip(gates, EXPECTED_GATES):
+                  gate = exact_keys(
+                      gate,
+                      {
+                          "name",
+                          "status",
+                          "private_release_commit",
+                          "release_manifest_sha256",
+                      },
+                      "receipt gate",
+                  )
+                  if gate["name"] != expected_name or gate["status"] != "passed":
+                      raise AdmissionError("receipt gate differs")
+                  if gate["private_release_commit"] != expected["private_release"]:
+                      raise AdmissionError("receipt gate release differs")
+                  if (
+                      gate["release_manifest_sha256"]
+                      != expected["manifest_sha256"]
+                  ):
+                      raise AdmissionError("receipt gate manifest differs")
+              pointer = exact_keys(
+                  receipt["installed_pointer"],
+                  {
+                      "name",
+                      "target",
+                      "resolved_release_commit",
+                      "release_manifest_sha256",
+                  },
+                  "installed pointer",
+              )
+              if pointer["name"] != "current" or pointer["target"] != release_target:
+                  raise AdmissionError("installed pointer target differs")
+              if pointer["resolved_release_commit"] != expected["private_release"]:
+                  raise AdmissionError("installed pointer release differs")
+              if pointer["release_manifest_sha256"] != expected["manifest_sha256"]:
+                  raise AdmissionError("installed pointer manifest differs")
+              return release_target
+
+
+          try:
+              if os.environ.get("GITHUB_REPOSITORY") != EXPECTED_REPOSITORY:
+                  raise AdmissionError("runner repository differs")
+              if required_environment("EVENT_REPOSITORY") != EXPECTED_REPOSITORY:
+                  raise AdmissionError("event repository differs")
+              if required_environment("PR_HEAD_REPOSITORY") != EXPECTED_REPOSITORY:
+                  raise AdmissionError("pull-request head repository differs")
+              if required_environment("PR_BASE_REF") != EXPECTED_BASE_REF:
+                  raise AdmissionError("pull-request base branch differs")
+              head_sha = require_sha(
+                  required_environment("PR_HEAD_SHA"),
+                  SHA1_PATTERN,
+                  "pull-request head SHA",
+              )
+              expected = {
+                  "canonical_commit": require_sha(
+                      required_environment(
+                          "CISCO_CUTOVER_EXPECTED_CANONICAL_COMMIT"
+                      ),
+                      SHA1_PATTERN,
+                      "expected canonical commit",
+                  ),
+                  "private_release": require_sha(
+                      required_environment(
+                          "CISCO_CUTOVER_EXPECTED_PRIVATE_RELEASE_COMMIT"
+                      ),
+                      SHA1_PATTERN,
+                      "expected private release commit",
+                  ),
+                  "manifest_sha256": require_sha(
+                      required_environment(
+                          "CISCO_CUTOVER_EXPECTED_RELEASE_MANIFEST_SHA256"
+                      ),
+                      SHA256_PATTERN,
+                      "expected release manifest SHA-256",
+                  ),
+                  "receipt_sha256": require_sha(
+                      required_environment(
+                          "CISCO_CUTOVER_EXPECTED_RECEIPT_SHA256"
+                      ),
+                      SHA256_PATTERN,
+                      "expected receipt SHA-256",
+                  ),
+              }
+              if expected["canonical_commit"] != head_sha:
+                  raise AdmissionError(
+                      "trusted canonical expectation differs from PR head"
+                  )
+              payload, receipt = parse_receipt(
+                  required_environment("CISCO_CUTOVER_RECEIPT_BASE64")
+              )
+              actual_receipt_sha256 = hashlib.sha256(payload).hexdigest()
+              if actual_receipt_sha256 != expected["receipt_sha256"]:
+                  raise AdmissionError("trusted receipt digest differs")
+              release_target = validate_receipt(receipt, expected)
+          except AdmissionError as error:
+              raise SystemExit(blocked(str(error)))
+
+          print(
+              json.dumps(
+                  {
+                      "canonical_commit": expected["canonical_commit"],
+                      "classification": "admitted",
+                      "pointer_target": release_target,
+                      "private_release_commit": expected["private_release"],
+                      "receipt_sha256": actual_receipt_sha256,
+                  },
+                  ensure_ascii=True,
+                  separators=(",", ":"),
+                  sort_keys=True,
+              )
+          )
+          PY
