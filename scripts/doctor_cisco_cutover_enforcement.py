@@ -49,6 +49,10 @@ MAX_JSON_STRING_CHARS = 128 * 1024
 MAX_GH_EXECUTABLE_BYTES = 256 * 1024 * 1024
 MAX_GH_CONFIG_BYTES = 1024 * 1024
 MAX_GH_CONFIG_LINE_BYTES = 16 * 1024
+GH_PROCESS_TERM_GRACE_SECONDS = 1.0
+GH_PROCESS_REAP_DEADLINE_SECONDS = 5.0
+GH_PROCESS_CLEANUP_POLL_SECONDS = 0.01
+GH_PROCESS_DRAIN_CHUNKS_PER_TICK = 16
 MAX_DARWIN_ACL_BYTES = 64 * 1024
 MAX_DARWIN_ACL_ENTRIES = 128
 GH_EXECUTABLE_ENVIRONMENT_PROFILE = "minimal-snapshotted-config-v2"
@@ -646,14 +650,231 @@ def _load_contract(contract: dict[str, Any]) -> dict[str, Any]:
     return contract
 
 
-def _kill_process(process: subprocess.Popen[bytes]) -> None:
+def _signal_process_group(
+    process: subprocess.Popen[bytes],
+    signal_number: int,
+) -> bool:
     try:
         if os.name == "posix":
-            os.killpg(process.pid, signal.SIGKILL)
+            os.killpg(process.pid, signal_number)
+        elif signal_number == signal.SIGTERM:
+            process.terminate()
         else:
             process.kill()
     except ProcessLookupError:
-        pass
+        return True
+    except Exception:
+        return False
+    return True
+
+
+def _process_group_state(
+    process: subprocess.Popen[bytes],
+    *,
+    direct_reaped: bool,
+) -> tuple[bool, bool]:
+    if os.name != "posix":
+        return (not direct_reaped, True)
+    try:
+        os.killpg(process.pid, 0)
+    except ProcessLookupError:
+        return (False, True)
+    except PermissionError:
+        return (True, False)
+    except OSError as error:
+        if error.errno == errno.ESRCH:
+            return (False, True)
+        return (True, False)
+    return (True, True)
+
+
+def _drain_process_streams_once(
+    open_stream_fds: set[int],
+) -> list[str]:
+    failures: list[str] = []
+    for fd in tuple(open_stream_fds):
+        for _ in range(GH_PROCESS_DRAIN_CHUNKS_PER_TICK):
+            try:
+                chunk = os.read(fd, 64 * 1024)
+            except BlockingIOError:
+                break
+            except InterruptedError:
+                continue
+            except OSError:
+                failures.append("stream-drain-read")
+                open_stream_fds.discard(fd)
+                break
+            if not chunk:
+                open_stream_fds.discard(fd)
+                break
+    return failures
+
+
+def _terminate_drain_reap_impl(
+    process: subprocess.Popen[bytes],
+) -> list[str]:
+    failures: list[str] = []
+    streams = tuple(
+        stream
+        for stream in (process.stdout, process.stderr)
+        if stream is not None
+    )
+    open_stream_fds: set[int] = set()
+    for stream in streams:
+        try:
+            fd = stream.fileno()
+            os.set_blocking(fd, False)
+        except Exception:
+            failures.append("stream-drain-setup")
+            continue
+        open_stream_fds.add(fd)
+
+    term_signal_succeeded = _signal_process_group(process, signal.SIGTERM)
+    term_deadline = time.monotonic() + GH_PROCESS_TERM_GRACE_SECONDS
+    direct_reaped = False
+    group_active = True
+    group_state_reliable = True
+    while time.monotonic() < term_deadline:
+        failures.extend(_drain_process_streams_once(open_stream_fds))
+        try:
+            direct_reaped = process.poll() is not None
+        except Exception:
+            failures.append("process-poll")
+            break
+        group_active, group_state_reliable = _process_group_state(
+            process,
+            direct_reaped=direct_reaped,
+        )
+        if direct_reaped and not group_active and not open_stream_fds:
+            break
+        time.sleep(
+            min(
+                GH_PROCESS_CLEANUP_POLL_SECONDS,
+                max(0.0, term_deadline - time.monotonic()),
+            )
+        )
+
+    kill_required = not (
+        direct_reaped
+        and not group_active
+        and group_state_reliable
+        and not open_stream_fds
+    )
+    kill_signal_succeeded = True
+    if kill_required:
+        kill_signal_succeeded = _signal_process_group(
+            process,
+            signal.SIGKILL,
+        )
+
+    reap_deadline = time.monotonic() + GH_PROCESS_REAP_DEADLINE_SECONDS
+    reap_wait_failed = False
+    while time.monotonic() < reap_deadline:
+        failures.extend(_drain_process_streams_once(open_stream_fds))
+        if not direct_reaped and not reap_wait_failed:
+            remaining = reap_deadline - time.monotonic()
+            try:
+                process.wait(
+                    timeout=max(
+                        0.0,
+                        min(
+                            GH_PROCESS_CLEANUP_POLL_SECONDS,
+                            remaining,
+                        ),
+                    ),
+                )
+                direct_reaped = True
+            except subprocess.TimeoutExpired:
+                pass
+            except Exception:
+                failures.append("process-reap")
+                reap_wait_failed = True
+        group_active, group_state_reliable = _process_group_state(
+            process,
+            direct_reaped=direct_reaped,
+        )
+        if direct_reaped and not group_active and not open_stream_fds:
+            break
+        time.sleep(
+            min(
+                GH_PROCESS_CLEANUP_POLL_SECONDS,
+                max(0.0, reap_deadline - time.monotonic()),
+            )
+        )
+
+    if not direct_reaped and not reap_wait_failed:
+        failures.append("process-reap-timeout")
+    group_active, group_state_reliable = _process_group_state(
+        process,
+        direct_reaped=direct_reaped,
+    )
+    if not direct_reaped:
+        failures.append("process-not-reaped")
+    if group_active or not group_state_reliable:
+        failures.append("process-group-not-quiescent")
+    if open_stream_fds:
+        failures.append("stream-drain-incomplete")
+    if not term_signal_succeeded and not direct_reaped:
+        failures.append("term-signal")
+    if kill_required and not kill_signal_succeeded:
+        failures.append("kill-signal")
+    return sorted(set(failures))
+
+
+def _terminate_drain_reap(
+    process: subprocess.Popen[bytes],
+) -> list[str]:
+    try:
+        return _terminate_drain_reap_impl(process)
+    except BaseException:
+        failures = ["process-cleanup-internal"]
+        if not _signal_process_group(process, signal.SIGKILL):
+            failures.append("kill-signal")
+        direct_reaped = False
+        try:
+            process.wait(timeout=GH_PROCESS_REAP_DEADLINE_SECONDS)
+            direct_reaped = True
+        except BaseException:
+            failures.append("process-reap")
+        try:
+            group_active, group_state_reliable = _process_group_state(
+                process,
+                direct_reaped=direct_reaped,
+            )
+        except BaseException:
+            group_active = True
+            group_state_reliable = False
+        if not direct_reaped:
+            failures.append("process-not-reaped")
+        if group_active or not group_state_reliable:
+            failures.append("process-group-not-quiescent")
+        return sorted(set(failures))
+
+
+def _close_process_resources(
+    selector: Optional[selectors.BaseSelector],
+    process: subprocess.Popen[bytes],
+    *,
+    close_streams: bool = True,
+) -> list[str]:
+    failures: list[str] = []
+    if selector is not None:
+        try:
+            selector.close()
+        except Exception:
+            failures.append("selector-close")
+    if close_streams:
+        for label, stream in (
+            ("stdout-close", process.stdout),
+            ("stderr-close", process.stderr),
+        ):
+            if stream is None:
+                continue
+            try:
+                stream.close()
+            except Exception:
+                failures.append(label)
+    return failures
 
 
 def _api_failure(
@@ -1355,64 +1576,75 @@ class _BoundRegularFile:
         flags = (
             os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
         )
-        parent.revalidate()
+        local_fd: Optional[int] = None
         try:
-            self.fd = os.open(name, flags, dir_fd=parent.fd)
-            descriptor_before = os.fstat(self.fd)
+            parent.revalidate()
+            local_fd = os.open(name, flags, dir_fd=parent.fd)
+            descriptor_before = os.fstat(local_fd)
             path_before = os.stat(
                 name,
                 dir_fd=parent.fd,
                 follow_symlinks=False,
             )
-            access_policy_before = _stable_fd_access_policy_binding(self.fd)
+            access_policy_before = _stable_fd_access_policy_binding(local_fd)
             first = _read_fd_payload_bounded(
-                self.fd,
+                local_fd,
                 label=label,
                 limit=max_bytes,
             )
             second = _read_fd_payload_bounded(
-                self.fd,
+                local_fd,
                 label=label,
                 limit=max_bytes,
             )
-            descriptor_after = os.fstat(self.fd)
+            descriptor_after = os.fstat(local_fd)
             path_after = os.stat(
                 name,
                 dir_fd=parent.fd,
                 follow_symlinks=False,
             )
-            access_policy_after = _stable_fd_access_policy_binding(self.fd)
+            access_policy_after = _stable_fd_access_policy_binding(local_fd)
+            if (
+                not stat.S_ISREG(descriptor_before.st_mode)
+                or not stat.S_ISREG(path_before.st_mode)
+                or not stat.S_ISREG(descriptor_after.st_mode)
+                or not stat.S_ISREG(path_after.st_mode)
+                or descriptor_before.st_uid != os.geteuid()
+                or descriptor_before.st_nlink != 1
+                or stat.S_IMODE(descriptor_before.st_mode) & 0o077
+                or _file_status(descriptor_before) != _file_status(path_before)
+                or _file_status(descriptor_before) != _file_status(descriptor_after)
+                or _file_status(descriptor_before) != _file_status(path_after)
+                or access_policy_before != access_policy_after
+                or first != second
+                or len(first) != descriptor_before.st_size
+            ):
+                raise _blocked(
+                    "collector-unavailable",
+                    f"{label} identity, access policy, or content is unsafe",
+                )
+            binding = _file_status(descriptor_before)
+            sha256 = hashlib.sha256(first).hexdigest()
+            parent.revalidate()
+            self.payload = first
+            self.binding = binding
+            self.access_policy_binding = access_policy_before
+            self.sha256 = sha256
+            self.fd = local_fd
+            local_fd = None
+        except EnforcementDoctorError:
+            raise
         except OSError as error:
-            self.close()
             raise _blocked(
                 "collector-unavailable",
                 f"{label} cannot be opened safely",
             ) from error
-        if (
-            not stat.S_ISREG(descriptor_before.st_mode)
-            or not stat.S_ISREG(path_before.st_mode)
-            or not stat.S_ISREG(descriptor_after.st_mode)
-            or not stat.S_ISREG(path_after.st_mode)
-            or descriptor_before.st_uid != os.geteuid()
-            or descriptor_before.st_nlink != 1
-            or stat.S_IMODE(descriptor_before.st_mode) & 0o077
-            or _file_status(descriptor_before) != _file_status(path_before)
-            or _file_status(descriptor_before) != _file_status(descriptor_after)
-            or _file_status(descriptor_before) != _file_status(path_after)
-            or access_policy_before != access_policy_after
-            or first != second
-            or len(first) != descriptor_before.st_size
-        ):
-            self.close()
-            raise _blocked(
-                "collector-unavailable",
-                f"{label} identity, access policy, or content is unsafe",
-            )
-        self.payload = first
-        self.binding = _file_status(descriptor_before)
-        self.access_policy_binding = access_policy_before
-        self.sha256 = hashlib.sha256(first).hexdigest()
-        parent.revalidate()
+        finally:
+            if local_fd is not None:
+                try:
+                    os.close(local_fd)
+                except OSError:
+                    pass
 
     def revalidate(self) -> None:
         if self.fd is None:
@@ -1903,6 +2135,7 @@ def _bounded_subprocess(
     environment: dict[str, str],
     execution_cwd: str,
     endpoint_class: str,
+    process_registry: dict[int, subprocess.Popen[bytes]],
     timeout_seconds: int,
     stdout_limit: int,
     stderr_limit: int,
@@ -1928,20 +2161,30 @@ def _bounded_subprocess(
                 failure_kind="process-start",
             ),
         ) from error
-    assert process.stdout is not None
-    assert process.stderr is not None
-    selector = selectors.DefaultSelector()
-    selector.register(process.stdout, selectors.EVENT_READ, ("stdout", stdout_limit))
-    selector.register(process.stderr, selectors.EVENT_READ, ("stderr", stderr_limit))
-    chunks: dict[str, list[bytes]] = {"stdout": [], "stderr": []}
-    retained: dict[str, int] = {"stdout": 0, "stderr": 0}
-    deadline = time.monotonic() + timeout_seconds
+    selector: Optional[selectors.BaseSelector] = None
     try:
+        if process.pid in process_registry:
+            raise OSError("collector process identity is already registered")
+        process_registry[process.pid] = process
+        chunks: dict[str, list[bytes]] = {"stdout": [], "stderr": []}
+        retained: dict[str, int] = {"stdout": 0, "stderr": 0}
+        deadline = time.monotonic() + timeout_seconds
+        if process.stdout is None or process.stderr is None:
+            raise OSError("collector pipes are unavailable")
+        selector = selectors.DefaultSelector()
+        selector.register(
+            process.stdout,
+            selectors.EVENT_READ,
+            ("stdout", stdout_limit),
+        )
+        selector.register(
+            process.stderr,
+            selectors.EVENT_READ,
+            ("stderr", stderr_limit),
+        )
         while selector.get_map():
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                _kill_process(process)
-                process.wait()
                 raise _blocked(
                     "api-timeout",
                     "GitHub API collector command exceeded its deadline",
@@ -1962,8 +2205,6 @@ def _bounded_subprocess(
                     continue
                 retained[stream_name] += len(chunk)
                 if retained[stream_name] > stream_limit:
-                    _kill_process(process)
-                    process.wait()
                     raise _blocked(
                         "api-response-too-large",
                         f"GitHub collector {stream_name} exceeded its byte ceiling",
@@ -1974,25 +2215,89 @@ def _bounded_subprocess(
                         ),
                     )
                 chunks[stream_name].append(chunk)
-        return_code = process.wait(
-            timeout=max(0.1, deadline - time.monotonic()),
+        try:
+            return_code = process.wait(
+                timeout=max(0.001, deadline - time.monotonic()),
+            )
+        except subprocess.TimeoutExpired as error:
+            raise _blocked(
+                "api-timeout",
+                "GitHub API collector command exceeded its deadline",
+                api_failure=_api_failure(
+                    endpoint_class,
+                    http_status=None,
+                    failure_kind="timeout",
+                ),
+            ) from error
+        group_active, group_state_reliable = _process_group_state(
+            process,
+            direct_reaped=True,
         )
-    except subprocess.TimeoutExpired as error:
-        _kill_process(process)
-        process.wait()
+        if group_active or not group_state_reliable:
+            raise _blocked(
+                "collector-inconclusive",
+                "GitHub API collector process group remained active",
+                api_failure=_api_failure(
+                    endpoint_class,
+                    http_status=None,
+                    failure_kind="process-linger",
+                ),
+            )
+    except BaseException as error:
+        cleanup_failures = _terminate_drain_reap(process)
+        resource_failures = _close_process_resources(
+            selector,
+            process,
+            close_streams=not cleanup_failures,
+        )
+        if cleanup_failures:
+            raise _blocked(
+                "collector-inconclusive",
+                "GitHub API collector process cleanup could not be proven",
+                api_failure=_api_failure(
+                    endpoint_class,
+                    http_status=None,
+                    failure_kind="process-cleanup",
+                ),
+            ) from error
+        if process_registry.get(process.pid) is process:
+            process_registry.pop(process.pid)
+        if resource_failures:
+            raise _blocked(
+                "collector-inconclusive",
+                "GitHub API collector resources could not be closed safely",
+                api_failure=_api_failure(
+                    endpoint_class,
+                    http_status=None,
+                    failure_kind="process-resource",
+                ),
+            ) from error
+        if isinstance(error, EnforcementDoctorError):
+            raise
+        if not isinstance(error, Exception):
+            raise
         raise _blocked(
-            "api-timeout",
-            "GitHub API collector command exceeded its deadline",
+            "collector-inconclusive",
+            "GitHub API collector I/O could not be supervised safely",
             api_failure=_api_failure(
                 endpoint_class,
                 http_status=None,
-                failure_kind="timeout",
+                failure_kind="process-io",
             ),
         ) from error
-    finally:
-        selector.close()
-        process.stdout.close()
-        process.stderr.close()
+    if process_registry.get(process.pid) is process:
+        process_registry.pop(process.pid)
+    resource_failures = _close_process_resources(selector, process)
+    if resource_failures:
+        raise _blocked(
+            "collector-inconclusive",
+            "GitHub API collector resources could not be closed safely",
+            api_failure=_api_failure(
+                endpoint_class,
+                http_status=None,
+                failure_kind="process-resource",
+            ),
+        )
     return return_code, b"".join(chunks["stdout"]), b"".join(chunks["stderr"])
 
 
@@ -2015,6 +2320,7 @@ class GitHubApiClient:
         self._snapshot_hosts_file: Optional[_BoundRegularFile] = None
         self._snapshot_global_config_file: Optional[_BoundRegularFile] = None
         self._provisional_cleanup_objects: list[dict[str, Any]] = []
+        self._active_processes: dict[int, subprocess.Popen[bytes]] = {}
         self._source_fd: Optional[int] = None
         self._snapshot_fd: Optional[int] = None
         self._source_access_policy_binding: Optional[tuple[str, int, str]] = None
@@ -2914,6 +3220,32 @@ class GitHubApiClient:
             return
         cleanup_failures: list[str] = []
         cleanup_proofs: list[bool] = []
+        unresolved_processes: list[dict[str, Any]] = []
+        active_processes = getattr(self, "_active_processes", {})
+        for process_id, process in tuple(active_processes.items()):
+            process_failures = _terminate_drain_reap(process)
+            if process_failures:
+                cleanup_failures.append("active-process-cleanup")
+                cleanup_proofs.append(False)
+                unresolved_processes.append(
+                    {
+                        "pid": process_id,
+                        "process_group": (
+                            process_id if os.name == "posix" else None
+                        ),
+                        "quiescence": "unproven",
+                    }
+                )
+                continue
+            process_resource_failures = _close_process_resources(
+                None,
+                process,
+            )
+            if process_resource_failures:
+                cleanup_failures.append("active-process-resource-close")
+            if active_processes.get(process_id) is process:
+                active_processes.pop(process_id)
+        process_cleanup_unproven = bool(unresolved_processes)
         if self._pinned:
             previously_reported_inconclusive = (
                 self._collector_inconclusive_reported
@@ -2946,7 +3278,10 @@ class GitHubApiClient:
                     cleanup_proofs.append(True)
                 return True
 
-        if self._config_snapshot_directory is not None:
+        if (
+            not process_cleanup_unproven
+            and self._config_snapshot_directory is not None
+        ):
             attempt(
                 "config-directory-owner-mode",
                 lambda: self._prepare_directory_for_cleanup(
@@ -2987,7 +3322,10 @@ class GitHubApiClient:
                     proof_required=True,
                 )
 
-        if self._executable_snapshot_directory is not None:
+        if (
+            not process_cleanup_unproven
+            and self._executable_snapshot_directory is not None
+        ):
             attempt(
                 "executable-directory-owner-mode",
                 lambda: self._prepare_directory_for_cleanup(
@@ -3008,7 +3346,9 @@ class GitHubApiClient:
             )
 
         run_directory_removed = self._run_directory is None
-        if self._run_directory is not None:
+        if process_cleanup_unproven and self._run_directory is not None:
+            run_directory_removed = False
+        elif self._run_directory is not None:
             if self._config_snapshot_directory is None:
                 attempt(
                     "remove-config-directory",
@@ -3078,6 +3418,13 @@ class GitHubApiClient:
             [] if cleanup_proven else self._retained_cleanup_objects()
         )
 
+        for process in active_processes.values():
+            process_resource_failures = _close_process_resources(
+                None,
+                process,
+            )
+            if process_resource_failures:
+                cleanup_failures.append("unresolved-process-resource-close")
         for anchor in self._provisional_cleanup_objects:
             try:
                 os.close(anchor["fd"])
@@ -3132,6 +3479,8 @@ class GitHubApiClient:
                 cleanup_failure["retained_runtime"] = retained_locator
             if retained_objects:
                 cleanup_failure["retained_objects"] = retained_objects
+            if unresolved_processes:
+                cleanup_failure["unresolved_processes"] = unresolved_processes
             raise _blocked(
                 "collector-inconclusive",
                 "GitHub CLI private snapshot policy or cleanup could not be proven",
@@ -3194,6 +3543,7 @@ class GitHubApiClient:
                 environment=dict(self._environment),
                 execution_cwd=self._execution_cwd,
                 endpoint_class=endpoint_class,
+                process_registry=self._active_processes,
                 timeout_seconds=max(1, min(MAX_API_SECONDS, int(remaining))),
                 stdout_limit=stdout_limit,
                 stderr_limit=MAX_API_STDERR_BYTES,

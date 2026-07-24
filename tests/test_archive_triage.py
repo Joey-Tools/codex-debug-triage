@@ -21,7 +21,7 @@ import tempfile
 import time
 import unittest
 import zipfile
-from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from contextlib import contextmanager, nullcontext, redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import Iterator
 from unittest import mock
@@ -6565,6 +6565,821 @@ class BugTriageDocumentationTests(unittest.TestCase):
                     actual_response = client.get_json("/user")
                     self.assertEqual(actual_response["login"], "fixture")
 
+    def test_enforcement_subprocess_registers_before_deadline_initialization(
+        self,
+    ) -> None:
+        process = mock.Mock()
+        process.pid = 4242
+        process.stdout = mock.Mock()
+        process.stderr = mock.Mock()
+        process_registry: dict[int, subprocess.Popen[bytes]] = {}
+
+        with (
+            mock.patch.object(
+                ENFORCEMENT_MODULE.subprocess,
+                "Popen",
+                return_value=process,
+            ),
+            mock.patch.object(
+                ENFORCEMENT_MODULE.time,
+                "monotonic",
+                side_effect=OSError(
+                    errno.EIO,
+                    "injected deadline initialization failure",
+                ),
+            ),
+            mock.patch.object(
+                ENFORCEMENT_MODULE,
+                "_terminate_drain_reap",
+                return_value=[],
+            ) as cleanup,
+            self.assertRaises(
+                ENFORCEMENT_MODULE.EnforcementDoctorError
+            ) as raised,
+        ):
+            ENFORCEMENT_MODULE._bounded_subprocess(
+                ["/fixed/gh", "api", "/user"],
+                environment={},
+                execution_cwd=tempfile.gettempdir(),
+                endpoint_class="authenticated-user",
+                process_registry=process_registry,
+                timeout_seconds=1,
+                stdout_limit=1024,
+                stderr_limit=1024,
+            )
+
+        cleanup.assert_called_once_with(process)
+        self.assertEqual(process_registry, {})
+        self.assertEqual(raised.exception.reason_code, "collector-inconclusive")
+        self.assertEqual(
+            raised.exception.api_failure,
+            {
+                "endpoint_class": "authenticated-user",
+                "failure_kind": "process-io",
+                "http_status": None,
+            },
+        )
+        process.stdout.close.assert_called_once()
+        process.stderr.close.assert_called_once()
+
+    def test_enforcement_subprocess_selector_failures_terminate_before_return(
+        self,
+    ) -> None:
+        for failure_point in (
+            "create",
+            "register",
+            "select",
+            "read",
+            "unregister",
+            "wait",
+        ):
+            with self.subTest(failure=failure_point):
+                process = mock.Mock()
+                process.pid = 4242
+                process.stdout = mock.Mock()
+                process.stderr = mock.Mock()
+                process.stdout.fileno.return_value = 101
+                process.stderr.fileno.return_value = 102
+                selector = mock.Mock()
+                key = mock.Mock()
+                key.data = ("stdout", 1024)
+                key.fileobj = process.stdout
+                selector.get_map.return_value = {"stdout": key}
+                selector.select.return_value = [
+                    (key, ENFORCEMENT_MODULE.selectors.EVENT_READ)
+                ]
+                if failure_point == "register":
+                    selector.register.side_effect = OSError(
+                        errno.EIO,
+                        "injected selector register failure",
+                    )
+                elif failure_point == "select":
+                    selector.select.side_effect = OSError(
+                        errno.EIO,
+                        "injected selector select failure",
+                    )
+                elif failure_point == "unregister":
+                    selector.unregister.side_effect = OSError(
+                        errno.EIO,
+                        "injected selector unregister failure",
+                    )
+                elif failure_point == "wait":
+                    selector.get_map.return_value = {}
+                    process.wait.side_effect = OSError(
+                        errno.EIO,
+                        "injected process wait failure",
+                    )
+
+                with (
+                    mock.patch.object(
+                        ENFORCEMENT_MODULE.subprocess,
+                        "Popen",
+                        return_value=process,
+                    ),
+                    mock.patch.object(
+                        ENFORCEMENT_MODULE,
+                        "_terminate_drain_reap",
+                        return_value=[],
+                    ) as cleanup,
+                ):
+                    if failure_point == "create":
+                        selector_context = mock.patch.object(
+                            ENFORCEMENT_MODULE.selectors,
+                            "DefaultSelector",
+                            side_effect=OSError(
+                                errno.EIO,
+                                "injected selector creation failure",
+                            ),
+                        )
+                    else:
+                        selector_context = mock.patch.object(
+                            ENFORCEMENT_MODULE.selectors,
+                            "DefaultSelector",
+                            return_value=selector,
+                        )
+                    with selector_context:
+                        if failure_point == "read":
+                            read_context = mock.patch.object(
+                                ENFORCEMENT_MODULE.os,
+                                "read",
+                                side_effect=OSError(
+                                    errno.EIO,
+                                    "injected stream read failure",
+                                ),
+                            )
+                        elif failure_point == "unregister":
+                            read_context = mock.patch.object(
+                                ENFORCEMENT_MODULE.os,
+                                "read",
+                                return_value=b"",
+                            )
+                        else:
+                            read_context = nullcontext()
+                        with read_context:
+                            with self.assertRaises(
+                                ENFORCEMENT_MODULE.EnforcementDoctorError
+                            ) as raised:
+                                ENFORCEMENT_MODULE._bounded_subprocess(
+                                    ["/fixed/gh", "api", "/user"],
+                                    environment={},
+                                    execution_cwd=tempfile.gettempdir(),
+                                    endpoint_class="authenticated-user",
+                                    process_registry={},
+                                    timeout_seconds=1,
+                                    stdout_limit=1024,
+                                    stderr_limit=1024,
+                                )
+
+                cleanup.assert_called_once_with(process)
+                self.assertEqual(
+                    raised.exception.reason_code,
+                    "collector-inconclusive",
+                )
+                self.assertEqual(
+                    raised.exception.api_failure,
+                    {
+                        "endpoint_class": "authenticated-user",
+                        "failure_kind": "process-io",
+                        "http_status": None,
+                    },
+                )
+                process.stdout.close.assert_called_once()
+                process.stderr.close.assert_called_once()
+                if failure_point != "create":
+                    selector.close.assert_called_once()
+
+    def test_enforcement_subprocess_normal_exit_rejects_lingering_group(
+        self,
+    ) -> None:
+        process = mock.Mock()
+        process.stdout = mock.Mock()
+        process.stderr = mock.Mock()
+        process.wait.return_value = 0
+        selector = mock.Mock()
+        selector.get_map.return_value = {}
+        with (
+            mock.patch.object(
+                ENFORCEMENT_MODULE.subprocess,
+                "Popen",
+                return_value=process,
+            ),
+            mock.patch.object(
+                ENFORCEMENT_MODULE.selectors,
+                "DefaultSelector",
+                return_value=selector,
+            ),
+            mock.patch.object(
+                ENFORCEMENT_MODULE,
+                "_process_group_state",
+                return_value=(True, True),
+            ),
+            mock.patch.object(
+                ENFORCEMENT_MODULE,
+                "_terminate_drain_reap",
+                return_value=[],
+            ) as cleanup,
+            self.assertRaises(
+                ENFORCEMENT_MODULE.EnforcementDoctorError
+            ) as raised,
+        ):
+            ENFORCEMENT_MODULE._bounded_subprocess(
+                ["/fixed/gh", "api", "/user"],
+                environment={},
+                execution_cwd=tempfile.gettempdir(),
+                endpoint_class="authenticated-user",
+                process_registry={},
+                timeout_seconds=1,
+                stdout_limit=1024,
+                stderr_limit=1024,
+            )
+
+        cleanup.assert_called_once_with(process)
+        self.assertEqual(raised.exception.reason_code, "collector-inconclusive")
+        self.assertEqual(
+            raised.exception.api_failure,
+            {
+                "endpoint_class": "authenticated-user",
+                "failure_kind": "process-linger",
+                "http_status": None,
+            },
+        )
+        selector.close.assert_called_once()
+        process.stdout.close.assert_called_once()
+        process.stderr.close.assert_called_once()
+
+    def test_enforcement_subprocess_resource_failure_overrides_limit_error(
+        self,
+    ) -> None:
+        process = mock.Mock()
+        process.stdout = mock.Mock()
+        process.stderr = mock.Mock()
+        process.stdout.fileno.return_value = 101
+        selector = mock.Mock()
+        key = mock.Mock()
+        key.data = ("stdout", 1)
+        key.fileobj = process.stdout
+        selector.get_map.return_value = {"stdout": key}
+        selector.select.return_value = [
+            (key, ENFORCEMENT_MODULE.selectors.EVENT_READ)
+        ]
+        selector.close.side_effect = OSError(
+            errno.EIO,
+            "injected selector close failure",
+        )
+        with (
+            mock.patch.object(
+                ENFORCEMENT_MODULE.subprocess,
+                "Popen",
+                return_value=process,
+            ),
+            mock.patch.object(
+                ENFORCEMENT_MODULE.selectors,
+                "DefaultSelector",
+                return_value=selector,
+            ),
+            mock.patch.object(
+                ENFORCEMENT_MODULE.os,
+                "read",
+                return_value=b"too large",
+            ),
+            mock.patch.object(
+                ENFORCEMENT_MODULE,
+                "_terminate_drain_reap",
+                return_value=[],
+            ) as cleanup,
+            self.assertRaises(
+                ENFORCEMENT_MODULE.EnforcementDoctorError
+            ) as raised,
+        ):
+            ENFORCEMENT_MODULE._bounded_subprocess(
+                ["/fixed/gh", "api", "/user"],
+                environment={},
+                execution_cwd=tempfile.gettempdir(),
+                endpoint_class="authenticated-user",
+                process_registry={},
+                timeout_seconds=1,
+                stdout_limit=1,
+                stderr_limit=1024,
+            )
+
+        cleanup.assert_called_once_with(process)
+        self.assertEqual(raised.exception.reason_code, "collector-inconclusive")
+        self.assertEqual(
+            raised.exception.api_failure,
+            {
+                "endpoint_class": "authenticated-user",
+                "failure_kind": "process-resource",
+                "http_status": None,
+            },
+        )
+
+    def test_enforcement_subprocess_cleanup_failure_is_structured(
+        self,
+    ) -> None:
+        process = mock.Mock()
+        process.pid = 4242
+        process.stdout = mock.Mock()
+        process.stderr = mock.Mock()
+        process_registry: dict[int, subprocess.Popen[bytes]] = {}
+        with (
+            mock.patch.object(
+                ENFORCEMENT_MODULE.subprocess,
+                "Popen",
+                return_value=process,
+            ),
+            mock.patch.object(
+                ENFORCEMENT_MODULE.selectors,
+                "DefaultSelector",
+                side_effect=OSError(
+                    errno.EIO,
+                    "injected selector creation failure",
+                ),
+            ),
+            mock.patch.object(
+                ENFORCEMENT_MODULE,
+                "_terminate_drain_reap",
+                return_value=["process-not-reaped"],
+            ) as cleanup,
+            self.assertRaises(
+                ENFORCEMENT_MODULE.EnforcementDoctorError
+            ) as raised,
+        ):
+            ENFORCEMENT_MODULE._bounded_subprocess(
+                ["/fixed/gh", "api", "/user"],
+                environment={},
+                execution_cwd=tempfile.gettempdir(),
+                endpoint_class="authenticated-user",
+                process_registry=process_registry,
+                timeout_seconds=1,
+                stdout_limit=1024,
+                stderr_limit=1024,
+            )
+
+        cleanup.assert_called_once_with(process)
+        self.assertIs(process_registry[process.pid], process)
+        self.assertEqual(raised.exception.reason_code, "collector-inconclusive")
+        self.assertEqual(
+            raised.exception.api_failure,
+            {
+                "endpoint_class": "authenticated-user",
+                "failure_kind": "process-cleanup",
+                "http_status": None,
+            },
+        )
+        process.stdout.close.assert_not_called()
+        process.stderr.close.assert_not_called()
+
+    def test_enforcement_process_cleanup_bounds_kill_and_reap_failure(
+        self,
+    ) -> None:
+        stdout_read_fd, stdout_write_fd = os.pipe()
+        stderr_read_fd, stderr_write_fd = os.pipe()
+        stdout = os.fdopen(stdout_read_fd, "rb", buffering=0)
+        stderr = os.fdopen(stderr_read_fd, "rb", buffering=0)
+        process = mock.Mock()
+        process.pid = 424242
+        process.stdout = stdout
+        process.stderr = stderr
+        observed_signals: list[int] = []
+        observed_wait_timeouts: list[float] = []
+
+        def record_signal(_process: object, signal_number: int) -> bool:
+            observed_signals.append(signal_number)
+            return signal_number != signal.SIGKILL
+
+        def reject_reap(*, timeout: float) -> None:
+            observed_wait_timeouts.append(timeout)
+            raise subprocess.TimeoutExpired("fixture-gh", timeout)
+
+        try:
+            with (
+                mock.patch.object(
+                    ENFORCEMENT_MODULE,
+                    "GH_PROCESS_TERM_GRACE_SECONDS",
+                    0.0,
+                ),
+                mock.patch.object(
+                    ENFORCEMENT_MODULE,
+                    "GH_PROCESS_REAP_DEADLINE_SECONDS",
+                    0.02,
+                ),
+                mock.patch.object(
+                    ENFORCEMENT_MODULE,
+                    "GH_PROCESS_CLEANUP_POLL_SECONDS",
+                    0.001,
+                ),
+                mock.patch.object(
+                    ENFORCEMENT_MODULE,
+                    "_signal_process_group",
+                    side_effect=record_signal,
+                ),
+                mock.patch.object(
+                    ENFORCEMENT_MODULE,
+                    "_process_group_state",
+                    return_value=(True, True),
+                ),
+            ):
+                process.wait.side_effect = reject_reap
+                failures = ENFORCEMENT_MODULE._terminate_drain_reap(process)
+        finally:
+            stdout.close()
+            stderr.close()
+            os.close(stdout_write_fd)
+            os.close(stderr_write_fd)
+
+        self.assertEqual(observed_signals, [signal.SIGTERM, signal.SIGKILL])
+        self.assertTrue(observed_wait_timeouts)
+        self.assertTrue(
+            all(0 <= timeout <= 0.0011 for timeout in observed_wait_timeouts)
+        )
+        self.assertIn("kill-signal", failures)
+        self.assertIn("process-reap-timeout", failures)
+        self.assertIn("process-not-reaped", failures)
+        self.assertIn("process-group-not-quiescent", failures)
+
+    @unittest.skipUnless(os.name == "posix", "requires POSIX process groups")
+    def test_enforcement_subprocess_kills_and_reaps_term_ignoring_process(
+        self,
+    ) -> None:
+        original_popen = subprocess.Popen
+        original_signal_process_group = (
+            ENFORCEMENT_MODULE._signal_process_group
+        )
+        spawned: list[subprocess.Popen[bytes]] = []
+
+        def record_popen(*args: object, **kwargs: object) -> subprocess.Popen[bytes]:
+            process = original_popen(*args, **kwargs)
+            spawned.append(process)
+            return process
+
+        program = (
+            "import signal,time\n"
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            "print('ready', flush=True)\n"
+            "time.sleep(60)\n"
+        )
+        try:
+            with (
+                mock.patch.object(
+                    ENFORCEMENT_MODULE.subprocess,
+                    "Popen",
+                    side_effect=record_popen,
+                ),
+                mock.patch.object(
+                    ENFORCEMENT_MODULE,
+                    "GH_PROCESS_TERM_GRACE_SECONDS",
+                    0.05,
+                ),
+                mock.patch.object(
+                    ENFORCEMENT_MODULE,
+                    "GH_PROCESS_REAP_DEADLINE_SECONDS",
+                    1.0,
+                ),
+                mock.patch.object(
+                    ENFORCEMENT_MODULE,
+                    "_signal_process_group",
+                    wraps=original_signal_process_group,
+                ) as signaller,
+                self.assertRaises(
+                    ENFORCEMENT_MODULE.EnforcementDoctorError
+                ) as raised,
+            ):
+                ENFORCEMENT_MODULE._bounded_subprocess(
+                    [sys.executable, "-c", program],
+                    environment={"LC_ALL": "C"},
+                    execution_cwd=tempfile.gettempdir(),
+                    endpoint_class="authenticated-user",
+                    process_registry={},
+                    timeout_seconds=0.5,
+                    stdout_limit=1024,
+                    stderr_limit=1024,
+                )
+        finally:
+            for process in spawned:
+                if process.poll() is None:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    process.wait(timeout=1)
+
+        self.assertEqual(raised.exception.reason_code, "api-timeout")
+        self.assertEqual(len(spawned), 1)
+        self.assertIsNotNone(spawned[0].returncode)
+        observed_signals = [call.args[1] for call in signaller.call_args_list]
+        self.assertEqual(observed_signals, [signal.SIGTERM, signal.SIGKILL])
+        with self.assertRaises(ProcessLookupError):
+            os.kill(spawned[0].pid, 0)
+
+    @unittest.skipUnless(os.name == "posix", "requires POSIX process groups")
+    def test_enforcement_client_reaps_active_process_before_first_unlink(
+        self,
+    ) -> None:
+        with owner_controlled_temp_root() as temp_root:
+            trusted_gh = temp_root / "trusted-gh"
+            trusted_payload = b"#!/bin/sh\nexit 0\n"
+            trusted_gh.write_bytes(trusted_payload)
+            trusted_gh.chmod(0o700)
+            config_dir, runtime_parent = self._make_private_gh_config(temp_root)
+            client = ENFORCEMENT_MODULE.GitHubApiClient(
+                trusted_gh,
+                hashlib.sha256(trusted_payload).hexdigest(),
+                config_dir,
+                runtime_parent=runtime_parent,
+            )
+            run_path = client._run_directory.path
+            process = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    (
+                        "import signal,time\n"
+                        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                        "print('ready', flush=True)\n"
+                        "time.sleep(60)\n"
+                    ),
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
+                close_fds=True,
+            )
+            assert process.stdout is not None
+            readiness_selector = ENFORCEMENT_MODULE.selectors.DefaultSelector()
+            readiness_selector.register(
+                process.stdout,
+                ENFORCEMENT_MODULE.selectors.EVENT_READ,
+            )
+            try:
+                self.assertTrue(readiness_selector.select(timeout=2))
+                self.assertEqual(process.stdout.readline(), b"ready\n")
+            finally:
+                readiness_selector.close()
+            client._active_processes[process.pid] = process
+            original_unlink = os.unlink
+            unlink_observations = 0
+
+            def require_quiescence_before_unlink(
+                path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+                *,
+                dir_fd: int | None = None,
+            ) -> None:
+                nonlocal unlink_observations
+                unlink_observations += 1
+                self.assertIsNotNone(process.returncode)
+                with self.assertRaises(ProcessLookupError):
+                    os.killpg(process.pid, 0)
+                original_unlink(path, dir_fd=dir_fd)
+
+            try:
+                with (
+                    mock.patch.object(
+                        ENFORCEMENT_MODULE,
+                        "GH_PROCESS_TERM_GRACE_SECONDS",
+                        0.05,
+                    ),
+                    mock.patch.object(
+                        ENFORCEMENT_MODULE,
+                        "GH_PROCESS_REAP_DEADLINE_SECONDS",
+                        1.0,
+                    ),
+                    mock.patch.object(
+                        ENFORCEMENT_MODULE.os,
+                        "unlink",
+                        side_effect=require_quiescence_before_unlink,
+                    ),
+                ):
+                    client.close()
+            finally:
+                if process.poll() is None:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    process.wait(timeout=1)
+                if run_path.exists():
+                    shutil.rmtree(run_path)
+
+        self.assertGreater(unlink_observations, 0)
+        self.assertFalse(run_path.exists())
+
+    def test_enforcement_client_retains_snapshot_when_process_is_unresolved(
+        self,
+    ) -> None:
+        with owner_controlled_temp_root() as temp_root:
+            trusted_gh = temp_root / "trusted-gh"
+            trusted_payload = b"#!/bin/sh\nexit 0\n"
+            trusted_gh.write_bytes(trusted_payload)
+            trusted_gh.chmod(0o700)
+            config_dir, runtime_parent = self._make_private_gh_config(temp_root)
+            client = ENFORCEMENT_MODULE.GitHubApiClient(
+                trusted_gh,
+                hashlib.sha256(trusted_payload).hexdigest(),
+                config_dir,
+                runtime_parent=runtime_parent,
+            )
+            run_path = client._run_directory.path
+            process = mock.Mock()
+            process.pid = 4242
+            process.stdout = mock.Mock()
+            process.stderr = mock.Mock()
+            client._active_processes[process.pid] = process
+            try:
+                with (
+                    mock.patch.object(
+                        ENFORCEMENT_MODULE,
+                        "_terminate_drain_reap",
+                        return_value=[
+                            "process-not-reaped",
+                            "process-group-not-quiescent",
+                        ],
+                    ),
+                    mock.patch.object(
+                        ENFORCEMENT_MODULE.os,
+                        "unlink",
+                        wraps=os.unlink,
+                    ) as unlink,
+                    self.assertRaises(
+                        ENFORCEMENT_MODULE.EnforcementDoctorError
+                    ) as raised,
+                ):
+                    client.close()
+
+                unlink.assert_not_called()
+                cleanup = raised.exception.cleanup_failure
+                self.assertEqual(cleanup["cleanup_proof"], "inconclusive")
+                self.assertIn(
+                    "active-process-cleanup",
+                    cleanup["failed_operations"],
+                )
+                self.assertEqual(
+                    cleanup["unresolved_processes"],
+                    [
+                        {
+                            "pid": process.pid,
+                            "process_group": process.pid,
+                            "quiescence": "unproven",
+                        }
+                    ],
+                )
+                self.assertEqual(
+                    cleanup["retained_runtime"]["path"],
+                    str(run_path),
+                )
+                self.assertEqual(
+                    cleanup["retained_runtime"]["path_binding"],
+                    "verified",
+                )
+                retained_labels = {
+                    locator["label"]
+                    for locator in cleanup["retained_objects"]
+                }
+                self.assertIn(
+                    "GitHub CLI private hosts.yml snapshot",
+                    retained_labels,
+                )
+                self.assertIn(
+                    "GitHub CLI executable snapshot",
+                    retained_labels,
+                )
+                self.assertTrue(run_path.exists())
+            finally:
+                for directory in (run_path / "config", run_path / "bin"):
+                    if directory.exists():
+                        directory.chmod(0o700)
+                if run_path.exists():
+                    run_path.chmod(0o700)
+                    shutil.rmtree(run_path)
+
+    def test_bound_regular_file_closes_fd_after_bounded_read_failure(
+        self,
+    ) -> None:
+        with owner_controlled_temp_root() as temp_root:
+            config_dir = temp_root / "config"
+            config_dir.mkdir(mode=0o700)
+            hosts_path = config_dir / "hosts.yml"
+            hosts_path.write_bytes(
+                b"x" * (ENFORCEMENT_MODULE.MAX_GH_CONFIG_BYTES + 1)
+            )
+            hosts_path.chmod(0o600)
+            parent = ENFORCEMENT_MODULE._BoundDirectory(
+                config_dir,
+                label="fixture config directory",
+            )
+            original_open = os.open
+            opened_fds: list[int] = []
+
+            def capture_open(
+                path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+                flags: int,
+                mode: int = 0o777,
+                *,
+                dir_fd: int | None = None,
+            ) -> int:
+                fd = original_open(path, flags, mode, dir_fd=dir_fd)
+                if path == "hosts.yml" and dir_fd == parent.fd:
+                    opened_fds.append(fd)
+                return fd
+
+            try:
+                with (
+                    mock.patch.object(
+                        ENFORCEMENT_MODULE.os,
+                        "open",
+                        side_effect=capture_open,
+                    ),
+                    self.assertRaises(
+                        ENFORCEMENT_MODULE.EnforcementDoctorError
+                    ) as raised,
+                ):
+                    ENFORCEMENT_MODULE._BoundRegularFile(
+                        parent,
+                        "hosts.yml",
+                        label="fixture hosts.yml",
+                        max_bytes=ENFORCEMENT_MODULE.MAX_GH_CONFIG_BYTES,
+                    )
+            finally:
+                parent.close()
+
+        self.assertEqual(raised.exception.reason_code, "collector-unavailable")
+        self.assertEqual(len(opened_fds), 1)
+        with self.assertRaises(OSError) as closed:
+            os.fstat(opened_fds[0])
+        self.assertEqual(closed.exception.errno, errno.EBADF)
+
+    def test_bound_regular_file_closes_fd_after_parent_revalidation_failure(
+        self,
+    ) -> None:
+        with owner_controlled_temp_root() as temp_root:
+            config_dir = temp_root / "config"
+            config_dir.mkdir(mode=0o700)
+            hosts_path = config_dir / "hosts.yml"
+            hosts_path.write_bytes(b"fixture\n")
+            hosts_path.chmod(0o600)
+            parent = ENFORCEMENT_MODULE._BoundDirectory(
+                config_dir,
+                label="fixture config directory",
+            )
+            original_open = os.open
+            original_revalidate = parent.revalidate
+            opened_fds: list[int] = []
+            revalidation_calls = 0
+
+            def capture_open(
+                path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+                flags: int,
+                mode: int = 0o777,
+                *,
+                dir_fd: int | None = None,
+            ) -> int:
+                fd = original_open(path, flags, mode, dir_fd=dir_fd)
+                if path == "hosts.yml" and dir_fd == parent.fd:
+                    opened_fds.append(fd)
+                return fd
+
+            def fail_final_parent_revalidation() -> None:
+                nonlocal revalidation_calls
+                revalidation_calls += 1
+                if revalidation_calls == 2:
+                    raise ENFORCEMENT_MODULE._blocked(
+                        "collector-inconclusive",
+                        "fixture parent revalidation failure",
+                    )
+                original_revalidate()
+
+            try:
+                with (
+                    mock.patch.object(
+                        ENFORCEMENT_MODULE.os,
+                        "open",
+                        side_effect=capture_open,
+                    ),
+                    mock.patch.object(
+                        parent,
+                        "revalidate",
+                        side_effect=fail_final_parent_revalidation,
+                    ),
+                    self.assertRaises(
+                        ENFORCEMENT_MODULE.EnforcementDoctorError
+                    ) as raised,
+                ):
+                    ENFORCEMENT_MODULE._BoundRegularFile(
+                        parent,
+                        "hosts.yml",
+                        label="fixture hosts.yml",
+                        max_bytes=ENFORCEMENT_MODULE.MAX_GH_CONFIG_BYTES,
+                    )
+            finally:
+                parent.close()
+
+        self.assertEqual(raised.exception.reason_code, "collector-inconclusive")
+        self.assertEqual(revalidation_calls, 2)
+        self.assertEqual(len(opened_fds), 1)
+        with self.assertRaises(OSError) as closed:
+            os.fstat(opened_fds[0])
+        self.assertEqual(closed.exception.errno, errno.EBADF)
+
     def test_enforcement_gh_cleanup_removes_identity_bound_policy_drift(
         self,
     ) -> None:
@@ -7851,6 +8666,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
                 client.calls = 0
                 client.total_bytes = 0
                 client.deadline = time.monotonic() + 30
+                client._active_processes = {}
                 client._environment = {}
                 client._execution_cwd = tempfile.gettempdir()
                 client._revalidate_snapshot = mock.Mock()
@@ -7902,6 +8718,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
         client.calls = 0
         client.total_bytes = 0
         client.deadline = time.monotonic() + 30
+        client._active_processes = {}
         client._environment = {}
         client._execution_cwd = tempfile.gettempdir()
         client._revalidate_snapshot = mock.Mock()

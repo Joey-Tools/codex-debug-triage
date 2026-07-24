@@ -99,11 +99,24 @@ Jenkins entrypoint stays installed. With the checked-in
 therefore remains mandatory.
 
 Doctor receipt schema 5 adds the static-equivalence boundary and sanitized
-cleanup-failure evidence. Snapshot cleanup keeps the credential, executable,
-and directory descriptors open while it removes their exact bound objects
-from leaf to root. Credential creation registers a provisional descriptor
-before content is written, so a binding failure before the normal snapshot
-member is published still retains the exact object identity through cleanup.
+cleanup-failure evidence. Every spawned `gh` process is registered before
+selector or deadline setup and is unregistered only after its direct child is
+reaped, both pipes reach EOF, and its POSIX process group is reliably absent.
+Any post-spawn timeout, byte-limit, selector, stream, or wait failure enters
+one bounded TERM/grace/KILL transaction with interleaved drain and a separate
+hard reap deadline. Snapshot deletion begins only after that transaction
+proves quiescence. If a close-time retry still cannot prove it, the doctor
+leaves the owner-private runtime intact and reports its verified locator plus
+the unresolved PID/process-group binding.
+
+Snapshot cleanup keeps the credential, executable, and directory descriptors
+open while it removes their exact bound objects from leaf to root. Credential
+creation registers a provisional descriptor before content is written, so a
+binding failure before the normal snapshot member is published still retains
+the exact object identity through cleanup. Credential source-file binding
+likewise keeps a local descriptor until both bounded reads, object/policy
+checks, and final parent revalidation succeed; every earlier exception closes
+that local descriptor before it can escape.
 File unlink proof requires the retained inode to reach zero links; directory
 removal is issued relative to the retained owner-private parent only after
 path/descriptor identity agrees. A pre-cleanup ACL or mode drift, or any failed

@@ -478,6 +478,18 @@ and malformed responses map to `api-unavailable`; and bounded command expiry
 maps to `api-timeout`. Response bodies, raw headers, command environments,
 tokens, and raw `gh` stderr are never copied into the doctor receipt.
 
+The process boundary starts immediately after `Popen`: the direct process is
+registered before deadline, buffer, or selector initialization. Every
+post-spawn error enters bounded TERM/grace/KILL with interleaved pipe drain and
+a second hard reap deadline. Successful completion and error cleanup both
+require direct-child reap and reliable process-group absence. Unexpected
+selector, stream, wait, or resource errors map to structured
+`collector-inconclusive` evidence. The client retries any unresolved registered
+process before credential cleanup; if quiescence is still unproven, it performs
+no snapshot `fchmod`, `unlink`, or `rmdir`, retains the owner-private runtime,
+and returns sanitized retained-object locators plus the unresolved process
+binding.
+
 Invoke the doctor only with administrator-pinned identities and the exact
 existing PR:
 
