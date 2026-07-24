@@ -109,7 +109,13 @@ Its defaults reject archive files above 256 MiB, central directories above
 cap `--all` selection at 20 members; cap each decompressed text member at 8 MiB
 and 100,000 lines; cap an input line at 131,072 characters; cap selected members
 at 32 MiB total; and cap displayed output at 200 lines and 65,536 characters.
-Narrow the selection before raising a cap.
+These defaults are also immutable hard ceilings: budget flags may only narrow a
+run and values above the hard ceiling fail before the archive is opened. One
+30-second process-timer deadline covers the complete command, including central
+directory validation, decompression, and the validation drain that continues
+after selected output has been truncated. The helper fails closed when the
+platform cannot provide that process timer or when the caller already owns it;
+it never silently replaces an existing timer.
 
 The helper opens the archive once, records the initially accepted file size,
 and holds that file descriptor through member selection and reading. Its

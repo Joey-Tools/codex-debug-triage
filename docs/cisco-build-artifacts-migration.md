@@ -24,7 +24,11 @@ The private skill owns:
 The public `bug-triage-playbook` owns only the downstream reasoning workflow
 after an authoritative artifact is available locally. Its
 `scripts/archive_triage.py` helper may inspect local ZIP members but performs no
-network or authentication work.
+network or authentication work. That local helper keeps its own conservative
+defaults as immutable hard ceilings and applies one process-timer deadline to
+central-directory validation, decompression, and the post-selection validation
+drain; the private provider must preserve or tighten those local archive
+properties when it delegates inspection.
 
 GitHub Actions and pull-request checks bypass both skills and stay with the
 GitHub provider workflow named in the generic skill's provider boundary.

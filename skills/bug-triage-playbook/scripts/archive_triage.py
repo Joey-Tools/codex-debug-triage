@@ -14,14 +14,16 @@ import os
 import pathlib
 import re
 import selectors
+import signal
 import stat
 import struct
 import subprocess
 import sys
+import threading
 import time
 import unicodedata
 import zipfile
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 
 try:
@@ -44,6 +46,23 @@ DEFAULT_MAX_MEMBER_LINES = 100_000
 DEFAULT_MAX_INPUT_LINE_CHARS = 128 * 1024
 DEFAULT_MAX_OUTPUT_LINES = 200
 DEFAULT_MAX_OUTPUT_CHARS = 64 * 1024
+DEFAULT_ARCHIVE_COMMAND_TIMEOUT_SECONDS = 30.0
+
+# These ceilings are intentionally equal to the conservative defaults.  The
+# command-line budget flags may narrow a run, but they must never turn the
+# local inspection helper into an unbounded archive processor.
+HARD_MAX_LIST_LIMIT = DEFAULT_LIST_LIMIT
+HARD_MAX_ARCHIVE_BYTES = DEFAULT_MAX_ARCHIVE_BYTES
+HARD_MAX_ARCHIVE_MEMBERS = DEFAULT_MAX_ARCHIVE_MEMBERS
+HARD_MAX_CENTRAL_DIRECTORY_BYTES = DEFAULT_MAX_CENTRAL_DIRECTORY_BYTES
+HARD_MAX_MEMBERS = DEFAULT_MAX_MEMBERS
+HARD_MAX_MEMBER_BYTES = DEFAULT_MAX_MEMBER_BYTES
+HARD_MAX_TOTAL_MEMBER_BYTES = DEFAULT_MAX_TOTAL_MEMBER_BYTES
+HARD_MAX_MEMBER_LINES = DEFAULT_MAX_MEMBER_LINES
+HARD_MAX_INPUT_LINE_CHARS = DEFAULT_MAX_INPUT_LINE_CHARS
+HARD_MAX_OUTPUT_LINES = DEFAULT_MAX_OUTPUT_LINES
+HARD_MAX_OUTPUT_CHARS = DEFAULT_MAX_OUTPUT_CHARS
+HARD_MAX_ARCHIVE_COMMAND_TIMEOUT_SECONDS = DEFAULT_ARCHIVE_COMMAND_TIMEOUT_SECONDS
 DEFAULT_CANDIDATE_REPORT_LIMIT = 20
 DEFAULT_MAX_RAW_MEMBER_NAME_BYTES = 512
 DEFAULT_MAX_ERROR_DETAIL_CHARS = 1_024
@@ -115,6 +134,79 @@ class MemberReadError(ValueError):
     pass
 
 
+class ArchiveCommandDeadline:
+    """Apply one immutable wall-clock budget to an archive command."""
+
+    def __init__(
+        self,
+        timeout_seconds: float = DEFAULT_ARCHIVE_COMMAND_TIMEOUT_SECONDS,
+    ) -> None:
+        if (
+            timeout_seconds <= 0
+            or timeout_seconds > HARD_MAX_ARCHIVE_COMMAND_TIMEOUT_SECONDS
+        ):
+            raise ArtifactLimitError(
+                "archive command timeout exceeds immutable hard max: "
+                f"{timeout_seconds} > "
+                f"{HARD_MAX_ARCHIVE_COMMAND_TIMEOUT_SECONDS}"
+            )
+        self.deadline = time.monotonic() + timeout_seconds
+        self._armed = False
+        self._previous_handler: object | None = None
+
+    def arm(self) -> None:
+        """Install a process timer so one blocking local read cannot overrun."""
+
+        self.check("deadline setup")
+        if self._armed:
+            raise ArtifactLimitError("archive command deadline is already armed")
+        if threading.current_thread() is not threading.main_thread():
+            raise ArtifactLimitError(
+                "archive command hard deadline requires the main thread"
+            )
+        required_names = ("SIGALRM", "ITIMER_REAL", "getitimer", "setitimer")
+        if any(not hasattr(signal, name) for name in required_names):
+            raise ArtifactLimitError(
+                "archive command hard deadline is unavailable on this platform"
+            )
+        previous_timer = signal.getitimer(signal.ITIMER_REAL)
+        if previous_timer != (0.0, 0.0):
+            raise ArtifactLimitError(
+                "archive command refuses to replace an existing process timer"
+            )
+        self._previous_handler = signal.getsignal(signal.SIGALRM)
+        try:
+            signal.signal(signal.SIGALRM, self._raise_timeout)
+            remaining = self.deadline - time.monotonic()
+            if remaining <= 0:
+                raise ArtifactLimitError(
+                    "archive command deadline exceeded during deadline setup"
+                )
+            signal.setitimer(signal.ITIMER_REAL, remaining)
+        except BaseException:
+            signal.signal(signal.SIGALRM, self._previous_handler)
+            self._previous_handler = None
+            raise
+        self._armed = True
+
+    def close(self) -> None:
+        if not self._armed:
+            return
+        signal.setitimer(signal.ITIMER_REAL, 0.0)
+        signal.signal(signal.SIGALRM, self._previous_handler)
+        self._previous_handler = None
+        self._armed = False
+
+    def _raise_timeout(self, _signum: int, _frame: object) -> None:
+        raise ArtifactLimitError("archive command deadline exceeded")
+
+    def check(self, phase: str) -> None:
+        if time.monotonic() >= self.deadline:
+            raise ArtifactLimitError(
+                f"archive command deadline exceeded during {phase}"
+            )
+
+
 @dataclass(frozen=True)
 class CentralDirectoryIdentity:
     ordinal: int
@@ -167,13 +259,21 @@ class MemberPayloadLayout:
 class PinnedArchiveReader(io.RawIOBase):
     """Expose the initially accepted archive extent as an immutable EOF."""
 
-    def __init__(self, raw_stream: io.FileIO, archive_size: int) -> None:
+    def __init__(
+        self,
+        raw_stream: io.FileIO,
+        archive_size: int,
+        deadline: ArchiveCommandDeadline,
+    ) -> None:
         super().__init__()
         self._raw_stream = raw_stream
         self.archive_size = archive_size
+        self._deadline = deadline
 
     def _validate_size(self) -> None:
+        self._deadline.check("archive metadata validation")
         current_size = os.fstat(self._raw_stream.fileno()).st_size
+        self._deadline.check("archive metadata validation")
         if current_size != self.archive_size:
             raise zipfile.BadZipFile(
                 "archive size changed after open: "
@@ -182,6 +282,9 @@ class PinnedArchiveReader(io.RawIOBase):
 
     def validate_unchanged(self) -> None:
         self._validate_size()
+
+    def check_deadline(self, phase: str) -> None:
+        self._deadline.check(phase)
 
     def readable(self) -> bool:
         return True
@@ -196,6 +299,7 @@ class PinnedArchiveReader(io.RawIOBase):
         return self._raw_stream.tell()
 
     def seek(self, offset: int, whence: int = os.SEEK_SET) -> int:
+        self._deadline.check("archive seek")
         self._validate_size()
         if whence == os.SEEK_SET:
             target = offset
@@ -207,9 +311,12 @@ class PinnedArchiveReader(io.RawIOBase):
             raise ValueError(f"unsupported seek mode: {whence}")
         if target < 0 or target > self.archive_size:
             raise zipfile.BadZipFile("archive seek exceeds the initially accepted size")
-        return self._raw_stream.seek(target, os.SEEK_SET)
+        result = self._raw_stream.seek(target, os.SEEK_SET)
+        self._deadline.check("archive seek")
+        return result
 
     def readinto(self, buffer: object) -> int | None:
+        self._deadline.check("archive read")
         self._validate_size()
         position = self.tell()
         if position < 0 or position > self.archive_size:
@@ -221,7 +328,9 @@ class PinnedArchiveReader(io.RawIOBase):
             return 0
         view = memoryview(buffer)
         bounded_view = view[: min(len(view), remaining)]
-        return self._raw_stream.readinto(bounded_view)
+        byte_count = self._raw_stream.readinto(bounded_view)
+        self._deadline.check("archive read")
+        return byte_count
 
     def close(self) -> None:
         if not self.closed:
@@ -285,6 +394,7 @@ class BoundedMemberReader(io.RawIOBase):
         return True
 
     def readinto(self, buffer: object) -> int | None:
+        self._archive_stream.check_deadline("member extraction")
         if self._finished:
             return 0
         destination = memoryview(buffer).cast("B")
@@ -304,6 +414,7 @@ class BoundedMemberReader(io.RawIOBase):
             data = self._read_stored(read_limit)
         else:
             data = self._read_deflated(read_limit)
+        self._archive_stream.check_deadline("member extraction")
         if not data:
             self._finish()
             return 0
@@ -335,6 +446,7 @@ class BoundedMemberReader(io.RawIOBase):
     def _read_deflated(self, max_bytes: int) -> bytes:
         assert self._decompressor is not None
         while True:
+            self._archive_stream.check_deadline("DEFLATE extraction")
             if self._decompressor.eof:
                 if (
                     self._decompressor.unused_data
@@ -364,6 +476,7 @@ class BoundedMemberReader(io.RawIOBase):
                 )
 
             data = self._decompressor.decompress(compressed, max_bytes)
+            self._archive_stream.check_deadline("DEFLATE extraction")
             self._compressed_buffer = self._decompressor.unconsumed_tail
             if self._decompressor.unused_data:
                 raise zipfile.BadZipFile(
@@ -467,6 +580,34 @@ def _positive_int(value: str) -> int:
     if parsed <= 0:
         raise argparse.ArgumentTypeError("value must be positive")
     return parsed
+
+
+def _bounded_positive_int(
+    option_name: str,
+    hard_max: int,
+) -> Callable[[str], int]:
+    def parse(value: str) -> int:
+        parsed = _positive_int(value)
+        if parsed > hard_max:
+            raise argparse.ArgumentTypeError(
+                f"{option_name} exceeds immutable hard max: {parsed} > {hard_max}"
+            )
+        return parsed
+
+    return parse
+
+
+def _require_bounded_positive(
+    option_name: str,
+    value: int,
+    hard_max: int,
+) -> None:
+    if value <= 0:
+        raise ArtifactLimitError(f"{option_name} must be positive")
+    if value > hard_max:
+        raise ArtifactLimitError(
+            f"{option_name} exceeds immutable hard max: {value} > {hard_max}"
+        )
 
 
 def _escape_terminal_text(value: str) -> str:
@@ -850,13 +991,19 @@ def _regex_worker_main() -> int:
 def _open_pinned_archive(
     path: pathlib.Path,
     max_archive_bytes: int,
+    *,
+    deadline: ArchiveCommandDeadline | None = None,
 ) -> Iterator[PinnedArchiveReader]:
+    command_deadline = deadline or ArchiveCommandDeadline()
+    command_deadline.check("archive open")
     flags = os.O_RDONLY
     flags |= getattr(os, "O_CLOEXEC", 0)
     flags |= getattr(os, "O_NONBLOCK", 0)
     fd = os.open(path, flags)
     try:
+        command_deadline.check("archive open")
         metadata = os.fstat(fd)
+        command_deadline.check("archive metadata validation")
         if not stat.S_ISREG(metadata.st_mode):
             raise ValueError("archive path must identify a regular file")
         if metadata.st_size > max_archive_bytes:
@@ -871,7 +1018,11 @@ def _open_pinned_archive(
             closefd=True,
         )
         fd = -1
-        stream = PinnedArchiveReader(raw_stream, metadata.st_size)
+        stream = PinnedArchiveReader(
+            raw_stream,
+            metadata.st_size,
+            command_deadline,
+        )
         with stream:
             yield stream
     finally:
@@ -2112,12 +2263,13 @@ def _add_member_output(
     try:
         collecting_output = not output.truncated
         for line_number, line in selected_lines:
+            archive_stream.check_deadline("member output selection")
             safe_line = _escape_terminal_text(line)
             rendered = f"{line_number}:{safe_line}" if args.line_numbers else safe_line
             if collecting_output:
                 collecting_output = output.add(rendered)
         for _ in line_iterator:
-            pass
+            archive_stream.check_deadline("member validation drain")
     except _archive_errors() as error:
         error_type, detail = _bounded_member_error(error, member)
         raise MemberReadError(
@@ -2166,9 +2318,40 @@ def _archive_errors() -> tuple[type[BaseException], ...]:
     return errors + optional_errors
 
 
+def _validate_list_args(args: argparse.Namespace) -> None:
+    for option_name, value, hard_max in (
+        ("limit", args.limit, HARD_MAX_LIST_LIMIT),
+        (
+            "max archive bytes",
+            args.max_archive_bytes,
+            HARD_MAX_ARCHIVE_BYTES,
+        ),
+        (
+            "max archive members",
+            args.max_archive_members,
+            HARD_MAX_ARCHIVE_MEMBERS,
+        ),
+        (
+            "max central-directory bytes",
+            args.max_central_directory_bytes,
+            HARD_MAX_CENTRAL_DIRECTORY_BYTES,
+        ),
+        (
+            "max output characters",
+            args.max_output_chars,
+            HARD_MAX_OUTPUT_CHARS,
+        ),
+    ):
+        _require_bounded_positive(option_name, value, hard_max)
+
+
 def cmd_zip_list(args: argparse.Namespace) -> int:
     zip_path = pathlib.Path(args.zip_path)
+    deadline = ArchiveCommandDeadline()
     try:
+        deadline.arm()
+        _validate_list_args(args)
+        deadline.check("argument validation")
         regex_budget = RegexMatchBudget()
         with contextlib.ExitStack() as workers:
             matcher = (
@@ -2185,6 +2368,7 @@ def cmd_zip_list(args: argparse.Namespace) -> int:
             with _open_pinned_archive(
                 zip_path,
                 args.max_archive_bytes,
+                deadline=deadline,
             ) as archive_stream:
                 directory = _preflight_central_directory(
                     archive_stream,
@@ -2212,6 +2396,8 @@ def cmd_zip_list(args: argparse.Namespace) -> int:
     except _archive_errors() + (re.error,) as error:
         print(f"error={error}", file=sys.stderr)
         return 1
+    finally:
+        deadline.close()
 
     output.flush()
     if output.truncated:
@@ -2257,6 +2443,62 @@ def _report_ambiguous_members(matches: list[ArchiveMember]) -> None:
 
 
 def _validate_show_args(args: argparse.Namespace) -> None:
+    for option_name, value, hard_max in (
+        (
+            "max archive bytes",
+            args.max_archive_bytes,
+            HARD_MAX_ARCHIVE_BYTES,
+        ),
+        (
+            "max archive members",
+            args.max_archive_members,
+            HARD_MAX_ARCHIVE_MEMBERS,
+        ),
+        (
+            "max central-directory bytes",
+            args.max_central_directory_bytes,
+            HARD_MAX_CENTRAL_DIRECTORY_BYTES,
+        ),
+        ("max members", args.max_members, HARD_MAX_MEMBERS),
+        (
+            "max member bytes",
+            args.max_member_bytes,
+            HARD_MAX_MEMBER_BYTES,
+        ),
+        (
+            "max total member bytes",
+            args.max_total_member_bytes,
+            HARD_MAX_TOTAL_MEMBER_BYTES,
+        ),
+        (
+            "max member lines",
+            args.max_member_lines,
+            HARD_MAX_MEMBER_LINES,
+        ),
+        (
+            "max input line characters",
+            args.max_input_line_chars,
+            HARD_MAX_INPUT_LINE_CHARS,
+        ),
+        (
+            "max output lines",
+            args.max_output_lines,
+            HARD_MAX_OUTPUT_LINES,
+        ),
+        (
+            "max output characters",
+            args.max_output_chars,
+            HARD_MAX_OUTPUT_CHARS,
+        ),
+    ):
+        _require_bounded_positive(option_name, value, hard_max)
+    for option_name, value in (
+        ("head", args.head),
+        ("tail", args.tail),
+        ("context", args.context),
+    ):
+        if value < 0:
+            raise ArtifactLimitError(f"{option_name} must be nonnegative")
     if args.head > args.max_output_lines:
         raise ArtifactLimitError(
             f"head exceeds max output lines: {args.head} > {args.max_output_lines}"
@@ -2275,8 +2517,11 @@ def _validate_show_args(args: argparse.Namespace) -> None:
 
 def cmd_zip_show(args: argparse.Namespace) -> int:
     zip_path = pathlib.Path(args.zip_path)
+    deadline = ArchiveCommandDeadline()
     try:
+        deadline.arm()
         _validate_show_args(args)
+        deadline.check("argument validation")
         regex_budget = RegexMatchBudget()
         with contextlib.ExitStack() as workers:
             member_matcher = (
@@ -2304,6 +2549,7 @@ def cmd_zip_show(args: argparse.Namespace) -> int:
             with _open_pinned_archive(
                 zip_path,
                 args.max_archive_bytes,
+                deadline=deadline,
             ) as archive_stream:
                 directory = _preflight_central_directory(
                     archive_stream,
@@ -2367,6 +2613,8 @@ def cmd_zip_show(args: argparse.Namespace) -> int:
     except _archive_errors() + (re.error,) as error:
         print(f"error={error}", file=sys.stderr)
         return 1
+    finally:
+        deadline.close()
 
     output.flush()
     if output.truncated:
@@ -2392,27 +2640,39 @@ def build_parser() -> argparse.ArgumentParser:
     zip_list.add_argument("--ignore-case", action="store_true")
     zip_list.add_argument(
         "--limit",
-        type=_positive_int,
+        type=_bounded_positive_int("--limit", HARD_MAX_LIST_LIMIT),
         default=DEFAULT_LIST_LIMIT,
     )
     zip_list.add_argument(
         "--max-archive-bytes",
-        type=_positive_int,
+        type=_bounded_positive_int(
+            "--max-archive-bytes",
+            HARD_MAX_ARCHIVE_BYTES,
+        ),
         default=DEFAULT_MAX_ARCHIVE_BYTES,
     )
     zip_list.add_argument(
         "--max-archive-members",
-        type=_positive_int,
+        type=_bounded_positive_int(
+            "--max-archive-members",
+            HARD_MAX_ARCHIVE_MEMBERS,
+        ),
         default=DEFAULT_MAX_ARCHIVE_MEMBERS,
     )
     zip_list.add_argument(
         "--max-central-directory-bytes",
-        type=_positive_int,
+        type=_bounded_positive_int(
+            "--max-central-directory-bytes",
+            HARD_MAX_CENTRAL_DIRECTORY_BYTES,
+        ),
         default=DEFAULT_MAX_CENTRAL_DIRECTORY_BYTES,
     )
     zip_list.add_argument(
         "--max-output-chars",
-        type=_positive_int,
+        type=_bounded_positive_int(
+            "--max-output-chars",
+            HARD_MAX_OUTPUT_CHARS,
+        ),
         default=DEFAULT_MAX_OUTPUT_CHARS,
     )
     zip_list.set_defaults(func=cmd_zip_list)
@@ -2435,52 +2695,79 @@ def build_parser() -> argparse.ArgumentParser:
     zip_show.add_argument("--line-numbers", action="store_true")
     zip_show.add_argument(
         "--max-archive-bytes",
-        type=_positive_int,
+        type=_bounded_positive_int(
+            "--max-archive-bytes",
+            HARD_MAX_ARCHIVE_BYTES,
+        ),
         default=DEFAULT_MAX_ARCHIVE_BYTES,
     )
     zip_show.add_argument(
         "--max-archive-members",
-        type=_positive_int,
+        type=_bounded_positive_int(
+            "--max-archive-members",
+            HARD_MAX_ARCHIVE_MEMBERS,
+        ),
         default=DEFAULT_MAX_ARCHIVE_MEMBERS,
     )
     zip_show.add_argument(
         "--max-central-directory-bytes",
-        type=_positive_int,
+        type=_bounded_positive_int(
+            "--max-central-directory-bytes",
+            HARD_MAX_CENTRAL_DIRECTORY_BYTES,
+        ),
         default=DEFAULT_MAX_CENTRAL_DIRECTORY_BYTES,
     )
     zip_show.add_argument(
         "--max-members",
-        type=_positive_int,
+        type=_bounded_positive_int("--max-members", HARD_MAX_MEMBERS),
         default=DEFAULT_MAX_MEMBERS,
     )
     zip_show.add_argument(
         "--max-member-bytes",
-        type=_positive_int,
+        type=_bounded_positive_int(
+            "--max-member-bytes",
+            HARD_MAX_MEMBER_BYTES,
+        ),
         default=DEFAULT_MAX_MEMBER_BYTES,
     )
     zip_show.add_argument(
         "--max-total-member-bytes",
-        type=_positive_int,
+        type=_bounded_positive_int(
+            "--max-total-member-bytes",
+            HARD_MAX_TOTAL_MEMBER_BYTES,
+        ),
         default=DEFAULT_MAX_TOTAL_MEMBER_BYTES,
     )
     zip_show.add_argument(
         "--max-member-lines",
-        type=_positive_int,
+        type=_bounded_positive_int(
+            "--max-member-lines",
+            HARD_MAX_MEMBER_LINES,
+        ),
         default=DEFAULT_MAX_MEMBER_LINES,
     )
     zip_show.add_argument(
         "--max-input-line-chars",
-        type=_positive_int,
+        type=_bounded_positive_int(
+            "--max-input-line-chars",
+            HARD_MAX_INPUT_LINE_CHARS,
+        ),
         default=DEFAULT_MAX_INPUT_LINE_CHARS,
     )
     zip_show.add_argument(
         "--max-output-lines",
-        type=_positive_int,
+        type=_bounded_positive_int(
+            "--max-output-lines",
+            HARD_MAX_OUTPUT_LINES,
+        ),
         default=DEFAULT_MAX_OUTPUT_LINES,
     )
     zip_show.add_argument(
         "--max-output-chars",
-        type=_positive_int,
+        type=_bounded_positive_int(
+            "--max-output-chars",
+            HARD_MAX_OUTPUT_CHARS,
+        ),
         default=DEFAULT_MAX_OUTPUT_CHARS,
     )
     zip_show.set_defaults(func=cmd_zip_show)

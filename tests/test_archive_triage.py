@@ -2651,6 +2651,204 @@ class ArchiveTriageTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.code, 2)
 
+    def test_parser_rejects_every_budget_above_immutable_hard_max(self) -> None:
+        parser = MODULE.build_parser()
+        cases = {
+            "list-limit": (
+                ["zip-list", "run.zip", "--limit"],
+                MODULE.HARD_MAX_LIST_LIMIT,
+            ),
+            "list-archive-bytes": (
+                ["zip-list", "run.zip", "--max-archive-bytes"],
+                MODULE.HARD_MAX_ARCHIVE_BYTES,
+            ),
+            "list-archive-members": (
+                ["zip-list", "run.zip", "--max-archive-members"],
+                MODULE.HARD_MAX_ARCHIVE_MEMBERS,
+            ),
+            "list-central-directory": (
+                ["zip-list", "run.zip", "--max-central-directory-bytes"],
+                MODULE.HARD_MAX_CENTRAL_DIRECTORY_BYTES,
+            ),
+            "list-output-chars": (
+                ["zip-list", "run.zip", "--max-output-chars"],
+                MODULE.HARD_MAX_OUTPUT_CHARS,
+            ),
+            "show-archive-bytes": (
+                ["zip-show", "run.zip", "console.txt", "--max-archive-bytes"],
+                MODULE.HARD_MAX_ARCHIVE_BYTES,
+            ),
+            "show-archive-members": (
+                ["zip-show", "run.zip", "console.txt", "--max-archive-members"],
+                MODULE.HARD_MAX_ARCHIVE_MEMBERS,
+            ),
+            "show-central-directory": (
+                [
+                    "zip-show",
+                    "run.zip",
+                    "console.txt",
+                    "--max-central-directory-bytes",
+                ],
+                MODULE.HARD_MAX_CENTRAL_DIRECTORY_BYTES,
+            ),
+            "show-members": (
+                ["zip-show", "run.zip", "console.txt", "--max-members"],
+                MODULE.HARD_MAX_MEMBERS,
+            ),
+            "show-member-bytes": (
+                ["zip-show", "run.zip", "console.txt", "--max-member-bytes"],
+                MODULE.HARD_MAX_MEMBER_BYTES,
+            ),
+            "show-total-member-bytes": (
+                [
+                    "zip-show",
+                    "run.zip",
+                    "console.txt",
+                    "--max-total-member-bytes",
+                ],
+                MODULE.HARD_MAX_TOTAL_MEMBER_BYTES,
+            ),
+            "show-member-lines": (
+                ["zip-show", "run.zip", "console.txt", "--max-member-lines"],
+                MODULE.HARD_MAX_MEMBER_LINES,
+            ),
+            "show-input-line-chars": (
+                [
+                    "zip-show",
+                    "run.zip",
+                    "console.txt",
+                    "--max-input-line-chars",
+                ],
+                MODULE.HARD_MAX_INPUT_LINE_CHARS,
+            ),
+            "show-output-lines": (
+                ["zip-show", "run.zip", "console.txt", "--max-output-lines"],
+                MODULE.HARD_MAX_OUTPUT_LINES,
+            ),
+            "show-output-chars": (
+                ["zip-show", "run.zip", "console.txt", "--max-output-chars"],
+                MODULE.HARD_MAX_OUTPUT_CHARS,
+            ),
+        }
+        for label, (argv, hard_max) in cases.items():
+            with self.subTest(option=label), redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as raised:
+                    parser.parse_args([*argv, str(hard_max + 1)])
+                self.assertEqual(raised.exception.code, 2)
+
+    def test_direct_entrypoints_reject_every_budget_above_hard_max(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            archive_path = self._make_archive(Path(temp_dir))
+            list_cases = {
+                "limit": MODULE.HARD_MAX_LIST_LIMIT,
+                "max_archive_bytes": MODULE.HARD_MAX_ARCHIVE_BYTES,
+                "max_archive_members": MODULE.HARD_MAX_ARCHIVE_MEMBERS,
+                "max_central_directory_bytes": (
+                    MODULE.HARD_MAX_CENTRAL_DIRECTORY_BYTES
+                ),
+                "max_output_chars": MODULE.HARD_MAX_OUTPUT_CHARS,
+            }
+            show_cases = {
+                "max_archive_bytes": MODULE.HARD_MAX_ARCHIVE_BYTES,
+                "max_archive_members": MODULE.HARD_MAX_ARCHIVE_MEMBERS,
+                "max_central_directory_bytes": (
+                    MODULE.HARD_MAX_CENTRAL_DIRECTORY_BYTES
+                ),
+                "max_members": MODULE.HARD_MAX_MEMBERS,
+                "max_member_bytes": MODULE.HARD_MAX_MEMBER_BYTES,
+                "max_total_member_bytes": MODULE.HARD_MAX_TOTAL_MEMBER_BYTES,
+                "max_member_lines": MODULE.HARD_MAX_MEMBER_LINES,
+                "max_input_line_chars": MODULE.HARD_MAX_INPUT_LINE_CHARS,
+                "max_output_lines": MODULE.HARD_MAX_OUTPUT_LINES,
+                "max_output_chars": MODULE.HARD_MAX_OUTPUT_CHARS,
+            }
+
+            for option_name, hard_max in list_cases.items():
+                with self.subTest(command="zip-list", option=option_name):
+                    stdout = io.StringIO()
+                    stderr = io.StringIO()
+                    args = self._list_args(
+                        archive_path,
+                        **{option_name: hard_max + 1},
+                    )
+                    with redirect_stdout(stdout), redirect_stderr(stderr):
+                        rc = MODULE.cmd_zip_list(args)
+                    self.assertEqual(rc, 1)
+                    self.assertEqual(stdout.getvalue(), "")
+                    self.assertIn("immutable hard max", stderr.getvalue())
+
+            for option_name, hard_max in show_cases.items():
+                with self.subTest(command="zip-show", option=option_name):
+                    stdout = io.StringIO()
+                    stderr = io.StringIO()
+                    args = self._show_args(
+                        archive_path,
+                        **{option_name: hard_max + 1},
+                    )
+                    with redirect_stdout(stdout), redirect_stderr(stderr):
+                        rc = MODULE.cmd_zip_show(args)
+                    self.assertEqual(rc, 1)
+                    self.assertEqual(stdout.getvalue(), "")
+                    self.assertIn("immutable hard max", stderr.getvalue())
+
+    def test_member_validation_drain_obeys_command_deadline(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            archive_path = self._make_archive(Path(temp_dir))
+            args = self._show_args(archive_path, head=1)
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            original_check = MODULE.PinnedArchiveReader.check_deadline
+
+            def fail_drain(
+                stream: MODULE.PinnedArchiveReader,
+                phase: str,
+            ) -> None:
+                if phase == "member validation drain":
+                    raise MODULE.ArtifactLimitError(
+                        "archive command deadline exceeded during member "
+                        "validation drain"
+                    )
+                original_check(stream, phase)
+
+            with mock.patch.object(
+                MODULE.PinnedArchiveReader,
+                "check_deadline",
+                fail_drain,
+            ):
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    rc = MODULE.cmd_zip_show(args)
+
+        self.assertEqual(rc, 1)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn(
+            "archive command deadline exceeded during member validation drain",
+            stderr.getvalue(),
+        )
+
+    def test_archive_command_timeout_is_immutable(self) -> None:
+        with self.assertRaisesRegex(
+            MODULE.ArtifactLimitError,
+            "immutable hard max",
+        ):
+            MODULE.ArchiveCommandDeadline(
+                MODULE.HARD_MAX_ARCHIVE_COMMAND_TIMEOUT_SECONDS + 1.0
+            )
+
+    def test_archive_command_timer_interrupts_one_blocking_operation(self) -> None:
+        deadline = MODULE.ArchiveCommandDeadline(0.05)
+        started = time.monotonic()
+        try:
+            deadline.arm()
+            with self.assertRaisesRegex(
+                MODULE.ArtifactLimitError,
+                "archive command deadline exceeded",
+            ):
+                time.sleep(1.0)
+        finally:
+            deadline.close()
+
+        self.assertLess(time.monotonic() - started, 0.5)
+
     def test_regex_entrypoints_report_invalid_patterns(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             archive_path = self._make_archive(Path(temp_dir))
@@ -2752,6 +2950,9 @@ class BugTriageDocumentationTests(unittest.TestCase):
         self.assertIn("or handle credentials", recipe)
         self.assertIn("reject archive files above 256 MiB", recipe)
         self.assertIn("and 100,000 lines", recipe)
+        self.assertIn("immutable hard ceilings", recipe)
+        self.assertIn("30-second process-timer deadline", recipe)
+        self.assertIn("validation drain", recipe)
         self.assertIn("protects archive object identity", recipe)
         self.assertIn("Before constructing Python `ZipInfo` objects", recipe)
         self.assertIn("binds each central record to\none matching local record", recipe)
