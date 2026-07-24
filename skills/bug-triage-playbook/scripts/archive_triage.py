@@ -120,6 +120,7 @@ class CentralDirectoryIdentity:
     raw_name: bytes
     decoded_name: str
     flag_bits: int
+    local_header_offset: int
 
 
 @dataclass(frozen=True)
@@ -1136,6 +1137,45 @@ def _resolved_central_directory_disk_start(
     return struct.unpack_from("<L", zip64, cursor - 4)[0]
 
 
+def _resolved_central_directory_local_header_offset(
+    header: bytes,
+    extra: bytes,
+    *,
+    ordinal: int,
+) -> int:
+    local_header_offset = struct.unpack_from("<L", header, 42)[0]
+    if local_header_offset != UINT32_MAX:
+        return local_header_offset
+
+    fields = _parse_extra_fields(
+        extra,
+        record_label="central-directory",
+    )
+    zip64 = fields.get(ZIP64_EXTRA_FIELD_ID)
+    if zip64 is None:
+        raise zipfile.BadZipFile(
+            f"central-directory ZIP64 local-header offset is missing: ordinal={ordinal}"
+        )
+    cursor = 0
+
+    def skip_field(size: int, label: str) -> None:
+        nonlocal cursor
+        if len(zip64) - cursor < size:
+            raise zipfile.BadZipFile(
+                f"truncated central-directory ZIP64 {label}: ordinal={ordinal}"
+            )
+        cursor += size
+
+    central_compress_size = struct.unpack_from("<L", header, 20)[0]
+    central_file_size = struct.unpack_from("<L", header, 24)[0]
+    if central_file_size == UINT32_MAX:
+        skip_field(8, "file size")
+    if central_compress_size == UINT32_MAX:
+        skip_field(8, "compressed size")
+    skip_field(8, "local-header offset")
+    return struct.unpack_from("<Q", zip64, cursor - 8)[0]
+
+
 def _read_central_directory_identities(
     stream: PinnedArchiveReader,
     *,
@@ -1199,6 +1239,11 @@ def _read_central_directory_identities(
                 "multi-disk ZIP archives are unsupported: "
                 f"member ordinal={ordinal}; disk-start={disk_start}"
             )
+        local_header_offset = _resolved_central_directory_local_header_offset(
+            header,
+            extra,
+            ordinal=ordinal,
+        )
         decoded_name = _decode_central_directory_name(
             raw_name,
             flag_bits=flag_bits,
@@ -1209,6 +1254,7 @@ def _read_central_directory_identities(
             raw_name=raw_name,
             decoded_name=decoded_name,
             flag_bits=flag_bits,
+            local_header_offset=local_header_offset,
         )
         identities.append(identity)
         cursor += record_size
@@ -1286,6 +1332,18 @@ def _preflight_central_directory(
     if len(identities) != total_entries:
         raise zipfile.BadZipFile(
             "declared and counted central-directory entries differ"
+        )
+    if identities:
+        first_local_offset = min(
+            identity.local_header_offset for identity in identities
+        )
+        if first_local_offset != 0:
+            raise zipfile.BadZipFile(
+                "concatenated or prefixed ZIP archives are unsupported"
+            )
+    elif central_start != 0:
+        raise zipfile.BadZipFile(
+            "concatenated or prefixed empty ZIP archives are unsupported"
         )
     return CentralDirectoryLayout(
         identities=identities,

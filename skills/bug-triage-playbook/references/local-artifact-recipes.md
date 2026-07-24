@@ -93,7 +93,7 @@ Select a member by regular expression and show matching lines with context:
 ```bash
 python3 "<path-to-skill>/scripts/archive_triage.py" zip-show \
   "$artifact_dir/run.zip" \
-  'error.*\\.log' \
+  'error.*\.log' \
   --regex \
   --grep 'ASSERT|ERROR|FAIL|Exception|Traceback|timeout' \
   --ignore-case \

@@ -7,6 +7,7 @@ import importlib.util
 import io
 import json
 import os
+import shlex
 import subprocess
 import struct
 import sys
@@ -108,6 +109,36 @@ class ArchiveTriageTests(unittest.TestCase):
         struct.pack_into("<H", outer, outer_eocd_offset + 20, len(inner))
         outer_path.write_bytes(outer + inner)
         return outer_path
+
+    def _prepend_and_rebase_classic_archive(
+        self,
+        archive_path: Path,
+        prefix: bytes,
+    ) -> None:
+        data = bytearray(archive_path.read_bytes())
+        eocd_offset = data.rfind(MODULE.EOCD_SIGNATURE)
+        self.assertGreaterEqual(eocd_offset, 0)
+        central_start = struct.unpack_from("<L", data, eocd_offset + 16)[0]
+        for central_offset, _, _ in self._central_directory_records(data):
+            local_header_offset = struct.unpack_from(
+                "<L",
+                data,
+                central_offset + 42,
+            )[0]
+            self.assertNotEqual(local_header_offset, MODULE.UINT32_MAX)
+            struct.pack_into(
+                "<L",
+                data,
+                central_offset + 42,
+                local_header_offset + len(prefix),
+            )
+        struct.pack_into(
+            "<L",
+            data,
+            eocd_offset + 16,
+            central_start + len(prefix),
+        )
+        archive_path.write_bytes(prefix + data)
 
     def _corrupt_member_payload_tail(
         self,
@@ -751,6 +782,78 @@ class ArchiveTriageTests(unittest.TestCase):
         self.assertEqual(stdout.getvalue(), "")
         self.assertIn(
             "concatenated or prefixed ZIP archives are unsupported",
+            stderr.getvalue(),
+        )
+
+    def test_prefixed_archive_with_rebased_offsets_is_rejected_before_zipfile(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            directory = Path(temp_dir)
+            archive_path = self._make_archive(directory)
+            self._prepend_and_rebase_classic_archive(
+                archive_path,
+                b"polyglot-prefix",
+            )
+            with zipfile.ZipFile(archive_path) as archive:
+                self.assertEqual(
+                    archive.namelist(),
+                    [
+                        "logs/console.txt",
+                        "logs/worker.log",
+                        "metadata.json",
+                    ],
+                )
+
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            real_zipfile = zipfile.ZipFile
+            with mock.patch.object(
+                MODULE.zipfile,
+                "ZipFile",
+                wraps=real_zipfile,
+            ) as constructor:
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    rc = MODULE.cmd_zip_list(self._list_args(archive_path))
+
+        self.assertEqual(rc, 1)
+        constructor.assert_not_called()
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn(
+            "concatenated or prefixed ZIP archives are unsupported",
+            stderr.getvalue(),
+        )
+
+    def test_prefixed_empty_archive_with_rebased_offset_is_rejected_before_zipfile(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            archive_path = Path(temp_dir) / "empty.zip"
+            with zipfile.ZipFile(archive_path, "w"):
+                pass
+            self._prepend_and_rebase_classic_archive(
+                archive_path,
+                b"polyglot-prefix",
+            )
+            with zipfile.ZipFile(archive_path) as archive:
+                self.assertEqual(archive.namelist(), [])
+
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            real_zipfile = zipfile.ZipFile
+            with mock.patch.object(
+                MODULE.zipfile,
+                "ZipFile",
+                wraps=real_zipfile,
+            ) as constructor:
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    rc = MODULE.cmd_zip_list(self._list_args(archive_path))
+
+        self.assertEqual(rc, 1)
+        constructor.assert_not_called()
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn(
+            "concatenated or prefixed empty ZIP archives are unsupported",
             stderr.getvalue(),
         )
 
@@ -2268,6 +2371,43 @@ class BugTriageDocumentationTests(unittest.TestCase):
         self.assertIn("accepts only stored and DEFLATE members", recipe)
         self.assertIn("rejects those\nmethods before opening a decompressor", recipe)
         self.assertIn("absence of trailing compressed data", recipe)
+
+    def test_documented_member_regex_matches_literal_log_suffix(self) -> None:
+        recipe = (SKILL_ROOT / "references/local-artifact-recipes.md").read_text(
+            encoding="utf-8"
+        )
+        pattern_line = next(
+            line for line in recipe.splitlines() if line.strip().startswith("'error.*")
+        )
+        documented_pattern = shlex.split(pattern_line.removesuffix(" \\"))[0]
+        self.assertEqual(documented_pattern, r"error.*\.log")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            archive_path = Path(temp_dir) / "recipe-regex.zip"
+            with zipfile.ZipFile(archive_path, "w") as archive:
+                archive.writestr("logs/error-build.log", "target\n")
+                archive.writestr("logs/error-buildXlog", "nonmatch\n")
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT_PATH),
+                    "zip-show",
+                    str(archive_path),
+                    documented_pattern,
+                    "--regex",
+                    "--head",
+                    "1",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('"name":"logs/error-build.log"', result.stdout)
+        self.assertNotIn("error-buildXlog", result.stdout)
+        self.assertIn("target", result.stdout)
+        self.assertNotIn("nonmatch", result.stdout)
 
     def test_private_migration_contract_is_explicit(self) -> None:
         migration = (REPO_ROOT / "docs/cisco-build-artifacts-migration.md").read_text(
