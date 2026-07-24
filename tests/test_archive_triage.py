@@ -4599,7 +4599,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
                 self.calls: list[tuple[str, dict[str, object]]] = []
                 self.executable_sha256 = "a" * 64
                 self.execution_source = "owner-private-snapshot"
-                self.environment_profile = "minimal-explicit-config-v1"
+                self.environment_profile = "minimal-snapshotted-config-v2"
 
             def auth_preflight(self) -> dict[str, object]:
                 self.auth_calls += 1
@@ -4800,6 +4800,41 @@ class BugTriageDocumentationTests(unittest.TestCase):
     @staticmethod
     def _copy_json(value: dict[str, object]) -> dict[str, object]:
         return json.loads(json.dumps(value))
+
+    @staticmethod
+    def _make_private_gh_config(
+        temp_root: Path,
+        *,
+        config_payload: str | None = None,
+        hosts_payload: str | None = None,
+    ) -> tuple[Path, Path]:
+        resolved_root = temp_root.resolve()
+        config_dir = resolved_root / "gh-config"
+        config_dir.mkdir(mode=0o700)
+        config_dir.chmod(0o700)
+        hosts_path = config_dir / "hosts.yml"
+        hosts_path.write_text(
+            hosts_payload
+            or (
+                "github.com:\n"
+                "    git_protocol: https\n"
+                "    users:\n"
+                "        fixture-admin:\n"
+                "    user: fixture-admin\n"
+            ),
+            encoding="utf-8",
+        )
+        hosts_path.chmod(0o600)
+        config_path = config_dir / "config.yml"
+        config_path.write_text(
+            config_payload
+            or (
+                "version: 1\ngit_protocol: https\nprompt: disabled\nhttp_unix_socket:\n"
+            ),
+            encoding="utf-8",
+        )
+        config_path.chmod(0o600)
+        return config_dir, resolved_root / "fixed-gh-runtime"
 
     @staticmethod
     def _cutover_variable(
@@ -5010,7 +5045,14 @@ class BugTriageDocumentationTests(unittest.TestCase):
         self.assertIn("--gh-executable", migration)
         self.assertIn("--expected-gh-sha256", migration)
         self.assertIn("--gh-config-dir", migration)
-        self.assertIn("owner-private executable snapshot", migration)
+        self.assertIn("private `bin` directory", migration)
+        self.assertIn("ignores ambient `HOME` and `TMPDIR`", migration)
+        self.assertIn("non-ABA execution binding", migration)
+        self.assertIn(
+            "source `hosts.yml` parser admits only the simple `github.com`",
+            migration,
+        )
+        self.assertIn("transport overrides are rejected", migration)
         self.assertIn("returns `collector-inconclusive`", migration)
         self.assertIn("A later attempt supersedes an older", migration)
         self.assertIn("blocked-permission", migration)
@@ -5582,7 +5624,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
         self.assertEqual(
             receipt["collector"]["gh_executable"],
             {
-                "environment_profile": "minimal-explicit-config-v1",
+                "environment_profile": "minimal-snapshotted-config-v2",
                 "execution_source": "owner-private-snapshot",
                 "sha256": "a" * 64,
             },
@@ -6155,12 +6197,13 @@ class BugTriageDocumentationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_root = Path(temp_dir)
             trusted_gh = temp_root / "trusted-gh"
-            trusted_payload = b"#!/bin/sh\nexit 0\n"
+            trusted_payload = (
+                b'#!/bin/sh\nprintf \'%s\\n\' \'{"id":1,"login":"fixture"}\'\n'
+            )
             trusted_gh.write_bytes(trusted_payload)
             trusted_gh.chmod(0o700)
             expected_digest = hashlib.sha256(trusted_payload).hexdigest()
-            config_dir = temp_root / "gh-config"
-            config_dir.mkdir()
+            config_dir, runtime_parent = self._make_private_gh_config(temp_root)
             malicious_dir = temp_root / "malicious-path"
             malicious_dir.mkdir()
             malicious_gh = malicious_dir / "gh"
@@ -6185,12 +6228,21 @@ class BugTriageDocumentationTests(unittest.TestCase):
                 "SSL_CERT_FILE": "/ambient-ca.pem",
                 "DYLD_INSERT_LIBRARIES": "/ambient.dylib",
                 "LD_PRELOAD": "/ambient.so",
+                "TMPDIR": str(malicious_dir),
             }
             with mock.patch.dict(os.environ, ambient, clear=False):
+                expected_default_runtime = Path(
+                    ENFORCEMENT_MODULE.pwd.getpwuid(os.geteuid()).pw_dir
+                ).joinpath(*ENFORCEMENT_MODULE.GH_RUNTIME_COMPONENTS)
+                self.assertEqual(
+                    ENFORCEMENT_MODULE._default_gh_runtime_parent(),
+                    expected_default_runtime,
+                )
                 with ENFORCEMENT_MODULE.GitHubApiClient(
                     trusted_gh,
                     expected_digest,
                     config_dir,
+                    runtime_parent=runtime_parent,
                 ) as client:
                     with mock.patch.object(
                         ENFORCEMENT_MODULE,
@@ -6202,10 +6254,19 @@ class BugTriageDocumentationTests(unittest.TestCase):
                     self.assertEqual(response["login"], "fixture")
                     self.assertEqual(observed["command"][0], client.executable)
                     self.assertNotEqual(observed["command"][0], str(malicious_gh))
+                    self.assertFalse(
+                        Path(observed["command"][0]).is_relative_to(malicious_dir)
+                    )
+                    snapshot_config_dir = Path(observed["environment"]["GH_CONFIG_DIR"])
+                    self.assertNotEqual(snapshot_config_dir, config_dir)
+                    self.assertEqual(
+                        snapshot_config_dir.parent,
+                        Path(client.executable).parent.parent,
+                    )
                     self.assertEqual(
                         observed["environment"],
                         {
-                            "GH_CONFIG_DIR": str(config_dir),
+                            "GH_CONFIG_DIR": str(snapshot_config_dir),
                             "GH_NO_UPDATE_NOTIFIER": "1",
                             "GH_PROMPT_DISABLED": "1",
                             "LC_ALL": "C",
@@ -6218,8 +6279,30 @@ class BugTriageDocumentationTests(unittest.TestCase):
                     )
                     self.assertEqual(
                         client.environment_profile,
-                        "minimal-explicit-config-v1",
+                        "minimal-snapshotted-config-v2",
                     )
+
+                    def attempt_execution_window_replacement(
+                        command: list[str],
+                        **kwargs: object,
+                    ) -> tuple[int, bytes, bytes]:
+                        try:
+                            client._snapshot_path.rename(
+                                client._snapshot_path.with_name("gh.replaced")
+                            )
+                        except PermissionError:
+                            observed["execution_window_replacement_blocked"] = True
+                        return 0, b'{"id":1,"login":"fixture"}', b""
+
+                    with mock.patch.object(
+                        ENFORCEMENT_MODULE,
+                        "_bounded_subprocess",
+                        side_effect=attempt_execution_window_replacement,
+                    ):
+                        client.get_json("/user")
+                    self.assertTrue(observed["execution_window_replacement_blocked"])
+                    actual_response = client.get_json("/user")
+                    self.assertEqual(actual_response["login"], "fixture")
 
     def test_enforcement_gh_pin_rejects_initial_digest_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -6227,14 +6310,14 @@ class BugTriageDocumentationTests(unittest.TestCase):
             trusted_gh = temp_root / "trusted-gh"
             trusted_gh.write_bytes(b"#!/bin/sh\nexit 0\n")
             trusted_gh.chmod(0o700)
-            config_dir = temp_root / "gh-config"
-            config_dir.mkdir()
+            config_dir, runtime_parent = self._make_private_gh_config(temp_root)
 
             with self.assertRaises(ENFORCEMENT_MODULE.EnforcementDoctorError) as raised:
                 ENFORCEMENT_MODULE.GitHubApiClient(
                     trusted_gh,
                     "a" * 64,
                     config_dir,
+                    runtime_parent=runtime_parent,
                 )
 
         self.assertEqual(
@@ -6254,8 +6337,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
             trusted_digest = hashlib.sha256(trusted_payload).hexdigest()
             symlink_gh = temp_root / "symlink-gh"
             symlink_gh.symlink_to(trusted_gh)
-            config_dir = temp_root / "gh-config"
-            config_dir.mkdir()
+            config_dir, runtime_parent = self._make_private_gh_config(temp_root)
             cases = (
                 ("relative-executable", Path("trusted-gh"), config_dir),
                 ("symlink-executable", symlink_gh, config_dir),
@@ -6270,6 +6352,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
                             executable,
                             trusted_digest,
                             selected_config,
+                            runtime_parent=runtime_parent,
                         )
                     self.assertEqual(
                         raised.exception.reason_code,
@@ -6285,12 +6368,12 @@ class BugTriageDocumentationTests(unittest.TestCase):
             trusted_payload = b"#!/bin/sh\nexit 0\n"
             trusted_gh.write_bytes(trusted_payload)
             trusted_gh.chmod(0o700)
-            config_dir = temp_root / "gh-config"
-            config_dir.mkdir()
+            config_dir, runtime_parent = self._make_private_gh_config(temp_root)
             with ENFORCEMENT_MODULE.GitHubApiClient(
                 trusted_gh,
                 hashlib.sha256(trusted_payload).hexdigest(),
                 config_dir,
+                runtime_parent=runtime_parent,
             ) as client:
                 trusted_gh.rename(temp_root / "trusted-gh.original")
                 trusted_gh.write_bytes(b"#!/bin/sh\nexit 99\n")
@@ -6324,6 +6407,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
                 client._source_path.chmod(0o700),
             ),
             "snapshot-path": lambda client, temp_root: (
+                client._executable_snapshot_directory.set_owner_mode(0o700),
                 client._snapshot_path.rename(
                     client._snapshot_path.with_name("gh.original")
                 ),
@@ -6342,12 +6426,12 @@ class BugTriageDocumentationTests(unittest.TestCase):
                     trusted_payload = b"#!/bin/sh\nexit 0\n"
                     trusted_gh.write_bytes(trusted_payload)
                     trusted_gh.chmod(0o700)
-                    config_dir = temp_root / "gh-config"
-                    config_dir.mkdir()
+                    config_dir, runtime_parent = self._make_private_gh_config(temp_root)
                     with ENFORCEMENT_MODULE.GitHubApiClient(
                         trusted_gh,
                         hashlib.sha256(trusted_payload).hexdigest(),
                         config_dir,
+                        runtime_parent=runtime_parent,
                     ) as client:
 
                         def drift_after_exec(
@@ -6372,6 +6456,307 @@ class BugTriageDocumentationTests(unittest.TestCase):
                             "collector-inconclusive",
                         )
 
+    def test_enforcement_gh_runtime_rejects_replaceable_ancestor(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            trusted_gh = temp_root / "trusted-gh"
+            trusted_payload = b"#!/bin/sh\nexit 0\n"
+            trusted_gh.write_bytes(trusted_payload)
+            trusted_gh.chmod(0o700)
+            config_dir, _ = self._make_private_gh_config(temp_root)
+            replaceable_parent = temp_root.resolve() / "replaceable"
+            replaceable_parent.mkdir(mode=0o777)
+            replaceable_parent.chmod(0o777)
+
+            with self.assertRaises(ENFORCEMENT_MODULE.EnforcementDoctorError) as raised:
+                ENFORCEMENT_MODULE.GitHubApiClient(
+                    trusted_gh,
+                    hashlib.sha256(trusted_payload).hexdigest(),
+                    config_dir,
+                    runtime_parent=replaceable_parent / "runtime",
+                )
+
+        self.assertEqual(raised.exception.reason_code, "collector-unavailable")
+        self.assertIn("untrusted principal", str(raised.exception))
+
+    def test_enforcement_gh_config_rejects_symlinks_and_open_permissions(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            resolved_root = temp_root.resolve()
+            trusted_gh = temp_root / "trusted-gh"
+            trusted_payload = b"#!/bin/sh\nexit 0\n"
+            trusted_gh.write_bytes(trusted_payload)
+            trusted_gh.chmod(0o700)
+            expected_digest = hashlib.sha256(trusted_payload).hexdigest()
+
+            config_dir, runtime_parent = self._make_private_gh_config(temp_root)
+            config_link = resolved_root / "config-link"
+            config_link.symlink_to(config_dir, target_is_directory=True)
+            with self.subTest(case="directory-symlink"):
+                with self.assertRaises(
+                    ENFORCEMENT_MODULE.EnforcementDoctorError
+                ) as raised:
+                    ENFORCEMENT_MODULE.GitHubApiClient(
+                        trusted_gh,
+                        expected_digest,
+                        config_link,
+                        runtime_parent=runtime_parent,
+                    )
+                self.assertEqual(
+                    raised.exception.reason_code,
+                    "collector-unavailable",
+                )
+
+            hosts_path = config_dir / "hosts.yml"
+            hosts_payload = hosts_path.read_bytes()
+            hosts_path.unlink()
+            external_hosts = resolved_root / "external-hosts.yml"
+            external_hosts.write_bytes(hosts_payload)
+            external_hosts.chmod(0o600)
+            hosts_path.symlink_to(external_hosts)
+            with self.subTest(case="hosts-symlink"):
+                with self.assertRaises(
+                    ENFORCEMENT_MODULE.EnforcementDoctorError
+                ) as raised:
+                    ENFORCEMENT_MODULE.GitHubApiClient(
+                        trusted_gh,
+                        expected_digest,
+                        config_dir,
+                        runtime_parent=runtime_parent,
+                    )
+                self.assertEqual(
+                    raised.exception.reason_code,
+                    "collector-unavailable",
+                )
+            hosts_path.unlink()
+            hosts_path.write_bytes(hosts_payload)
+            hosts_path.chmod(0o600)
+
+            for label, path, mode in (
+                ("directory-open", config_dir, 0o755),
+                ("hosts-open", hosts_path, 0o644),
+            ):
+                with self.subTest(case=label):
+                    path.chmod(mode)
+                    with self.assertRaises(
+                        ENFORCEMENT_MODULE.EnforcementDoctorError
+                    ) as raised:
+                        ENFORCEMENT_MODULE.GitHubApiClient(
+                            trusted_gh,
+                            expected_digest,
+                            config_dir,
+                            runtime_parent=runtime_parent,
+                        )
+                    self.assertEqual(
+                        raised.exception.reason_code,
+                        "collector-unavailable",
+                    )
+                    path.chmod(0o700 if path == config_dir else 0o600)
+
+    def test_enforcement_gh_config_rejects_transport_redirects(self) -> None:
+        cases = (
+            (
+                "global-unix-socket",
+                "version: 1\nhttp_unix_socket: /tmp/attacker.sock\n",
+                None,
+            ),
+            (
+                "quoted-global-unix-socket",
+                'version: 1\n"http_unix_socket": /tmp/attacker.sock\n',
+                None,
+            ),
+            (
+                "host-api-redirect",
+                None,
+                (
+                    "github.com:\n"
+                    "    git_protocol: https\n"
+                    "    api_host: attacker.invalid\n"
+                    "    users:\n"
+                    "        fixture-admin:\n"
+                    "        inactive-user:\n"
+                    "            oauth_token: ghp_inactive_must_not_be_snapshotted\n"
+                    "    user: fixture-admin\n"
+                ),
+            ),
+        )
+        for label, config_payload, hosts_payload in cases:
+            with self.subTest(case=label):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    temp_root = Path(temp_dir)
+                    trusted_gh = temp_root / "trusted-gh"
+                    trusted_payload = b"#!/bin/sh\nexit 0\n"
+                    trusted_gh.write_bytes(trusted_payload)
+                    trusted_gh.chmod(0o700)
+                    config_dir, runtime_parent = self._make_private_gh_config(
+                        temp_root,
+                        config_payload=config_payload,
+                        hosts_payload=hosts_payload,
+                    )
+                    with self.assertRaises(
+                        ENFORCEMENT_MODULE.EnforcementDoctorError
+                    ) as raised:
+                        ENFORCEMENT_MODULE.GitHubApiClient(
+                            trusted_gh,
+                            hashlib.sha256(trusted_payload).hexdigest(),
+                            config_dir,
+                            runtime_parent=runtime_parent,
+                        )
+                    self.assertEqual(
+                        raised.exception.reason_code,
+                        "collector-unavailable",
+                    )
+
+    def test_enforcement_gh_config_drift_discards_command_output(self) -> None:
+        mutations = {
+            "source-config-content": lambda client, temp_root: (
+                client._source_config_directory.path / "config.yml"
+            ).write_text(
+                "version: 1\nhttp_unix_socket: /tmp/attacker.sock\n",
+                encoding="utf-8",
+            ),
+            "source-hosts": lambda client, temp_root: (
+                (client._source_config_directory.path / "hosts.yml").rename(
+                    temp_root / "hosts.original"
+                ),
+                (client._source_config_directory.path / "hosts.yml").write_text(
+                    (
+                        "github.com:\n"
+                        "    git_protocol: https\n"
+                        "    users:\n"
+                        "        attacker:\n"
+                        "            oauth_token: ghp_attacker\n"
+                        "    user: attacker\n"
+                        "    oauth_token: ghp_attacker\n"
+                    ),
+                    encoding="utf-8",
+                ),
+                (client._source_config_directory.path / "hosts.yml").chmod(0o600),
+            ),
+            "snapshot-hosts": lambda client, temp_root: (
+                (client._config_snapshot_directory.path / "hosts.yml").rename(
+                    temp_root / "snapshot-hosts.original"
+                ),
+                (client._config_snapshot_directory.path / "hosts.yml").write_text(
+                    ("attacker.invalid:\n    oauth_token: ghp_attacker\n"),
+                    encoding="utf-8",
+                ),
+                (client._config_snapshot_directory.path / "hosts.yml").chmod(0o600),
+            ),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(drift=label):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    temp_root = Path(temp_dir).resolve()
+                    trusted_gh = temp_root / "trusted-gh"
+                    trusted_payload = b"#!/bin/sh\nexit 0\n"
+                    trusted_gh.write_bytes(trusted_payload)
+                    trusted_gh.chmod(0o700)
+                    config_dir, runtime_parent = self._make_private_gh_config(temp_root)
+                    with ENFORCEMENT_MODULE.GitHubApiClient(
+                        trusted_gh,
+                        hashlib.sha256(trusted_payload).hexdigest(),
+                        config_dir,
+                        runtime_parent=runtime_parent,
+                    ) as client:
+
+                        def drift_during_execution(
+                            command: list[str],
+                            **kwargs: object,
+                        ) -> tuple[int, bytes, bytes]:
+                            if label == "snapshot-hosts":
+                                client._config_snapshot_directory.set_owner_mode(0o700)
+                            mutate(client, temp_root)
+                            return 0, b'{"id":1,"login":"must-not-be-used"}', b""
+
+                        with mock.patch.object(
+                            ENFORCEMENT_MODULE,
+                            "_bounded_subprocess",
+                            side_effect=drift_during_execution,
+                        ):
+                            with self.assertRaises(
+                                ENFORCEMENT_MODULE.EnforcementDoctorError
+                            ) as raised:
+                                client.get_json("/user")
+                        self.assertEqual(
+                            raised.exception.reason_code,
+                            "collector-inconclusive",
+                        )
+
+    def test_enforcement_gh_snapshot_excludes_non_github_authentication(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            trusted_gh = temp_root / "trusted-gh"
+            trusted_payload = b"#!/bin/sh\nexit 0\n"
+            trusted_gh.write_bytes(trusted_payload)
+            trusted_gh.chmod(0o700)
+            config_dir, runtime_parent = self._make_private_gh_config(
+                temp_root,
+                hosts_payload=(
+                    "github.com:\n"
+                    "    git_protocol: https\n"
+                    "    users:\n"
+                    "        fixture-admin:\n"
+                    "    user: fixture-admin\n"
+                    "attacker.invalid:\n"
+                    "    git_protocol: https\n"
+                    "    oauth_token: ghp_must_not_be_snapshotted\n"
+                    "    user: attacker\n"
+                ),
+            )
+            observed_commands: list[list[str]] = []
+
+            def fixed_result(
+                command: list[str],
+                **kwargs: object,
+            ) -> tuple[int, bytes, bytes]:
+                observed_commands.append(command)
+                return 0, b'{"id":1,"login":"fixture"}', b""
+
+            with ENFORCEMENT_MODULE.GitHubApiClient(
+                trusted_gh,
+                hashlib.sha256(trusted_payload).hexdigest(),
+                config_dir,
+                runtime_parent=runtime_parent,
+            ) as client:
+                snapshot_hosts = (
+                    client._config_snapshot_directory.path / "hosts.yml"
+                ).read_text(encoding="utf-8")
+                self.assertIn("github.com:", snapshot_hosts)
+                self.assertNotIn("attacker.invalid", snapshot_hosts)
+                self.assertNotIn("ghp_must_not_be_snapshotted", snapshot_hosts)
+                self.assertNotIn(
+                    "ghp_inactive_must_not_be_snapshotted",
+                    snapshot_hosts,
+                )
+                with mock.patch.object(
+                    ENFORCEMENT_MODULE,
+                    "_bounded_subprocess",
+                    side_effect=fixed_result,
+                ):
+                    client.get_json("/user")
+                    for endpoint in (
+                        "https://attacker.invalid/user",
+                        "//attacker.invalid/user",
+                    ):
+                        with self.subTest(endpoint=endpoint):
+                            with self.assertRaises(
+                                ENFORCEMENT_MODULE.EnforcementDoctorError
+                            ):
+                                client.get_json(endpoint)
+
+            self.assertEqual(len(observed_commands), 1)
+            self.assertIn("--hostname", observed_commands[0])
+            self.assertEqual(
+                observed_commands[0][observed_commands[0].index("--hostname") + 1],
+                "github.com",
+            )
+            self.assertNotIn("attacker.invalid", " ".join(observed_commands[0]))
+
     def test_enforcement_api_failures_are_sanitized_and_actionable(
         self,
     ) -> None:
@@ -6393,11 +6778,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
                 client.total_bytes = 0
                 client.deadline = time.monotonic() + 30
                 client._environment = {}
-                client._temporary_directory = type(
-                    "TemporaryDirectoryStub",
-                    (),
-                    {"name": tempfile.gettempdir()},
-                )()
+                client._execution_cwd = tempfile.gettempdir()
                 client._revalidate_snapshot = mock.Mock()
                 detail = (
                     "rate limit exceeded"
@@ -6448,11 +6829,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
         client.total_bytes = 0
         client.deadline = time.monotonic() + 30
         client._environment = {}
-        client._temporary_directory = type(
-            "TemporaryDirectoryStub",
-            (),
-            {"name": tempfile.gettempdir()},
-        )()
+        client._execution_cwd = tempfile.gettempdir()
         client._revalidate_snapshot = mock.Mock()
         with mock.patch.object(
             ENFORCEMENT_MODULE,

@@ -7,12 +7,13 @@ import hashlib
 import json
 import os
 import pathlib
+import pwd
 import re
+import secrets
 import selectors
 import signal
 import stat
 import subprocess
-import tempfile
 import time
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -42,8 +43,40 @@ MAX_JSON_CONTAINER_ITEMS = 16_384
 MAX_JSON_INTEGER_DIGITS = 64
 MAX_JSON_STRING_CHARS = 128 * 1024
 MAX_GH_EXECUTABLE_BYTES = 256 * 1024 * 1024
-GH_EXECUTABLE_ENVIRONMENT_PROFILE = "minimal-explicit-config-v1"
+MAX_GH_CONFIG_BYTES = 1024 * 1024
+MAX_GH_CONFIG_LINE_BYTES = 16 * 1024
+GH_EXECUTABLE_ENVIRONMENT_PROFILE = "minimal-snapshotted-config-v2"
 GH_EXECUTION_SOURCE = "owner-private-snapshot"
+GH_RUNTIME_COMPONENTS = (".codex", "cisco-cutover-doctor")
+GH_SNAPSHOT_CONFIG = (
+    b"version: 1\n"
+    b"git_protocol: https\n"
+    b"prompt: disabled\n"
+    b"prefer_editor_prompt: disabled\n"
+    b"pager:\n"
+    b"aliases:\n"
+    b"http_unix_socket:\n"
+    b"browser:\n"
+    b"color_labels: disabled\n"
+    b"accessible_colors: disabled\n"
+    b"accessible_prompter: disabled\n"
+    b"spinner: disabled\n"
+)
+GH_TRANSPORT_REDIRECT_KEYS = frozenset(
+    {
+        "api_host",
+        "api_url",
+        "base_url",
+        "endpoint",
+        "http_proxy",
+        "http_unix_socket",
+        "https_proxy",
+        "proxy",
+        "socket",
+        "transport",
+        "unix_socket",
+    }
+)
 CUTOVER_INPUT_VARIABLES = (
     "CISCO_CUTOVER_TARGET_PR_NUMBER",
     "CISCO_CUTOVER_TARGET_HEAD_SHA",
@@ -741,6 +774,808 @@ def _sha256_fd_bounded(fd: int) -> tuple[str, int]:
     return digest.hexdigest(), offset
 
 
+def _read_fd_payload_bounded(fd: int, *, label: str, limit: int) -> bytes:
+    chunks: list[bytes] = []
+    offset = 0
+    while True:
+        try:
+            chunk = os.pread(fd, min(64 * 1024, limit + 1 - offset), offset)
+        except OSError as error:
+            raise _blocked(
+                "collector-unavailable",
+                f"{label} could not be read safely",
+            ) from error
+        if not chunk:
+            break
+        chunks.append(chunk)
+        offset += len(chunk)
+        if offset > limit:
+            raise _blocked(
+                "collector-unavailable",
+                f"{label} exceeds its byte ceiling",
+            )
+    return b"".join(chunks)
+
+
+def _directory_status(status_value: os.stat_result) -> dict[str, int]:
+    return {
+        "device": status_value.st_dev,
+        "gid": status_value.st_gid,
+        "inode": status_value.st_ino,
+        "mode": stat.S_IMODE(status_value.st_mode),
+        "uid": status_value.st_uid,
+    }
+
+
+def _file_status(status_value: os.stat_result) -> dict[str, int]:
+    return {
+        "device": status_value.st_dev,
+        "gid": status_value.st_gid,
+        "inode": status_value.st_ino,
+        "links": status_value.st_nlink,
+        "mode": stat.S_IMODE(status_value.st_mode),
+        "size": status_value.st_size,
+        "uid": status_value.st_uid,
+    }
+
+
+def _require_safe_directory_status(
+    status_value: os.stat_result,
+    *,
+    label: str,
+    owner_private: bool,
+) -> None:
+    mode = stat.S_IMODE(status_value.st_mode)
+    if not stat.S_ISDIR(status_value.st_mode):
+        raise _blocked("collector-unavailable", f"{label} must be a directory")
+    if status_value.st_uid not in (0, os.geteuid()):
+        raise _blocked(
+            "collector-unavailable",
+            f"{label} is owned by an untrusted principal",
+        )
+    if mode & 0o022:
+        raise _blocked(
+            "collector-unavailable",
+            f"{label} can be renamed by an untrusted principal",
+        )
+    if owner_private and (status_value.st_uid != os.geteuid() or mode != 0o700):
+        raise _blocked(
+            "collector-unavailable",
+            f"{label} must be owner-private",
+        )
+
+
+class _BoundDirectory:
+    def __init__(
+        self,
+        path: pathlib.Path,
+        *,
+        label: str,
+        create_final: bool = False,
+    ) -> None:
+        self.path = path
+        self.label = label
+        self._fds: list[int] = []
+        self._bindings: list[dict[str, int]] = []
+        self._relations: list[tuple[int, str, int]] = []
+        self._closed = False
+        if (
+            not path.is_absolute()
+            or path == pathlib.Path("/")
+            or any(part in ("", ".", "..") for part in path.parts[1:])
+        ):
+            raise _blocked(
+                "collector-unavailable",
+                f"{label} must be a normalized absolute non-root path",
+            )
+        missing_flags = [
+            name
+            for name in ("O_DIRECTORY", "O_NOFOLLOW", "O_NONBLOCK")
+            if not hasattr(os, name)
+        ]
+        if missing_flags:
+            raise _blocked(
+                "collector-unavailable",
+                f"{label} safe directory flags are unavailable",
+            )
+        flags = (
+            os.O_RDONLY
+            | os.O_DIRECTORY
+            | os.O_NOFOLLOW
+            | os.O_NONBLOCK
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+        try:
+            root_fd = os.open("/", flags)
+            self._fds.append(root_fd)
+            root_status = os.fstat(root_fd)
+            _require_safe_directory_status(
+                root_status,
+                label=f"{label} root ancestor",
+                owner_private=False,
+            )
+            self._bindings.append(_directory_status(root_status))
+            parent_fd = root_fd
+            components = path.parts[1:]
+            for index, component in enumerate(components):
+                is_final = index == len(components) - 1
+                created = False
+                try:
+                    child_fd = os.open(component, flags, dir_fd=parent_fd)
+                except FileNotFoundError:
+                    if not (create_final and is_final):
+                        raise
+                    os.mkdir(component, 0o700, dir_fd=parent_fd)
+                    created = True
+                    child_fd = os.open(component, flags, dir_fd=parent_fd)
+                self._fds.append(child_fd)
+                child_descriptor = os.fstat(child_fd)
+                child_path = os.stat(
+                    component,
+                    dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+                if _directory_status(child_descriptor) != _directory_status(child_path):
+                    raise _blocked(
+                        "collector-unavailable",
+                        f"{label} component identity is unstable",
+                    )
+                _require_safe_directory_status(
+                    child_descriptor,
+                    label=f"{label} component {component!r}",
+                    owner_private=is_final and not created,
+                )
+                if created:
+                    if (
+                        not stat.S_ISDIR(child_descriptor.st_mode)
+                        or child_descriptor.st_uid != os.geteuid()
+                        or stat.S_IMODE(child_descriptor.st_mode) & 0o077
+                    ):
+                        raise _blocked(
+                            "collector-unavailable",
+                            f"{label} newly created component is not private",
+                        )
+                    os.fchmod(child_fd, 0o700)
+                    child_descriptor = os.fstat(child_fd)
+                    child_path = os.stat(
+                        component,
+                        dir_fd=parent_fd,
+                        follow_symlinks=False,
+                    )
+                    if _directory_status(child_descriptor) != _directory_status(
+                        child_path
+                    ):
+                        raise _blocked(
+                            "collector-unavailable",
+                            f"{label} created component identity changed",
+                        )
+                    _require_safe_directory_status(
+                        child_descriptor,
+                        label=f"{label} created component",
+                        owner_private=True,
+                    )
+                binding = _directory_status(child_descriptor)
+                self._bindings.append(binding)
+                self._relations.append((parent_fd, component, child_fd))
+                parent_fd = child_fd
+            self.fd = self._fds[-1]
+            self.revalidate()
+        except EnforcementDoctorError:
+            self.close()
+            raise
+        except OSError as error:
+            self.close()
+            raise _blocked(
+                "collector-unavailable",
+                f"{label} cannot be opened without following components",
+            ) from error
+
+    def revalidate(self) -> None:
+        if self._closed or not self._fds:
+            raise _blocked(
+                "collector-inconclusive",
+                f"{self.label} binding is unavailable",
+            )
+        try:
+            for fd, expected in zip(self._fds, self._bindings):
+                current = os.fstat(fd)
+                if (
+                    not stat.S_ISDIR(current.st_mode)
+                    or _directory_status(current) != expected
+                ):
+                    raise self._inconclusive()
+            for relation, expected in zip(self._relations, self._bindings[1:]):
+                parent_fd, component, child_fd = relation
+                child_descriptor = os.fstat(child_fd)
+                child_path = os.stat(
+                    component,
+                    dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+                if (
+                    _directory_status(child_descriptor) != expected
+                    or _directory_status(child_path) != expected
+                ):
+                    raise self._inconclusive()
+        except EnforcementDoctorError:
+            raise
+        except OSError as error:
+            raise self._inconclusive() from error
+
+    def _inconclusive(self) -> EnforcementDoctorError:
+        return _blocked(
+            "collector-inconclusive",
+            f"{self.label} identity or access policy changed",
+        )
+
+    def set_owner_mode(self, mode: int) -> None:
+        if mode not in (0o500, 0o700):
+            raise _blocked(
+                "collector-unavailable",
+                f"{self.label} requested an unsupported access policy",
+            )
+        self.revalidate()
+        try:
+            os.fchmod(self.fd, mode)
+            descriptor = os.fstat(self.fd)
+            if (
+                not stat.S_ISDIR(descriptor.st_mode)
+                or descriptor.st_uid != os.geteuid()
+                or stat.S_IMODE(descriptor.st_mode) != mode
+            ):
+                raise self._inconclusive()
+            self._bindings[-1] = _directory_status(descriptor)
+            self.revalidate()
+        except EnforcementDoctorError:
+            raise
+        except OSError as error:
+            raise self._inconclusive() from error
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        for fd in reversed(self._fds):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        self._fds = []
+
+
+class _BoundRegularFile:
+    def __init__(
+        self,
+        parent: _BoundDirectory,
+        name: str,
+        *,
+        label: str,
+        max_bytes: int,
+    ) -> None:
+        self.parent = parent
+        self.name = name
+        self.label = label
+        self.max_bytes = max_bytes
+        self.fd: Optional[int] = None
+        if (
+            not name
+            or "/" in name
+            or name in (".", "..")
+            or not hasattr(os, "O_NOFOLLOW")
+            or not hasattr(os, "O_NONBLOCK")
+        ):
+            raise _blocked(
+                "collector-unavailable",
+                f"{label} safe file binding is unavailable",
+            )
+        flags = (
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
+        )
+        parent.revalidate()
+        try:
+            self.fd = os.open(name, flags, dir_fd=parent.fd)
+            descriptor_before = os.fstat(self.fd)
+            path_before = os.stat(
+                name,
+                dir_fd=parent.fd,
+                follow_symlinks=False,
+            )
+            first = _read_fd_payload_bounded(
+                self.fd,
+                label=label,
+                limit=max_bytes,
+            )
+            second = _read_fd_payload_bounded(
+                self.fd,
+                label=label,
+                limit=max_bytes,
+            )
+            descriptor_after = os.fstat(self.fd)
+            path_after = os.stat(
+                name,
+                dir_fd=parent.fd,
+                follow_symlinks=False,
+            )
+        except OSError as error:
+            self.close()
+            raise _blocked(
+                "collector-unavailable",
+                f"{label} cannot be opened safely",
+            ) from error
+        if (
+            not stat.S_ISREG(descriptor_before.st_mode)
+            or not stat.S_ISREG(path_before.st_mode)
+            or not stat.S_ISREG(descriptor_after.st_mode)
+            or not stat.S_ISREG(path_after.st_mode)
+            or descriptor_before.st_uid != os.geteuid()
+            or descriptor_before.st_nlink != 1
+            or stat.S_IMODE(descriptor_before.st_mode) & 0o077
+            or _file_status(descriptor_before) != _file_status(path_before)
+            or _file_status(descriptor_before) != _file_status(descriptor_after)
+            or _file_status(descriptor_before) != _file_status(path_after)
+            or first != second
+            or len(first) != descriptor_before.st_size
+        ):
+            self.close()
+            raise _blocked(
+                "collector-unavailable",
+                f"{label} identity, access policy, or content is unsafe",
+            )
+        self.payload = first
+        self.binding = _file_status(descriptor_before)
+        self.sha256 = hashlib.sha256(first).hexdigest()
+        parent.revalidate()
+
+    def revalidate(self) -> None:
+        if self.fd is None:
+            raise self._inconclusive()
+        self.parent.revalidate()
+        try:
+            descriptor_before = os.fstat(self.fd)
+            path_before = os.stat(
+                self.name,
+                dir_fd=self.parent.fd,
+                follow_symlinks=False,
+            )
+            first = _read_fd_payload_bounded(
+                self.fd,
+                label=self.label,
+                limit=self.max_bytes,
+            )
+            second = _read_fd_payload_bounded(
+                self.fd,
+                label=self.label,
+                limit=self.max_bytes,
+            )
+            descriptor_after = os.fstat(self.fd)
+            path_after = os.stat(
+                self.name,
+                dir_fd=self.parent.fd,
+                follow_symlinks=False,
+            )
+        except EnforcementDoctorError:
+            raise self._inconclusive()
+        except OSError as error:
+            raise self._inconclusive() from error
+        if (
+            not stat.S_ISREG(descriptor_before.st_mode)
+            or _file_status(descriptor_before) != self.binding
+            or _file_status(path_before) != self.binding
+            or _file_status(descriptor_after) != self.binding
+            or _file_status(path_after) != self.binding
+            or first != second
+            or hashlib.sha256(first).hexdigest() != self.sha256
+        ):
+            raise self._inconclusive()
+        self.parent.revalidate()
+
+    def _inconclusive(self) -> EnforcementDoctorError:
+        return _blocked(
+            "collector-inconclusive",
+            f"{self.label} identity, access policy, or content changed",
+        )
+
+    def close(self) -> None:
+        if self.fd is not None:
+            try:
+                os.close(self.fd)
+            except OSError:
+                pass
+            self.fd = None
+
+
+def _default_gh_runtime_parent() -> pathlib.Path:
+    try:
+        account = pwd.getpwuid(os.geteuid())
+    except (KeyError, OSError) as error:
+        raise _blocked(
+            "collector-unavailable",
+            "the effective account home directory is unavailable",
+        ) from error
+    home = pathlib.Path(account.pw_dir)
+    if not home.is_absolute() or home == pathlib.Path("/"):
+        raise _blocked(
+            "collector-unavailable",
+            "the effective account home directory is unsafe",
+        )
+    return home.joinpath(*GH_RUNTIME_COMPONENTS)
+
+
+def _validate_config_text(payload: bytes, *, label: str) -> str:
+    try:
+        decoded = payload.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as error:
+        raise _blocked(
+            "collector-unavailable",
+            f"{label} must be strict UTF-8",
+        ) from error
+    if "\r" in decoded:
+        raise _blocked(
+            "collector-unavailable",
+            f"{label} must use canonical LF line endings",
+        )
+    for line in decoded.splitlines():
+        if (
+            "\x00" in line
+            or "\t" in line
+            or len(line.encode("utf-8")) > MAX_GH_CONFIG_LINE_BYTES
+        ):
+            raise _blocked(
+                "collector-unavailable",
+                f"{label} contains an unsafe line",
+            )
+    return decoded
+
+
+def _validate_no_transport_redirects(payload: bytes) -> None:
+    decoded = _validate_config_text(payload, label="GitHub CLI config.yml")
+    for raw_line in decoded.splitlines():
+        stripped = raw_line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        match = re.fullmatch(
+            r"(?:\"([A-Za-z0-9_.-]+)\"|'([A-Za-z0-9_.-]+)'|"
+            r"([A-Za-z0-9_.-]+))\s*:\s*(.*)",
+            stripped,
+        )
+        if match is None:
+            continue
+        key = next(value for value in match.groups()[:3] if value is not None).lower()
+        if key not in GH_TRANSPORT_REDIRECT_KEYS:
+            continue
+        value = match.group(4).split(" #", 1)[0].strip()
+        if value not in ("", "''", '""', "~", "null"):
+            raise _blocked(
+                "collector-unavailable",
+                f"GitHub CLI transport redirect {key!r} is forbidden",
+            )
+
+
+def _minimal_github_hosts(payload: bytes) -> bytes:
+    decoded = _validate_config_text(payload, label="GitHub CLI hosts.yml")
+    github_sections = 0
+    in_github = False
+    github_lines: list[tuple[int, str]] = []
+    for raw_line in decoded.splitlines():
+        stripped = raw_line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        indent = len(raw_line) - len(raw_line.lstrip(" "))
+        if indent == 0:
+            root = re.fullmatch(r"([A-Za-z0-9.-]+):", stripped)
+            if root is None:
+                raise _blocked(
+                    "collector-unavailable",
+                    "GitHub CLI hosts.yml has an unsupported root entry",
+                )
+            in_github = root.group(1) == API_HOST
+            if in_github:
+                github_sections += 1
+            continue
+        if in_github:
+            github_lines.append((indent, stripped))
+    if github_sections != 1:
+        raise _blocked(
+            "collector-unavailable",
+            "GitHub CLI hosts.yml must contain one exact github.com entry",
+        )
+
+    host_values: dict[str, str] = {}
+    users: dict[str, Optional[str]] = {}
+    current_section = ""
+    current_user = ""
+    saw_users = False
+    for indent, stripped in github_lines:
+        entry = re.fullmatch(r"([A-Za-z0-9_.-]+):(?: (.*))?", stripped)
+        if entry is None:
+            raise _blocked(
+                "collector-unavailable",
+                "GitHub CLI github.com config is not a simple mapping",
+            )
+        key = entry.group(1)
+        value = entry.group(2) or ""
+        if indent == 4:
+            current_user = ""
+            if key == "users":
+                if value:
+                    raise _blocked(
+                        "collector-unavailable",
+                        "GitHub CLI users entry must be a mapping",
+                    )
+                if saw_users:
+                    raise _blocked(
+                        "collector-unavailable",
+                        "GitHub CLI users entry is duplicated",
+                    )
+                saw_users = True
+                current_section = "users"
+                continue
+            current_section = ""
+            if key not in ("git_protocol", "oauth_token", "user"):
+                raise _blocked(
+                    "collector-unavailable",
+                    f"GitHub CLI github.com key {key!r} is not admitted",
+                )
+            if key in host_values or not value:
+                raise _blocked(
+                    "collector-unavailable",
+                    f"GitHub CLI github.com key {key!r} is invalid",
+                )
+            host_values[key] = value
+            continue
+        if indent == 8 and current_section == "users":
+            if value or not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})", key):
+                raise _blocked(
+                    "collector-unavailable",
+                    "GitHub CLI user entry is invalid",
+                )
+            if key in users:
+                raise _blocked(
+                    "collector-unavailable",
+                    "GitHub CLI user entry is duplicated",
+                )
+            users[key] = None
+            current_user = key
+            continue
+        if (
+            indent == 12
+            and current_section == "users"
+            and current_user
+            and key == "oauth_token"
+            and value
+            and users[current_user] is None
+        ):
+            users[current_user] = value
+            continue
+        raise _blocked(
+            "collector-unavailable",
+            "GitHub CLI github.com config has an unsupported shape",
+        )
+
+    active_user = host_values.get("user", "")
+    if re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})", active_user) is None:
+        raise _blocked(
+            "collector-unavailable",
+            "GitHub CLI active github.com user is invalid",
+        )
+    protocol = host_values.get("git_protocol", "https")
+    if protocol not in ("https", "ssh"):
+        raise _blocked(
+            "collector-unavailable",
+            "GitHub CLI github.com git protocol is invalid",
+        )
+    root_token = host_values.get("oauth_token")
+    nested_token = users.get(active_user)
+    if active_user not in users and root_token is None:
+        raise _blocked(
+            "collector-unavailable",
+            "GitHub CLI active github.com user has no bounded authentication slot",
+        )
+    if (
+        root_token is not None
+        and nested_token is not None
+        and root_token != nested_token
+    ):
+        raise _blocked(
+            "collector-unavailable",
+            "GitHub CLI active github.com token slots disagree",
+        )
+    active_token = root_token or nested_token
+    if (
+        active_token is not None
+        and re.fullmatch(
+            r"[A-Za-z0-9_.-]{1,2048}",
+            active_token,
+        )
+        is None
+    ):
+        raise _blocked(
+            "collector-unavailable",
+            "GitHub CLI active github.com token is not a safe scalar",
+        )
+    output = [
+        f"{API_HOST}:\n",
+        f"    git_protocol: {protocol}\n",
+        "    users:\n",
+        f"        {active_user}:\n",
+    ]
+    if active_token is not None:
+        output.append(f"            oauth_token: {active_token}\n")
+    output.append(f"    user: {active_user}\n")
+    if active_token is not None:
+        output.append(f"    oauth_token: {active_token}\n")
+    return "".join(output).encode("utf-8")
+
+
+def _create_private_child_directory(
+    parent: _BoundDirectory,
+    name: str,
+    *,
+    label: str,
+) -> _BoundDirectory:
+    if (
+        not name
+        or "/" in name
+        or name in (".", "..")
+        or not hasattr(os, "O_DIRECTORY")
+        or not hasattr(os, "O_NOFOLLOW")
+        or not hasattr(os, "O_NONBLOCK")
+    ):
+        raise _blocked(
+            "collector-unavailable",
+            f"{label} component is invalid",
+        )
+    parent.revalidate()
+    try:
+        os.mkdir(name, 0o700, dir_fd=parent.fd)
+        flags = (
+            os.O_RDONLY
+            | os.O_DIRECTORY
+            | os.O_NOFOLLOW
+            | os.O_NONBLOCK
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+        child_fd = os.open(name, flags, dir_fd=parent.fd)
+        try:
+            descriptor = os.fstat(child_fd)
+            path_status = os.stat(
+                name,
+                dir_fd=parent.fd,
+                follow_symlinks=False,
+            )
+            if (
+                not stat.S_ISDIR(descriptor.st_mode)
+                or descriptor.st_uid != os.geteuid()
+                or stat.S_IMODE(descriptor.st_mode) & 0o077
+                or _directory_status(descriptor) != _directory_status(path_status)
+            ):
+                raise _blocked(
+                    "collector-unavailable",
+                    f"{label} initial object is unsafe",
+                )
+            os.fchmod(child_fd, 0o700)
+            descriptor = os.fstat(child_fd)
+            path_status = os.stat(
+                name,
+                dir_fd=parent.fd,
+                follow_symlinks=False,
+            )
+            if (
+                _directory_status(descriptor) != _directory_status(path_status)
+                or stat.S_IMODE(descriptor.st_mode) != 0o700
+            ):
+                raise _blocked(
+                    "collector-unavailable",
+                    f"{label} access policy could not be fixed",
+                )
+        finally:
+            os.close(child_fd)
+    except FileExistsError as error:
+        raise _blocked(
+            "collector-unavailable",
+            f"{label} already exists",
+        ) from error
+    except EnforcementDoctorError:
+        raise
+    except OSError as error:
+        raise _blocked(
+            "collector-unavailable",
+            f"{label} could not be created safely",
+        ) from error
+    parent.revalidate()
+    try:
+        return _BoundDirectory(parent.path / name, label=label)
+    except BaseException:
+        try:
+            os.rmdir(name, dir_fd=parent.fd)
+        except OSError:
+            pass
+        raise
+
+
+def _create_private_regular_file(
+    parent: _BoundDirectory,
+    name: str,
+    payload: bytes,
+    *,
+    label: str,
+    mode: int,
+    max_bytes: int,
+) -> _BoundRegularFile:
+    if len(payload) > max_bytes:
+        raise _blocked(
+            "collector-unavailable",
+            f"{label} exceeds its byte ceiling",
+        )
+    parent.revalidate()
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | os.O_NOFOLLOW
+        | os.O_NONBLOCK
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    fd: Optional[int] = None
+    try:
+        fd = os.open(name, flags, mode, dir_fd=parent.fd)
+        descriptor = os.fstat(fd)
+        path_status = os.stat(
+            name,
+            dir_fd=parent.fd,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISREG(descriptor.st_mode)
+            or descriptor.st_uid != os.geteuid()
+            or descriptor.st_nlink != 1
+            or stat.S_IMODE(descriptor.st_mode) & 0o077
+            or _file_status(descriptor) != _file_status(path_status)
+        ):
+            raise _blocked(
+                "collector-unavailable",
+                f"{label} initial object is unsafe",
+            )
+        _write_all(fd, payload)
+        os.fchmod(fd, mode)
+        os.fsync(fd)
+        descriptor = os.fstat(fd)
+        path_status = os.stat(
+            name,
+            dir_fd=parent.fd,
+            follow_symlinks=False,
+        )
+        if (
+            _file_status(descriptor) != _file_status(path_status)
+            or descriptor.st_size != len(payload)
+            or stat.S_IMODE(descriptor.st_mode) != mode
+        ):
+            raise _blocked(
+                "collector-unavailable",
+                f"{label} could not be bound after creation",
+            )
+    except EnforcementDoctorError:
+        raise
+    except OSError as error:
+        raise _blocked(
+            "collector-unavailable",
+            f"{label} could not be created safely",
+        ) from error
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+    parent.revalidate()
+    return _BoundRegularFile(
+        parent,
+        name,
+        label=label,
+        max_bytes=max_bytes,
+    )
+
+
 def _write_all(fd: int, payload: bytes) -> None:
     offset = 0
     while offset < len(payload):
@@ -855,12 +1690,24 @@ class GitHubApiClient:
         gh_executable: pathlib.Path,
         expected_gh_sha256: str,
         gh_config_dir: pathlib.Path,
+        *,
+        runtime_parent: Optional[pathlib.Path] = None,
     ) -> None:
-        self._temporary_directory: Optional[tempfile.TemporaryDirectory[str]] = None
+        self._runtime_parent: Optional[_BoundDirectory] = None
+        self._run_directory: Optional[_BoundDirectory] = None
+        self._executable_snapshot_directory: Optional[_BoundDirectory] = None
+        self._config_snapshot_directory: Optional[_BoundDirectory] = None
+        self._source_config_directory: Optional[_BoundDirectory] = None
+        self._source_hosts_file: Optional[_BoundRegularFile] = None
+        self._source_global_config_file: Optional[_BoundRegularFile] = None
+        self._snapshot_hosts_file: Optional[_BoundRegularFile] = None
+        self._snapshot_global_config_file: Optional[_BoundRegularFile] = None
         self._source_fd: Optional[int] = None
         self._snapshot_fd: Optional[int] = None
         self._closed = False
         self._pinned = False
+        self._run_name = ""
+        self._execution_cwd = ""
         self.executable = ""
         self.executable_sha256 = expected_gh_sha256
         self.execution_source = GH_EXECUTION_SOURCE
@@ -872,9 +1719,29 @@ class GitHubApiClient:
                 "collector-unavailable",
                 "expected GitHub CLI SHA-256 is invalid",
             )
-        self._environment = self._build_environment(gh_config_dir)
         try:
+            selected_runtime_parent = runtime_parent or _default_gh_runtime_parent()
+            self._runtime_parent = _BoundDirectory(
+                selected_runtime_parent,
+                label="GitHub CLI fixed runtime parent",
+                create_final=True,
+            )
+            self._create_run_directory()
+            self._snapshot_configuration(gh_config_dir)
+            if self._run_directory is None:
+                raise _blocked(
+                    "collector-unavailable",
+                    "GitHub CLI private run directory is unavailable",
+                )
+            self._executable_snapshot_directory = _create_private_child_directory(
+                self._run_directory,
+                "bin",
+                label="GitHub CLI private executable snapshot directory",
+            )
             self._pin_executable(gh_executable, expected_gh_sha256)
+            self._config_snapshot_directory.set_owner_mode(0o500)
+            self._executable_snapshot_directory.set_owner_mode(0o500)
+            self._revalidate_snapshot()
         except BaseException:
             self._cleanup_noexcept()
             raise
@@ -882,30 +1749,113 @@ class GitHubApiClient:
         self.total_bytes = 0
         self.deadline = time.monotonic() + MAX_COLLECTION_SECONDS
 
-    @staticmethod
-    def _build_environment(gh_config_dir: pathlib.Path) -> dict[str, str]:
+    def _create_run_directory(self) -> None:
+        if self._runtime_parent is None:
+            raise _blocked(
+                "collector-unavailable",
+                "GitHub CLI fixed runtime parent is unavailable",
+            )
+        for _ in range(64):
+            run_name = f"run-{os.getpid()}-{secrets.token_hex(16)}"
+            try:
+                run_directory = _create_private_child_directory(
+                    self._runtime_parent,
+                    run_name,
+                    label="GitHub CLI private run directory",
+                )
+            except EnforcementDoctorError as error:
+                if (
+                    error.reason_code == "collector-unavailable"
+                    and str(error) == "GitHub CLI private run directory already exists"
+                ):
+                    continue
+                raise
+            self._run_name = run_name
+            self._run_directory = run_directory
+            self._execution_cwd = os.fspath(run_directory.path)
+            return
+        raise _blocked(
+            "collector-unavailable",
+            "GitHub CLI private run name collision limit was reached",
+        )
+
+    def _snapshot_configuration(self, gh_config_dir: pathlib.Path) -> None:
         if not gh_config_dir.is_absolute():
             raise _blocked(
                 "collector-unavailable",
                 "GitHub CLI config directory must be an absolute path",
             )
+        self._source_config_directory = _BoundDirectory(
+            gh_config_dir,
+            label="GitHub CLI source config directory",
+        )
+        self._source_hosts_file = _BoundRegularFile(
+            self._source_config_directory,
+            "hosts.yml",
+            label="GitHub CLI source hosts.yml",
+            max_bytes=MAX_GH_CONFIG_BYTES,
+        )
         try:
-            config_status = os.stat(gh_config_dir)
+            os.stat(
+                "config.yml",
+                dir_fd=self._source_config_directory.fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            self._source_global_config_file = None
         except OSError as error:
             raise _blocked(
                 "collector-unavailable",
-                "GitHub CLI config directory is unavailable",
+                "GitHub CLI source config.yml cannot be inspected safely",
             ) from error
-        if not stat.S_ISDIR(config_status.st_mode):
+        else:
+            self._source_global_config_file = _BoundRegularFile(
+                self._source_config_directory,
+                "config.yml",
+                label="GitHub CLI source config.yml",
+                max_bytes=MAX_GH_CONFIG_BYTES,
+            )
+            _validate_no_transport_redirects(self._source_global_config_file.payload)
+        minimal_hosts = _minimal_github_hosts(self._source_hosts_file.payload)
+        self._source_hosts_file.payload = b""
+        if self._source_global_config_file is not None:
+            self._source_global_config_file.payload = b""
+        if self._run_directory is None:
             raise _blocked(
                 "collector-unavailable",
-                "GitHub CLI config path must be an existing directory",
+                "GitHub CLI private run directory is unavailable",
             )
-        # Authentication is deliberately limited to the caller-selected gh config
-        # directory. No ambient HOME, token, loader, proxy, CA, PATH, or other GH_*
-        # variables are inherited by the collector subprocess.
-        return {
-            "GH_CONFIG_DIR": os.fspath(gh_config_dir),
+        self._config_snapshot_directory = _create_private_child_directory(
+            self._run_directory,
+            "config",
+            label="GitHub CLI private config snapshot directory",
+        )
+        self._snapshot_hosts_file = _create_private_regular_file(
+            self._config_snapshot_directory,
+            "hosts.yml",
+            minimal_hosts,
+            label="GitHub CLI private hosts.yml snapshot",
+            mode=0o400,
+            max_bytes=MAX_GH_CONFIG_BYTES,
+        )
+        self._snapshot_global_config_file = _create_private_regular_file(
+            self._config_snapshot_directory,
+            "config.yml",
+            GH_SNAPSHOT_CONFIG,
+            label="GitHub CLI private config.yml snapshot",
+            mode=0o400,
+            max_bytes=MAX_GH_CONFIG_BYTES,
+        )
+        self._snapshot_hosts_file.payload = b""
+        self._snapshot_global_config_file.payload = b""
+        self.config_snapshot_sha256 = hashlib.sha256(
+            b"hosts.yml\0" + minimal_hosts + b"\0config.yml\0" + GH_SNAPSHOT_CONFIG
+        ).hexdigest()
+        # Authentication is deliberately limited to the controlled minimal
+        # snapshot. No ambient HOME, TMPDIR, token, loader, proxy, CA, PATH, or
+        # other GH_* variables are inherited by the collector subprocess.
+        self._environment = {
+            "GH_CONFIG_DIR": os.fspath(self._config_snapshot_directory.path),
             "GH_NO_UPDATE_NOTIFIER": "1",
             "GH_PROMPT_DISABLED": "1",
             "LC_ALL": "C",
@@ -975,40 +1925,49 @@ class GitHubApiClient:
         gh_executable: pathlib.Path,
         expected_gh_sha256: str,
     ) -> None:
+        if self._executable_snapshot_directory is None:
+            raise _blocked(
+                "collector-unavailable",
+                "GitHub CLI private executable snapshot directory is unavailable",
+            )
         source_fd: Optional[int]
         source_fd, source_before = self._initial_source_status(gh_executable)
         snapshot_write_fd: Optional[int] = None
         try:
-            self._temporary_directory = tempfile.TemporaryDirectory(
-                prefix="codex-gh-snapshot-"
-            )
-            directory_path = pathlib.Path(self._temporary_directory.name)
-            directory_status = os.lstat(directory_path)
-            if (
-                not stat.S_ISDIR(directory_status.st_mode)
-                or stat.S_IMODE(directory_status.st_mode) != 0o700
-                or directory_status.st_uid != os.geteuid()
-            ):
-                raise _blocked(
-                    "collector-unavailable",
-                    "GitHub CLI snapshot directory is not owner-private",
-                )
-            self._directory_binding = {
-                "device": directory_status.st_dev,
-                "gid": directory_status.st_gid,
-                "inode": directory_status.st_ino,
-                "mode": stat.S_IMODE(directory_status.st_mode),
-                "uid": directory_status.st_uid,
-            }
-            snapshot_path = directory_path / "gh"
+            self._executable_snapshot_directory.revalidate()
+            snapshot_path = self._executable_snapshot_directory.path / "gh"
             flags = (
                 os.O_WRONLY
                 | os.O_CREAT
                 | os.O_EXCL
                 | os.O_NOFOLLOW
+                | os.O_NONBLOCK
                 | getattr(os, "O_CLOEXEC", 0)
             )
-            snapshot_write_fd = os.open(snapshot_path, flags, 0o500)
+            snapshot_write_fd = os.open(
+                "gh",
+                flags,
+                0o500,
+                dir_fd=self._executable_snapshot_directory.fd,
+            )
+            initial_snapshot_descriptor = os.fstat(snapshot_write_fd)
+            initial_snapshot_path = os.stat(
+                "gh",
+                dir_fd=self._executable_snapshot_directory.fd,
+                follow_symlinks=False,
+            )
+            if (
+                not stat.S_ISREG(initial_snapshot_descriptor.st_mode)
+                or initial_snapshot_descriptor.st_uid != os.geteuid()
+                or initial_snapshot_descriptor.st_nlink != 1
+                or stat.S_IMODE(initial_snapshot_descriptor.st_mode) & 0o077
+                or _file_status(initial_snapshot_descriptor)
+                != _file_status(initial_snapshot_path)
+            ):
+                raise _blocked(
+                    "collector-unavailable",
+                    "GitHub CLI executable snapshot initial object is unsafe",
+                )
             digest = hashlib.sha256()
             copied = 0
             while True:
@@ -1060,6 +2019,7 @@ class GitHubApiClient:
                 "device": source_after.st_dev,
                 "gid": source_after.st_gid,
                 "inode": source_after.st_ino,
+                "links": source_after.st_nlink,
                 "mode": stat.S_IMODE(source_after.st_mode),
                 "sha256": actual_sha256,
                 "size": source_after.st_size,
@@ -1068,11 +2028,18 @@ class GitHubApiClient:
             os.fchmod(snapshot_write_fd, 0o500)
             os.fsync(snapshot_write_fd)
             snapshot_status = os.fstat(snapshot_write_fd)
+            snapshot_path_status = os.stat(
+                "gh",
+                dir_fd=self._executable_snapshot_directory.fd,
+                follow_symlinks=False,
+            )
             if (
                 not stat.S_ISREG(snapshot_status.st_mode)
                 or snapshot_status.st_size != copied
                 or snapshot_status.st_uid != os.geteuid()
+                or snapshot_status.st_nlink != 1
                 or stat.S_IMODE(snapshot_status.st_mode) != 0o500
+                or _file_status(snapshot_status) != _file_status(snapshot_path_status)
             ):
                 raise _blocked(
                     "collector-unavailable",
@@ -1081,8 +2048,12 @@ class GitHubApiClient:
             os.close(snapshot_write_fd)
             snapshot_write_fd = None
             self._snapshot_fd = os.open(
-                snapshot_path,
-                os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+                "gh",
+                os.O_RDONLY
+                | os.O_NOFOLLOW
+                | os.O_NONBLOCK
+                | getattr(os, "O_CLOEXEC", 0),
+                dir_fd=self._executable_snapshot_directory.fd,
             )
             pinned_status = os.fstat(self._snapshot_fd)
             self._snapshot_path = snapshot_path
@@ -1090,6 +2061,7 @@ class GitHubApiClient:
                 "device": pinned_status.st_dev,
                 "gid": pinned_status.st_gid,
                 "inode": pinned_status.st_ino,
+                "links": pinned_status.st_nlink,
                 "mode": stat.S_IMODE(pinned_status.st_mode),
                 "sha256": actual_sha256,
                 "size": pinned_status.st_size,
@@ -1099,6 +2071,7 @@ class GitHubApiClient:
             self._source_fd = source_fd
             source_fd = None
             self._pinned = True
+            self._executable_snapshot_directory.revalidate()
             self._revalidate_snapshot()
         except EnforcementDoctorError:
             raise
@@ -1129,17 +2102,27 @@ class GitHubApiClient:
             or self._source_fd is None
             or self._snapshot_fd is None
             or not self.executable
+            or self._runtime_parent is None
+            or self._run_directory is None
+            or self._executable_snapshot_directory is None
+            or self._config_snapshot_directory is None
+            or self._source_config_directory is None
+            or self._source_hosts_file is None
+            or self._snapshot_hosts_file is None
+            or self._snapshot_global_config_file is None
         ):
             raise self._collector_inconclusive()
         try:
-            directory_status = os.lstat(self._snapshot_path.parent)
-            directory_current = {
-                "device": directory_status.st_dev,
-                "gid": directory_status.st_gid,
-                "inode": directory_status.st_ino,
-                "mode": stat.S_IMODE(directory_status.st_mode),
-                "uid": directory_status.st_uid,
-            }
+            self._runtime_parent.revalidate()
+            self._run_directory.revalidate()
+            self._executable_snapshot_directory.revalidate()
+            self._config_snapshot_directory.revalidate()
+            self._source_config_directory.revalidate()
+            self._source_hosts_file.revalidate()
+            if self._source_global_config_file is not None:
+                self._source_global_config_file.revalidate()
+            self._snapshot_hosts_file.revalidate()
+            self._snapshot_global_config_file.revalidate()
             source_descriptor_before = os.fstat(self._source_fd)
             source_path_before = os.lstat(self._source_path)
             source_digest, source_retained = _sha256_fd_bounded(self._source_fd)
@@ -1153,16 +2136,6 @@ class GitHubApiClient:
         except (OSError, ValueError):
             raise self._collector_inconclusive()
 
-        def file_status(status_value: os.stat_result) -> dict[str, int]:
-            return {
-                "device": status_value.st_dev,
-                "gid": status_value.st_gid,
-                "inode": status_value.st_ino,
-                "mode": stat.S_IMODE(status_value.st_mode),
-                "size": status_value.st_size,
-                "uid": status_value.st_uid,
-            }
-
         source_expected = {
             key: value for key, value in self._source_binding.items() if key != "sha256"
         }
@@ -1172,26 +2145,24 @@ class GitHubApiClient:
             if key != "sha256"
         }
         if (
-            not stat.S_ISDIR(directory_status.st_mode)
-            or directory_current != self._directory_binding
-            or not stat.S_ISREG(source_descriptor_before.st_mode)
+            not stat.S_ISREG(source_descriptor_before.st_mode)
             or not stat.S_ISREG(source_path_before.st_mode)
             or not stat.S_ISREG(source_descriptor_after.st_mode)
             or not stat.S_ISREG(source_path_after.st_mode)
-            or file_status(source_descriptor_before) != source_expected
-            or file_status(source_path_before) != source_expected
-            or file_status(source_descriptor_after) != source_expected
-            or file_status(source_path_after) != source_expected
+            or _file_status(source_descriptor_before) != source_expected
+            or _file_status(source_path_before) != source_expected
+            or _file_status(source_descriptor_after) != source_expected
+            or _file_status(source_path_after) != source_expected
             or source_retained != self._source_binding["size"]
             or source_digest != self._source_binding["sha256"]
             or not stat.S_ISREG(snapshot_descriptor_before.st_mode)
             or not stat.S_ISREG(snapshot_path_before.st_mode)
             or not stat.S_ISREG(snapshot_descriptor_after.st_mode)
             or not stat.S_ISREG(snapshot_path_after.st_mode)
-            or file_status(snapshot_descriptor_before) != snapshot_expected
-            or file_status(snapshot_path_before) != snapshot_expected
-            or file_status(snapshot_descriptor_after) != snapshot_expected
-            or file_status(snapshot_path_after) != snapshot_expected
+            or _file_status(snapshot_descriptor_before) != snapshot_expected
+            or _file_status(snapshot_path_before) != snapshot_expected
+            or _file_status(snapshot_descriptor_after) != snapshot_expected
+            or _file_status(snapshot_path_after) != snapshot_expected
             or snapshot_retained != self._snapshot_binding["size"]
             or snapshot_digest != self._snapshot_binding["sha256"]
         ):
@@ -1204,6 +2175,14 @@ class GitHubApiClient:
         if self._closed:
             return
         self._closed = True
+        for bound_file in (
+            self._source_hosts_file,
+            self._source_global_config_file,
+            self._snapshot_hosts_file,
+            self._snapshot_global_config_file,
+        ):
+            if bound_file is not None:
+                bound_file.close()
         if self._source_fd is not None:
             try:
                 os.close(self._source_fd)
@@ -1214,14 +2193,61 @@ class GitHubApiClient:
                 os.close(self._snapshot_fd)
             finally:
                 self._snapshot_fd = None
-        if self._temporary_directory is not None:
-            self._temporary_directory.cleanup()
-            self._temporary_directory = None
+        if self._config_snapshot_directory is not None:
+            try:
+                os.fchmod(self._config_snapshot_directory.fd, 0o700)
+            except OSError:
+                pass
+            for name in ("hosts.yml", "config.yml"):
+                try:
+                    os.unlink(name, dir_fd=self._config_snapshot_directory.fd)
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    pass
+            self._config_snapshot_directory.close()
+            self._config_snapshot_directory = None
+        if self._source_config_directory is not None:
+            self._source_config_directory.close()
+            self._source_config_directory = None
+        if self._executable_snapshot_directory is not None:
+            try:
+                os.fchmod(self._executable_snapshot_directory.fd, 0o700)
+            except OSError:
+                pass
+            try:
+                os.unlink("gh", dir_fd=self._executable_snapshot_directory.fd)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
+            self._executable_snapshot_directory.close()
+            self._executable_snapshot_directory = None
+        if self._run_directory is not None:
+            for name in ("config", "bin"):
+                try:
+                    os.rmdir(name, dir_fd=self._run_directory.fd)
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    pass
+            self._run_directory.close()
+            self._run_directory = None
+        if self._runtime_parent is not None and self._run_name:
+            try:
+                os.rmdir(self._run_name, dir_fd=self._runtime_parent.fd)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
+        if self._runtime_parent is not None:
+            self._runtime_parent.close()
+            self._runtime_parent = None
 
     def _cleanup_noexcept(self) -> None:
         try:
             self.close()
-        except OSError:
+        except BaseException:
             pass
 
     def __enter__(self) -> GitHubApiClient:
@@ -1271,7 +2297,7 @@ class GitHubApiClient:
             process_result = _bounded_subprocess(
                 command,
                 environment=dict(self._environment),
-                execution_cwd=self._temporary_directory.name,
+                execution_cwd=self._execution_cwd,
                 endpoint_class=endpoint_class,
                 timeout_seconds=max(1, min(MAX_API_SECONDS, int(remaining))),
                 stdout_limit=stdout_limit,
@@ -1332,7 +2358,13 @@ class GitHubApiClient:
         endpoint: str,
         parameters: Optional[dict[str, object]] = None,
     ) -> object:
-        if not endpoint.startswith("/") or "?" in endpoint or "#" in endpoint:
+        if (
+            re.fullmatch(r"/[A-Za-z0-9._~/-]+", endpoint) is None
+            or endpoint.startswith("//")
+            or "//" in endpoint
+            or "/../" in f"{endpoint}/"
+            or "/./" in f"{endpoint}/"
+        ):
             raise _blocked("invalid-api-endpoint", "collector endpoint is not fixed")
         command = [
             self.executable,

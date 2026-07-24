@@ -314,16 +314,42 @@ Before retirement, run `scripts/doctor_cisco_cutover_enforcement.py` in the
 trusted administrator environment. It deliberately accepts no `--evidence`
 file and does not trust caller-supplied pagination or completeness booleans.
 The administrator must supply an absolute, non-symlink `gh` executable path,
-its independently pinned SHA-256, and an explicit absolute `GH_CONFIG_DIR`.
-The doctor opens the source executable with no-follow semantics, copies the
-digest-matched bytes to an owner-private executable snapshot, and invokes only
-that snapshot. Every invocation uses only `LC_ALL=C`, `GH_PROMPT_DISABLED=1`,
-`GH_NO_UPDATE_NOTIFIER=1`, and the explicit `GH_CONFIG_DIR`; ambient `PATH`,
-`HOME`, token, loader, proxy, CA, and other `GH_*` variables are absent. The
-source path/descriptor and snapshot path/descriptor, content digest, size,
-owner, group, and mode are revalidated before and after every invocation and
-once more before any admission. Replacement or mutation after pinning discards
-the command output and returns `collector-inconclusive`.
+its independently pinned SHA-256, and an explicit absolute owner-private
+`GH_CONFIG_DIR`. That directory must be mode `0700`; `hosts.yml` and an
+optional `config.yml` must be single-link, owner-only regular files. Every
+component from `/` to the selected directory is opened with no-follow
+semantics, retained by descriptor, and required to have an owner and write
+policy that prevents another principal from renaming its child.
+
+The doctor ignores ambient `HOME` and `TMPDIR`. It derives the fixed runtime
+parent `~/.codex/cisco-cutover-doctor` from the effective account database,
+opens and retains every component with the same namespace checks, and creates
+a unique `0700` run directory below it. It copies the digest-matched executable
+into a dedicated private `bin` directory and changes that directory to `0500`
+before any command. This protected namespace is the macOS-compatible
+non-ABA execution binding: an untrusted principal cannot replace the executable
+between validation and `exec`. Another process with the same effective UID is
+the same filesystem security principal; deliberate same-UID interference is
+still detected by the before/after identity and digest checks, but is not
+claimed as a separate OS isolation boundary.
+
+The source `hosts.yml` parser admits only the simple `github.com` authentication
+mapping, retains only its active user, and excludes every other host and
+credential. A fresh `config.yml` is generated with prompting disabled and an
+empty `http_unix_socket`; source `http_unix_socket`, proxy, socket, API host,
+base URL, endpoint, and transport overrides are rejected rather than copied.
+The generated files are `0400` and their configuration directory becomes
+`0500` before execution. Every invocation
+uses only `LC_ALL=C`, `GH_PROMPT_DISABLED=1`,
+`GH_NO_UPDATE_NOTIFIER=1`, and the generated snapshot `GH_CONFIG_DIR`; ambient
+`PATH`, `HOME`, `TMPDIR`, token, loader, proxy, CA, and other `GH_*` variables
+are absent. API commands use only relative endpoints plus exact
+`--hostname github.com`, so the snapshot supplies no authentication source for
+a non-GitHub host. The source executable/config and snapshot
+path/descriptor identities, content digests, sizes, owners, groups, links, and
+modes are revalidated before and after every invocation and once more before
+any admission. Replacement or mutation after pinning discards the command
+output and returns `collector-inconclusive`.
 The same process:
 
 - runs `gh auth status --hostname github.com` without printing its output, then

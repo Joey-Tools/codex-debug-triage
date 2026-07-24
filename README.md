@@ -63,10 +63,17 @@ then pass merge readiness. None of those live mutations is automatic.
 `scripts/doctor_cisco_cutover_enforcement.py` accepts no caller-produced
 evidence file. It performs an authenticated, read-only `github.com` preflight
 with an absolute administrator-pinned `gh` executable and SHA-256, an explicit
-absolute `GH_CONFIG_DIR`, an owner-private executable snapshot, and a minimal
-environment that inherits no ambient `PATH`, token, loader, proxy, or CA
-variables. It revalidates the source and snapshot identities, access policy,
-and content before and after each invocation and before admission. It collects
+absolute owner-private `GH_CONFIG_DIR`, owner-private executable and
+configuration snapshots, and a minimal environment that inherits no ambient
+`PATH`, `HOME`, `TMPDIR`, token, loader, proxy, or CA variables. The runtime
+root is the fixed system-account path
+`~/.codex/cisco-cutover-doctor`, not an environment-selected temporary
+directory. Every path component is opened without following symlinks and kept
+descriptor-bound; ancestors must not be renameable by another principal.
+Only the active `github.com` authentication entry enters the generated
+configuration snapshot, whose global config contains no transport redirect.
+Source and snapshot identities, access policy, and content are revalidated
+before and after each invocation and before admission. It collects
 every API page through an explicit empty terminal page,
 and revalidates the protected snapshot before admitting the selector, pinned
 ruleset, workflow, PR head, administrator-pinned exact run ID/attempt, job, and
