@@ -22,15 +22,22 @@ merge places it on the protected base. Its job name is not an enforcement
 identity: another GitHub Actions workflow can emit the same
 `cisco-cutover-admission` context.
 
-Retirement additionally requires an active, bypass-free GitHub ruleset
-`workflows` rule bound to repository ID `1242512092`, the exact workflow path,
-`refs/heads/master`, and an administrator-pinned base commit SHA. A
-`required_status_checks` rule with the same context is explicitly insufficient.
-Run `scripts/doctor_cisco_cutover_enforcement.py` against complete,
-authenticated API evidence to verify the pinned ruleset ID, workflow ID,
-workflow source identity, and successful trusted run for the frozen candidate.
-Until that doctor returns `classification=admitted`, retirement remains
-`blocked_until_trusted` and the Jenkins entrypoint stays installed.
+Retirement additionally requires an active, bypass-free organization ruleset
+(`source_type=Organization`, organization ID `283943935`) whose conditions
+target only repository ID `1242512092` and `~DEFAULT_BRANCH`. Its `workflows`
+rule binds the source workflow repository ID, exact workflow path,
+`refs/heads/master`, and an administrator-pinned source commit SHA. The
+workflow `repository_id` identifies the source workflow repository; it is not
+the ruleset target condition. A `required_status_checks` rule with the same
+context is explicitly insufficient.
+
+`scripts/doctor_cisco_cutover_enforcement.py` accepts no caller-produced
+evidence file. It performs an authenticated, read-only `github.com` preflight
+with `gh`, collects every API page through an explicit empty terminal page,
+and revalidates the protected snapshot before admitting the pinned ruleset,
+workflow, PR head, run attempt, job, and check run. Until it returns
+`classification=admitted`, retirement remains `blocked_until_trusted` and the
+Jenkins entrypoint stays installed.
 
 ## Test
 

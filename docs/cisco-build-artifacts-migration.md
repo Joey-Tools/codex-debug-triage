@@ -165,19 +165,24 @@ and service-authored pull-request head SHA before validating the receipt. It
 exposes no secret or token to a candidate process because there is no candidate
 process. Exit 0 with `classification=admitted` is its only green outcome.
 
-The enforcement boundary is an active GitHub ruleset rule with
-`type=workflows`, not a named status context. The exact rule must:
+The enforcement boundary is an active organization-level GitHub ruleset rule
+with `source_type=Organization` and `type=workflows`, not a repository-level
+ruleset or named status context. The exact rule must:
 
-- target only the repository's default branch
+- bind organization ID `283943935` and login `Joey-Tools`
+- use an exact `repository_id.repository_ids=[1242512092]` target condition
+  plus `ref_name.include=["~DEFAULT_BRANCH"]`, with no exclusions; the workflow
+  binding's `repository_id` is the source workflow repository and never
+  substitutes for this target condition
 - have no bypass actors and
   `parameters.do_not_enforce_on_create=false`
 - contain exactly one required workflow entry
-- bind repository ID `1242512092`, path
+- bind source workflow repository ID `1242512092`, path
   `.github/workflows/cisco-cutover-admission.yml`,
   ref `refs/heads/master`, and the exact protected-base commit SHA containing
   the reviewed workflow
-- resolve through authenticated workflow metadata to the separately pinned
-  workflow ID in state `active`
+- resolve that source repository through authenticated repository and workflow
+  metadata to the separately pinned workflow ID in state `active`
 
 A branch ref without the exact `sha` is mutable and remains blocked. The SHA
 does not silently follow later edits: an administrator must review a new
@@ -205,35 +210,60 @@ the exact event head SHA, so a valid old receipt and stale repository variable
 cannot admit a different candidate. Missing, empty, recognizable placeholder,
 all-zero, malformed, stale, or mismatched values keep the trusted workflow red.
 
-Before retirement, collect authenticated GitHub API evidence and normalize it
-into the schema consumed by
-`scripts/doctor_cisco_cutover_enforcement.py`. The evidence must contain:
+Before retirement, run `scripts/doctor_cisco_cutover_enforcement.py` in the
+trusted administrator environment. It deliberately accepts no `--evidence`
+file and does not trust caller-supplied pagination or completeness booleans.
+The same process:
 
-- complete target repository metadata: numeric ID, exact full name, default
-  branch, archived state, and disabled state
-- every effective ruleset with its numeric ID, source, enforcement, target,
-  conditions, bypass actors, and full rules
-- exact workflow metadata: workflow ID, repository ID/full name, path, state,
-  protected-base ref, and pinned source SHA
-- the frozen candidate head and one exact trusted workflow run, including run
-  ID/attempt, workflow identity, candidate head, event, status, and conclusion
-- all check runs for that candidate head joined through authenticated
-  Actions job/run metadata to workflow ID, repository ID, path, ref, and SHA
-- all five collection-completeness flags from the machine contract
+- runs `gh auth status --hostname github.com` without printing its output, then
+  reads `/user` to prove the active authenticated API path
+- reads the exact organization, target repository, selected PR, organization
+  ruleset, source workflow repository, workflow metadata, and pinned source
+  commit
+- lists every effective target-repository ruleset with
+  `includes_parents=true`, every check run for both the frozen PR head and the
+  `pull_request_target` base commit with `filter=all`, every workflow run for
+  each selected-PR same-name check-suite ID, and every job for every observed
+  run attempt
+- uses `per_page=100`, continues even after a short non-empty page, and stops
+  only after requesting an explicit empty terminal page; object endpoints and
+  page bounds are recorded in the receipt
+- derives the native PR -> workflow run and attempt -> Actions job -> check-run
+  link from PR objects, run/job IDs and URLs, `job.check_run_url`, check-suite
+  ID, head repository ID, the exact PR head, and the base SHA used by
+  `pull_request_target`
+- binds the GitHub Actions provider app ID/slug, status, conclusion, workflow
+  ID/path, ruleset ref/SHA, source workflow repository ID, and native API URLs;
+  the receipt also preserves GitHub's corresponding HTML URLs
+- collects and validates the protected snapshot twice; organization,
+  repository, PR head/base, ruleset content/scope, workflow source, or
+  same-name execution-lineage changes block admission, while timestamps alone
+  are not treated as object replacement or content mutation
 
-The doctor rejects incomplete pagination, a missing or mutable workflow
-binding, the wrong repository/ruleset/workflow ID, a disabled or evaluating
-ruleset, any bypass actor, or any same-name `required_status_checks` rule. It
-also rejects any `cisco-cutover-admission` check whose joined workflow identity
-differs from the pinned trusted workflow. Therefore a green candidate-authored
-duplicate cannot compensate for a red or absent trusted workflow run.
+The doctor rejects pagination totals that do not match the fully collected
+items, page/call/search caps that prevent proof of exhaustion, a missing or
+mutable workflow binding, the wrong organization/repository/ruleset/workflow
+identity, a disabled or evaluating ruleset, any bypass actor, wrong repository
+or default-branch conditions, or any same-name `required_status_checks` rule.
+It also rejects every current `cisco-cutover-admission` check whose native
+run/job/provider lineage differs from the pinned workflow. Therefore a green
+candidate-authored duplicate cannot compensate for a red or absent trusted
+workflow run.
 
-Invoke the doctor only with administrator-pinned identities:
+The live preflight is read-only. It invokes only `gh auth status` and fixed
+GitHub REST `GET` endpoints; it does not create, update, evaluate, disable, or
+delete a ruleset, rerun a workflow, post a comment, or mutate the PR. The active
+credential needs read access to the repository, Actions, checks, and
+organization ruleset metadata. Authentication, permission, pagination, and
+API-limit failures remain `blocked_until_trusted`.
+
+Invoke the doctor only with administrator-pinned identities and the exact
+existing PR:
 
 ```text
 python3 scripts/doctor_cisco_cutover_enforcement.py \
   --contract docs/cisco-cutover-enforcement-contract.json \
-  --evidence <authenticated-complete-api-evidence.json> \
+  --pull-request-number <existing-pr-number> \
   --expected-ruleset-id <numeric-ruleset-id> \
   --expected-workflow-id <numeric-workflow-id> \
   --expected-workflow-sha <protected-base-40-lowercase-hex> \
@@ -241,12 +271,13 @@ python3 scripts/doctor_cisco_cutover_enforcement.py \
 ```
 
 The admitted doctor receipt has exact fields for the schema/operation,
-contract and evidence SHA-256 digests, candidate head, repository identity,
-ruleset ID, trusted workflow ID/repository ID/path/ref/SHA, trusted workflow run
-ID, and trusted check-run ID. Blocked output includes the same available input
-digests plus `reason_code` and `reason`. The doctor validates exact evidence
-equivalence; it does not authenticate a locally supplied evidence file.
-Collection must therefore come from authenticated GitHub APIs, and no admitted
+contract and collected-evidence SHA-256 digests, collection timestamps and
+page bounds, authenticated account identity, organization/target repository,
+PR number/head repository ID/head SHA, ruleset source/ID, source workflow
+repository ID/name/path/ref/SHA, and the trusted run/attempt/job/check
+IDs, URLs, provider, status, and conclusion. Blocked output includes the
+available digests plus `reason_code` and `reason`. The receipt is an output of
+the live collection transaction, not reusable evidence input, and no admitted
 receipt is stored in this repository.
 
 This workflow cannot protect the pull request that first introduces it:
@@ -258,13 +289,14 @@ ordinary PR-merge sequence is therefore:
    workflow on `master`; a branch containing the workflow is not proof that the
    base owns it.
 2. Confirm the workflow file is present on protected `master`. Record that
-   base commit SHA and the authenticated workflow ID. Create an active,
-   bypass-free `workflows` ruleset with the exact repository/path/ref/SHA
-   binding above, then record its numeric ruleset ID. Do not add a same-name
-   status-only requirement.
-3. Collect complete ruleset/workflow metadata and run the doctor against a
-   real test candidate. Keep blocked until the exact identity-bound rule and
-   successful trusted run are both proved.
+   base commit SHA and the authenticated workflow ID. An organization owner
+   must create an active, bypass-free organization `workflows` ruleset with the
+   exact target repository/default-branch conditions and source
+   repository/path/ref/SHA binding above, then record its numeric ruleset ID.
+   Do not add a same-name status-only requirement.
+3. Run the live read-only doctor against a real test PR. Keep blocked until its
+   fully paginated, twice-stable API snapshot proves both the exact
+   identity-bound rule and successful trusted run/job/check lineage.
 4. Publish and verify the real private overlay, obtain its producer-authored
    receipt, and independently configure the receipt plus all four expectation
    variables. Do not add a fabricated receipt or derive expectations from it.
@@ -280,10 +312,17 @@ This branch restores the Jenkins entrypoint so it can be used only as the
 compatibility/bootstrap change. It cannot install a base-owned workflow or
 configure its own identity-bound ruleset. If it remains described or treated
 as the retirement PR, it must stay draft/blocked until steps 1 through 3 have
-completed in separate protected-base/admin operations. As of the 2026-07-24
-audit, the live repository rulesets contain only status-check and merge rules;
-no `workflows` rule exists. That external administrator action is the rollout
-blocker. Do not weaken or skip it to collapse the merges into one.
+completed in separate protected-base/admin operations. In the 2026-07-24
+read-only preflight, the effective list exposed organization rulesets
+`16590367` and `16585220` plus repository rulesets `16583544` and `16583553`.
+The two readable repository details contain only status-check and merge rules.
+The active credential lacks `admin:org`, so GitHub rejected both organization
+detail reads and no exact organization target/workflow contract could be
+proved. An organization administrator must provide the required read authority
+and install or identify the exact contract-compliant rule; no OAuth scope or
+live ruleset was changed during this audit. That unproved external
+administrator state is the rollout blocker. Do not weaken or skip it to
+collapse the merges into one.
 
 ## Private Command Interface To Preserve
 

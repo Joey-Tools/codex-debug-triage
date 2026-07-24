@@ -45,6 +45,15 @@ assert SPEC is not None
 assert SPEC.loader is not None
 sys.modules[SPEC.name] = MODULE
 SPEC.loader.exec_module(MODULE)
+ENFORCEMENT_SPEC = importlib.util.spec_from_file_location(
+    "doctor_cisco_cutover_enforcement",
+    CUTOVER_ENFORCEMENT_DOCTOR_PATH,
+)
+ENFORCEMENT_MODULE = importlib.util.module_from_spec(ENFORCEMENT_SPEC)
+assert ENFORCEMENT_SPEC is not None
+assert ENFORCEMENT_SPEC.loader is not None
+sys.modules[ENFORCEMENT_SPEC.name] = ENFORCEMENT_MODULE
+ENFORCEMENT_SPEC.loader.exec_module(ENFORCEMENT_MODULE)
 
 
 class ArchiveTriageTests(unittest.TestCase):
@@ -4000,91 +4009,362 @@ class BugTriageDocumentationTests(unittest.TestCase):
         contract = json.loads(
             CUTOVER_ENFORCEMENT_CONTRACT_PATH.read_text(encoding="utf-8")
         )
+        organization = contract["source_organization"]
         repository = contract["target_repository"]
         workflow = contract["required_workflow"]
-        workflow_identity = {
+        repository_api = (
+            f"https://api.github.com/repos/{repository['full_name']}"
+        )
+        pull_request = {
+            "base": {
+                "ref": repository["default_branch"],
+                "repository": {
+                    "full_name": repository["full_name"],
+                    "id": repository["id"],
+                },
+                "sha": "9" * 40,
+            },
+            "head": {
+                "repository": {
+                    "full_name": repository["full_name"],
+                    "id": repository["id"],
+                },
+                "sha": self._canonical_commit,
+            },
+            "html_url": (
+                f"https://github.com/{repository['full_name']}/pull/7"
+            ),
+            "id": 7007,
+            "merged": False,
+            "number": 7,
+            "state": "open",
+            "url": f"{repository_api}/pulls/7",
+        }
+        pull_request_link = {
+            "base": {
+                "ref": repository["default_branch"],
+                "repository_id": repository["id"],
+                "sha": "9" * 40,
+            },
+            "head": {
+                "repository_id": repository["id"],
+                "sha": self._canonical_commit,
+            },
+            "id": 7007,
+            "number": 7,
+            "url": f"{repository_api}/pulls/7",
+        }
+        ruleset = {
+            "id": self._ruleset_id,
+            "name": "Cisco cutover required workflow",
+            "source_type": contract["ruleset"]["source_type"],
+            "source": contract["ruleset"]["source"],
+            "target": contract["ruleset"]["target"],
+            "enforcement": contract["ruleset"]["enforcement"],
+            "bypass_actors": contract["ruleset"]["bypass_actors"],
+            "conditions": contract["ruleset"]["conditions"],
+            "rules": [
+                {"type": "deletion"},
+                {"type": "non_fast_forward"},
+                {
+                    "type": "workflows",
+                    "parameters": {
+                        "do_not_enforce_on_create": workflow[
+                            "do_not_enforce_on_create"
+                        ],
+                        "workflows": [
+                            {
+                                "repository_id": workflow["repository_id"],
+                                "path": workflow["path"],
+                                "ref": workflow["ref"],
+                                "sha": self._workflow_source_commit,
+                            }
+                        ],
+                    },
+                },
+            ],
+        }
+        base_sha = pull_request["base"]["sha"]
+        run_url = f"{repository_api}/actions/runs/10101"
+        check_url = f"{repository_api}/check-runs/20202"
+        run = {
+            "check_suite_id": 30303,
+            "check_suite_url": f"{repository_api}/check-suites/30303",
+            "conclusion": "success",
+            "event": workflow["event"],
+            "head_repository": {
+                "full_name": repository["full_name"],
+                "id": repository["id"],
+            },
+            "head_sha": base_sha,
+            "html_url": (
+                f"https://github.com/{repository['full_name']}"
+                "/actions/runs/10101"
+            ),
+            "id": 10101,
+            "jobs_url": f"{run_url}/jobs",
+            "path": f"{workflow['path']}@master",
+            "pull_requests": [self._copy_json(pull_request_link)],
+            "repository": {
+                "full_name": repository["full_name"],
+                "id": repository["id"],
+            },
+            "run_attempt": 1,
+            "status": "completed",
+            "url": run_url,
             "workflow_id": self._workflow_id,
-            "repository_id": workflow["repository_id"],
-            "workflow_path": workflow["path"],
-            "workflow_ref": workflow["ref"],
-            "workflow_sha": self._workflow_source_commit,
+            "workflow_url": (
+                "https://api.github.com/repos/"
+                f"{workflow['repository_full_name']}/actions/workflows/"
+                f"{self._workflow_id}"
+            ),
+        }
+        job = {
+            "check_run_url": check_url,
+            "conclusion": "success",
+            "head_sha": base_sha,
+            "html_url": (
+                f"https://github.com/{repository['full_name']}"
+                "/actions/runs/10101/job/20202"
+            ),
+            "id": 20202,
+            "name": workflow["check_name"],
+            "run_attempt": 1,
+            "run_id": 10101,
+            "run_url": run_url,
+            "status": "completed",
+            "url": f"{repository_api}/actions/jobs/20202",
+            "workflow_name": "Cisco cutover admission",
+        }
+        check_run = {
+            "app": workflow["provider"],
+            "check_suite_id": 30303,
+            "conclusion": "success",
+            "details_url": job["html_url"],
+            "head_sha": base_sha,
+            "html_url": job["html_url"],
+            "id": 20202,
+            "name": workflow["check_name"],
+            "pull_requests": [self._copy_json(pull_request_link)],
+            "status": "completed",
+            "url": check_url,
         }
         return {
-            "schema_version": 1,
-            "collection": {
-                flag: True for flag in contract["required_collection_flags"]
-            },
+            "organization": organization,
             "repository": {
-                "id": repository["id"],
-                "full_name": repository["full_name"],
-                "default_branch": repository["default_branch"],
                 "archived": False,
+                "default_branch": repository["default_branch"],
                 "disabled": False,
+                "full_name": repository["full_name"],
+                "id": repository["id"],
+                "owner": {
+                    "id": organization["id"],
+                    "login": organization["login"],
+                    "type": "Organization",
+                },
+            },
+            "pull_request": pull_request,
+            "effective_rulesets": [self._copy_json(ruleset)],
+            "selected_ruleset": ruleset,
+            "workflow_source_repository": {
+                "archived": False,
+                "default_branch": "master",
+                "disabled": False,
+                "full_name": workflow["repository_full_name"],
+                "id": workflow["repository_id"],
+                "owner": {
+                    "id": organization["id"],
+                    "login": organization["login"],
+                    "type": "Organization",
+                },
             },
             "workflow": {
+                "html_url": (
+                    "https://github.com/"
+                    f"{workflow['repository_full_name']}/actions/workflows/"
+                    f"{workflow['path'].rsplit('/', 1)[-1]}"
+                ),
                 "id": self._workflow_id,
-                "repository_id": workflow["repository_id"],
-                "repository_full_name": workflow["repository_full_name"],
                 "path": workflow["path"],
-                "ref": workflow["ref"],
-                "sha": self._workflow_source_commit,
                 "state": workflow["state"],
+                "url": (
+                    "https://api.github.com/repos/"
+                    f"{workflow['repository_full_name']}/actions/workflows/"
+                    f"{self._workflow_id}"
+                ),
             },
-            "rulesets": [
-                {
-                    "id": self._ruleset_id,
-                    "name": "Cisco cutover required workflow",
-                    "source_type": contract["ruleset"]["source_type"],
-                    "source": contract["ruleset"]["source"],
-                    "target": contract["ruleset"]["target"],
-                    "enforcement": contract["ruleset"]["enforcement"],
-                    "bypass_actors": contract["ruleset"]["bypass_actors"],
-                    "conditions": contract["ruleset"]["conditions"],
-                    "rules": [
-                        {"type": "deletion"},
-                        {"type": "non_fast_forward"},
-                        {
-                            "type": "workflows",
-                            "parameters": {
-                                "do_not_enforce_on_create": workflow[
-                                    "do_not_enforce_on_create"
-                                ],
-                                "workflows": [
-                                    {
-                                        "repository_id": workflow["repository_id"],
-                                        "path": workflow["path"],
-                                        "ref": workflow["ref"],
-                                        "sha": self._workflow_source_commit,
-                                    }
-                                ],
-                            },
-                        },
-                    ],
-                }
-            ],
-            "candidate": {
-                "head_sha": self._canonical_commit,
-                "trusted_workflow_run": {
-                    "id": 10101,
-                    "run_attempt": 1,
-                    **workflow_identity,
-                    "candidate_head_sha": self._canonical_commit,
-                    "event": workflow["event"],
-                    "status": "completed",
-                    "conclusion": "success",
+            "workflow_source_commit": {
+                "html_url": (
+                    "https://github.com/"
+                    f"{workflow['repository_full_name']}/commit/"
+                    f"{self._workflow_source_commit}"
+                ),
+                "sha": self._workflow_source_commit,
+                "url": (
+                    "https://api.github.com/repos/"
+                    f"{workflow['repository_full_name']}/commits/"
+                    f"{self._workflow_source_commit}"
+                ),
+            },
+            "workflow_runs": [run],
+            "jobs": [job],
+            "check_runs": [check_run],
+        }
+
+    @staticmethod
+    def _api_pr_link(link: dict[str, object]) -> dict[str, object]:
+        return {
+            "base": {
+                "ref": link["base"]["ref"],
+                "repo": {
+                    "id": link["base"]["repository_id"],
                 },
-                "check_runs": [
-                    {
-                        "id": 20202,
-                        "name": workflow["check_name"],
-                        "head_sha": self._canonical_commit,
-                        "status": "completed",
-                        "conclusion": "success",
-                        **workflow_identity,
-                    }
-                ],
+                "sha": link["base"]["sha"],
+            },
+            "head": {
+                "repo": {
+                    "id": link["head"]["repository_id"],
+                },
+                "sha": link["head"]["sha"],
+            },
+            "id": link["id"],
+            "number": link["number"],
+            "url": link["url"],
+        }
+
+    def _matching_live_api_client(self) -> object:
+        evidence = self._matching_enforcement_evidence()
+        contract = json.loads(
+            CUTOVER_ENFORCEMENT_CONTRACT_PATH.read_text(encoding="utf-8")
+        )
+        repository = contract["target_repository"]
+        workflow = contract["required_workflow"]
+        target_name = repository["full_name"]
+        workflow_name = workflow["repository_full_name"]
+        pull_request = self._copy_json(evidence["pull_request"])
+        pull_request["base"]["repo"] = pull_request["base"].pop("repository")
+        pull_request["head"]["repo"] = pull_request["head"].pop("repository")
+        run = self._copy_json(evidence["workflow_runs"][0])
+        run["pull_requests"] = [
+            self._api_pr_link(link) for link in run["pull_requests"]
+        ]
+        job = self._copy_json(evidence["jobs"][0])
+        del job["run_attempt"]
+        check_run = self._copy_json(evidence["check_runs"][0])
+        check_run["check_suite"] = {
+            "id": check_run.pop("check_suite_id"),
+        }
+        check_run["pull_requests"] = [
+            self._api_pr_link(link) for link in check_run["pull_requests"]
+        ]
+        ruleset_summaries = [
+            {
+                field: ruleset[field]
+                for field in (
+                    "enforcement",
+                    "id",
+                    "name",
+                    "source",
+                    "source_type",
+                    "target",
+                )
+            }
+            for ruleset in evidence["effective_rulesets"]
+        ]
+
+        class FixtureApiClient:
+            def __init__(
+                self,
+                *,
+                objects: dict[str, object],
+                collections: dict[str, dict[str, object]],
+            ) -> None:
+                self.objects = objects
+                self.collections = collections
+                self.auth_calls = 0
+                self.calls: list[tuple[str, dict[str, object]]] = []
+
+            def auth_preflight(self) -> dict[str, object]:
+                self.auth_calls += 1
+                return {
+                    "id": 4242,
+                    "login": "fixture-admin",
+                }
+
+            def get_json(
+                self,
+                endpoint: str,
+                parameters: dict[str, object] | None = None,
+            ) -> object:
+                query = dict(parameters or {})
+                self.calls.append((endpoint, query))
+                if endpoint in self.objects:
+                    return json.loads(json.dumps(self.objects[endpoint]))
+                collection = self.collections[endpoint]
+                page = int(query["page"])
+                pages = collection["pages"]
+                page_items = pages[page - 1] if page <= len(pages) else []
+                item_key = collection["item_key"]
+                copied_items = json.loads(json.dumps(page_items))
+                if item_key is None:
+                    return copied_items
+                total_count = sum(len(items) for items in pages)
+                return {
+                    "total_count": total_count,
+                    item_key: copied_items,
+                }
+
+        objects = {
+            f"/orgs/{contract['source_organization']['login']}": evidence[
+                "organization"
+            ],
+            f"/repos/{target_name}": evidence["repository"],
+            f"/repos/{target_name}/pulls/7": pull_request,
+            (
+                f"/orgs/{contract['source_organization']['login']}/rulesets/"
+                f"{self._ruleset_id}"
+            ): evidence["selected_ruleset"],
+            f"/repos/{workflow_name}": evidence[
+                "workflow_source_repository"
+            ],
+            (
+                f"/repos/{workflow_name}/actions/workflows/"
+                f"{self._workflow_id}"
+            ): evidence["workflow"],
+            (
+                f"/repos/{workflow_name}/commits/"
+                f"{self._workflow_source_commit}"
+            ): evidence["workflow_source_commit"],
+        }
+        collections = {
+            f"/repos/{target_name}/rulesets": {
+                "item_key": None,
+                "pages": [ruleset_summaries],
+            },
+            f"/repos/{target_name}/actions/runs": {
+                "item_key": "workflow_runs",
+                "pages": [[run]],
+            },
+            f"/repos/{target_name}/commits/{pull_request['base']['sha']}/check-runs": {
+                "item_key": "check_runs",
+                "pages": [[check_run]],
+            },
+            f"/repos/{target_name}/commits/{self._canonical_commit}/check-runs": {
+                "item_key": "check_runs",
+                "pages": [[]],
+            },
+            (
+                f"/repos/{target_name}/actions/runs/10101"
+                "/attempts/1/jobs"
+            ): {
+                "item_key": "jobs",
+                "pages": [[job]],
             },
         }
+        return FixtureApiClient(
+            objects=objects,
+            collections=collections,
+        )
 
     def _run_enforcement_doctor(
         self,
@@ -4095,40 +4375,65 @@ class BugTriageDocumentationTests(unittest.TestCase):
         expected_workflow_sha: str | None = None,
         candidate_head_sha: str | None = None,
     ) -> subprocess.CompletedProcess[str]:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            evidence_path = Path(temp_dir) / "enforcement-evidence.json"
-            evidence_path.write_text(
+        contract_payload = CUTOVER_ENFORCEMENT_CONTRACT_PATH.read_bytes()
+        contract = json.loads(contract_payload)
+        ruleset_id = expected_ruleset_id or self._ruleset_id
+        workflow_id = expected_workflow_id or self._workflow_id
+        workflow_sha = expected_workflow_sha or self._workflow_source_commit
+        head_sha = candidate_head_sha or self._canonical_commit
+        try:
+            admission = ENFORCEMENT_MODULE.validate_enforcement(
+                contract,
+                evidence,
+                expected_ruleset_id=ruleset_id,
+                expected_workflow_id=workflow_id,
+                expected_workflow_sha=workflow_sha,
+                candidate_head_sha=head_sha,
+                pull_request_number=7,
+            )
+        except ENFORCEMENT_MODULE.EnforcementDoctorError as error:
+            outcome = {
+                "classification": "blocked_until_trusted",
+                "reason": str(error),
+                "reason_code": error.reason_code,
+            }
+            return subprocess.CompletedProcess(
+                args=[],
+                returncode=1,
+                stdout=json.dumps(outcome),
+                stderr="",
+            )
+        outcome = {
+            "candidate_head_sha": head_sha,
+            "classification": "admitted",
+            "contract_sha256": hashlib.sha256(contract_payload).hexdigest(),
+            "evidence_sha256": hashlib.sha256(
                 json.dumps(
                     evidence,
                     ensure_ascii=True,
                     separators=(",", ":"),
                     sort_keys=True,
-                )
-                + "\n",
-                encoding="utf-8",
-            )
-            return subprocess.run(
-                [
-                    sys.executable,
-                    str(CUTOVER_ENFORCEMENT_DOCTOR_PATH),
-                    "--contract",
-                    str(CUTOVER_ENFORCEMENT_CONTRACT_PATH),
-                    "--evidence",
-                    str(evidence_path),
-                    "--expected-ruleset-id",
-                    str(expected_ruleset_id or self._ruleset_id),
-                    "--expected-workflow-id",
-                    str(expected_workflow_id or self._workflow_id),
-                    "--expected-workflow-sha",
-                    expected_workflow_sha or self._workflow_source_commit,
-                    "--candidate-head-sha",
-                    candidate_head_sha or self._canonical_commit,
+                ).encode("utf-8")
+            ).hexdigest(),
+            "ruleset_id": ruleset_id,
+            "trusted_check_run_id": admission["trusted_check_run"]["id"],
+            "trusted_workflow": {
+                "id": workflow_id,
+                "path": contract["required_workflow"]["path"],
+                "ref": contract["required_workflow"]["ref"],
+                "repository_id": contract["required_workflow"][
+                    "repository_id"
                 ],
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
+                "sha": workflow_sha,
+            },
+            "trusted_workflow_run_id": admission["trusted_run"]["id"],
+        }
+        return subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=json.dumps(outcome),
+            stderr="",
+        )
 
     @staticmethod
     def _copy_json(value: dict[str, object]) -> dict[str, object]:
@@ -4301,10 +4606,19 @@ class BugTriageDocumentationTests(unittest.TestCase):
         self.assertIn("minimum\nordinary PR-merge sequence", migration)
         self.assertIn("restores the Jenkins entrypoint", migration)
         self.assertIn("is not an enforcement identity", migration)
-        self.assertIn("`type=workflows`, not a named status context", migration)
+        self.assertIn(
+            "`source_type=Organization` and `type=workflows`",
+            migration,
+        )
         self.assertIn("A branch ref without the exact `sha` is mutable", migration)
-        self.assertIn("candidate-authored\nduplicate cannot compensate", migration)
-        self.assertIn("no `workflows` rule exists", migration)
+        self.assertIn("candidate-authored duplicate cannot compensate", migration)
+        self.assertIn("accepts no `--evidence`", migration)
+        self.assertIn("explicit empty terminal page", migration)
+        self.assertIn("The live preflight is read-only", migration)
+        self.assertIn("source workflow repository", migration)
+        self.assertIn("timestamps alone", migration)
+        self.assertIn("active credential lacks `admin:org`", migration)
+        self.assertIn("no OAuth scope or\nlive ruleset was changed", migration)
         self.assertIn("cannot install a base-owned workflow", migration)
         self.assertIn("doctor_cisco_cutover_enforcement.py", migration)
 
@@ -4355,7 +4669,14 @@ class BugTriageDocumentationTests(unittest.TestCase):
             CUTOVER_ENFORCEMENT_CONTRACT_PATH.read_text(encoding="utf-8")
         )
 
-        self.assertEqual(contract["schema_version"], 1)
+        self.assertEqual(contract["schema_version"], 2)
+        self.assertEqual(
+            contract["source_organization"],
+            {
+                "id": 283943935,
+                "login": "Joey-Tools",
+            },
+        )
         self.assertEqual(
             contract["target_repository"],
             {
@@ -4364,12 +4685,16 @@ class BugTriageDocumentationTests(unittest.TestCase):
                 "default_branch": "master",
             },
         )
-        self.assertEqual(contract["ruleset"]["source_type"], "Repository")
+        self.assertEqual(contract["ruleset"]["source_type"], "Organization")
+        self.assertEqual(contract["ruleset"]["source"], "Joey-Tools")
         self.assertEqual(contract["ruleset"]["enforcement"], "active")
         self.assertEqual(contract["ruleset"]["bypass_actors"], [])
         self.assertEqual(
             contract["ruleset"]["conditions"],
             {
+                "repository_id": {
+                    "repository_ids": [1242512092],
+                },
                 "ref_name": {
                     "include": ["~DEFAULT_BRANCH"],
                     "exclude": [],
@@ -4385,6 +4710,13 @@ class BugTriageDocumentationTests(unittest.TestCase):
         self.assertEqual(workflow["ref"], "refs/heads/master")
         self.assertTrue(workflow["require_exact_sha"])
         self.assertFalse(workflow["do_not_enforce_on_create"])
+        self.assertEqual(
+            workflow["provider"],
+            {
+                "id": 15368,
+                "slug": "github-actions",
+            },
+        )
         self.assertEqual(
             contract["disallowed_status_contexts"],
             ["cisco-cutover-admission"],
@@ -4579,11 +4911,488 @@ class BugTriageDocumentationTests(unittest.TestCase):
         self.assertRegex(outcome["contract_sha256"], r"\A[0-9a-f]{64}\Z")
         self.assertRegex(outcome["evidence_sha256"], r"\A[0-9a-f]{64}\Z")
 
+    def test_enforcement_live_collector_exhausts_pages_and_binds_lineage(
+        self,
+    ) -> None:
+        contract = json.loads(
+            CUTOVER_ENFORCEMENT_CONTRACT_PATH.read_text(encoding="utf-8")
+        )
+        client = self._matching_live_api_client()
+
+        receipt, admission = ENFORCEMENT_MODULE.collect_and_validate(
+            client,
+            contract,
+            expected_ruleset_id=self._ruleset_id,
+            expected_workflow_id=self._workflow_id,
+            expected_workflow_sha=self._workflow_source_commit,
+            candidate_head_sha=self._canonical_commit,
+            pull_request_number=7,
+        )
+
+        self.assertEqual(receipt["schema_version"], 2)
+        self.assertEqual(receipt["collector"]["mode"], "live-gh-rest")
+        self.assertEqual(client.auth_calls, 1)
+        self.assertNotIn("collection", receipt["initial"])
+        self.assertEqual(admission["trusted_run"]["id"], 10101)
+        self.assertEqual(admission["trusted_job"]["id"], 20202)
+        self.assertEqual(admission["trusted_check_run"]["id"], 20202)
+        ruleset_bounds = [
+            bound
+            for bound in receipt["collector"]["page_bounds"]
+            if bound["label"] == "effective repository rulesets"
+        ]
+        self.assertEqual(len(ruleset_bounds), 2)
+        self.assertEqual(
+            {bound["phase"] for bound in ruleset_bounds},
+            {"initial", "revalidation"},
+        )
+        self.assertTrue(
+            all(bound["terminal_empty_page"] == 2 for bound in ruleset_bounds)
+        )
+        self.assertTrue(
+            all(bound["item_count"] == 1 for bound in ruleset_bounds)
+        )
+        check_bounds = [
+            bound
+            for bound in receipt["collector"]["page_bounds"]
+            if bound["label"].startswith("selected PR ")
+            and bound["label"].endswith(" check runs")
+        ]
+        self.assertEqual(len(check_bounds), 4)
+        self.assertEqual(
+            {
+                bound["endpoint"]
+                for bound in check_bounds
+            },
+            {
+                (
+                    "/repos/Joey-Tools/codex-debug-triage/commits/"
+                    f"{self._canonical_commit}/check-runs"
+                ),
+                (
+                    "/repos/Joey-Tools/codex-debug-triage/commits/"
+                    f"{'9' * 40}/check-runs"
+                ),
+            },
+        )
+
+    def test_enforcement_live_collector_reads_hidden_later_page(
+        self,
+    ) -> None:
+        contract = json.loads(
+            CUTOVER_ENFORCEMENT_CONTRACT_PATH.read_text(encoding="utf-8")
+        )
+        client = self._matching_live_api_client()
+        target_name = contract["target_repository"]["full_name"]
+        hidden_ruleset = self._copy_json(
+            self._matching_enforcement_evidence()["selected_ruleset"]
+        )
+        hidden_ruleset["id"] = self._ruleset_id + 1
+        hidden_ruleset["name"] = "Hidden same-name status rule"
+        hidden_ruleset["rules"] = [
+            {
+                "type": "required_status_checks",
+                "parameters": {
+                    "required_status_checks": [
+                        {
+                            "context": "cisco-cutover-admission",
+                            "integration_id": 15368,
+                        }
+                    ],
+                },
+            }
+        ]
+        client.collections[f"/repos/{target_name}/rulesets"]["pages"].append(
+            [hidden_ruleset]
+        )
+        client.objects[
+            (
+                f"/orgs/{contract['source_organization']['login']}/rulesets/"
+                f"{hidden_ruleset['id']}"
+            )
+        ] = hidden_ruleset
+
+        with self.assertRaisesRegex(
+            ENFORCEMENT_MODULE.EnforcementDoctorError,
+            "same-name required_status_checks",
+        ) as raised:
+            ENFORCEMENT_MODULE.collect_and_validate(
+                client,
+                contract,
+                expected_ruleset_id=self._ruleset_id,
+                expected_workflow_id=self._workflow_id,
+                expected_workflow_sha=self._workflow_source_commit,
+                candidate_head_sha=self._canonical_commit,
+                pull_request_number=7,
+            )
+
+        self.assertEqual(raised.exception.reason_code, "spoofable-status-rule")
+        requested_ruleset_pages = [
+            query["page"]
+            for endpoint, query in client.calls
+            if endpoint == f"/repos/{target_name}/rulesets"
+        ]
+        self.assertEqual(requested_ruleset_pages, [1, 2, 3])
+
+    def test_enforcement_live_collector_rejects_head_change_on_revalidation(
+        self,
+    ) -> None:
+        contract = json.loads(
+            CUTOVER_ENFORCEMENT_CONTRACT_PATH.read_text(encoding="utf-8")
+        )
+        client = self._matching_live_api_client()
+        pull_endpoint = (
+            "/repos/Joey-Tools/codex-debug-triage/pulls/7"
+        )
+        original_get_json = client.get_json
+        pull_reads = 0
+
+        def raced_get_json(
+            endpoint: str,
+            parameters: dict[str, object] | None = None,
+        ) -> object:
+            nonlocal pull_reads
+            result = original_get_json(endpoint, parameters)
+            if endpoint == pull_endpoint:
+                pull_reads += 1
+                if pull_reads == 2:
+                    result["head"]["sha"] = "8" * 40
+            return result
+
+        client.get_json = raced_get_json
+
+        with self.assertRaises(
+            ENFORCEMENT_MODULE.EnforcementDoctorError
+        ) as raised:
+            ENFORCEMENT_MODULE.collect_and_validate(
+                client,
+                contract,
+                expected_ruleset_id=self._ruleset_id,
+                expected_workflow_id=self._workflow_id,
+                expected_workflow_sha=self._workflow_source_commit,
+                candidate_head_sha=self._canonical_commit,
+                pull_request_number=7,
+            )
+
+        self.assertEqual(
+            raised.exception.reason_code,
+            "pull-request-identity-mismatch",
+        )
+        self.assertEqual(pull_reads, 2)
+
+    def test_enforcement_live_collector_ignores_timestamp_only_churn(
+        self,
+    ) -> None:
+        contract = json.loads(
+            CUTOVER_ENFORCEMENT_CONTRACT_PATH.read_text(encoding="utf-8")
+        )
+        client = self._matching_live_api_client()
+        original_get_json = client.get_json
+        read_count = 0
+
+        def timestamped_get_json(
+            endpoint: str,
+            parameters: dict[str, object] | None = None,
+        ) -> object:
+            nonlocal read_count
+            read_count += 1
+            result = original_get_json(endpoint, parameters)
+            if type(result) is dict:
+                result["updated_at"] = (
+                    f"2026-07-24T00:00:{read_count % 60:02d}Z"
+                )
+            return result
+
+        client.get_json = timestamped_get_json
+
+        _, admission = ENFORCEMENT_MODULE.collect_and_validate(
+            client,
+            contract,
+            expected_ruleset_id=self._ruleset_id,
+            expected_workflow_id=self._workflow_id,
+            expected_workflow_sha=self._workflow_source_commit,
+            candidate_head_sha=self._canonical_commit,
+            pull_request_number=7,
+        )
+
+        self.assertEqual(admission["trusted_run"]["id"], 10101)
+
+    def test_enforcement_doctor_cli_has_no_untrusted_evidence_input(
+        self,
+    ) -> None:
+        with redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as raised:
+                ENFORCEMENT_MODULE.build_parser().parse_args(
+                    [
+                        "--contract",
+                        str(CUTOVER_ENFORCEMENT_CONTRACT_PATH),
+                        "--evidence",
+                        "caller.json",
+                        "--pull-request-number",
+                        "7",
+                        "--expected-ruleset-id",
+                        str(self._ruleset_id),
+                        "--expected-workflow-id",
+                        str(self._workflow_id),
+                        "--expected-workflow-sha",
+                        self._workflow_source_commit,
+                        "--candidate-head-sha",
+                        self._canonical_commit,
+                    ]
+                )
+
+        self.assertEqual(raised.exception.code, 2)
+
+    def test_enforcement_doctor_cli_receipt_binds_native_objects(
+        self,
+    ) -> None:
+        client = self._matching_live_api_client()
+        arguments = [
+            str(CUTOVER_ENFORCEMENT_DOCTOR_PATH),
+            "--contract",
+            str(CUTOVER_ENFORCEMENT_CONTRACT_PATH),
+            "--pull-request-number",
+            "7",
+            "--expected-ruleset-id",
+            str(self._ruleset_id),
+            "--expected-workflow-id",
+            str(self._workflow_id),
+            "--expected-workflow-sha",
+            self._workflow_source_commit,
+            "--candidate-head-sha",
+            self._canonical_commit,
+        ]
+        output = io.StringIO()
+        with mock.patch.object(
+            ENFORCEMENT_MODULE,
+            "GitHubApiClient",
+            return_value=client,
+        ):
+            with mock.patch.object(sys, "argv", arguments):
+                with redirect_stdout(output):
+                    return_code = ENFORCEMENT_MODULE.main()
+
+        self.assertEqual(return_code, 0)
+        outcome = json.loads(output.getvalue())
+        self.assertEqual(outcome["classification"], "admitted")
+        candidate = outcome["candidate"]
+        self.assertEqual(candidate["head_repository_id"], 1242512092)
+        self.assertEqual(
+            candidate["head_repository_full_name"],
+            "Joey-Tools/codex-debug-triage",
+        )
+        self.assertEqual(candidate["head_sha"], self._canonical_commit)
+        self.assertEqual(candidate["pull_request_id"], 7007)
+        self.assertEqual(candidate["pull_request_number"], 7)
+        self.assertEqual(
+            candidate["pull_request_url"],
+            "https://api.github.com/repos/"
+            "Joey-Tools/codex-debug-triage/pulls/7",
+        )
+        execution = outcome["trusted_execution"]
+        self.assertEqual(execution["run"]["id"], 10101)
+        self.assertEqual(execution["run"]["run_attempt"], 1)
+        self.assertEqual(execution["job"]["id"], 20202)
+        self.assertEqual(execution["check_run"]["id"], 20202)
+        self.assertEqual(
+            execution["check_run"]["app"],
+            {"id": 15368, "slug": "github-actions"},
+        )
+        self.assertEqual(
+            execution["workflow"]["repository_full_name"],
+            "Joey-Tools/codex-debug-triage",
+        )
+        self.assertEqual(
+            outcome["collection"]["authenticated_user"],
+            {"id": 4242, "login": "fixture-admin"},
+        )
+
+    def test_enforcement_accepts_distinct_source_workflow_repository(
+        self,
+    ) -> None:
+        contract = json.loads(
+            CUTOVER_ENFORCEMENT_CONTRACT_PATH.read_text(encoding="utf-8")
+        )
+        evidence = self._matching_enforcement_evidence()
+        source_id = 777777
+        source_name = "Joey-Tools/codex-required-workflows"
+        workflow = contract["required_workflow"]
+        workflow["repository_id"] = source_id
+        workflow["repository_full_name"] = source_name
+        evidence["workflow_source_repository"].update(
+            {
+                "full_name": source_name,
+                "id": source_id,
+            }
+        )
+        evidence["workflow"]["url"] = (
+            f"https://api.github.com/repos/{source_name}/actions/workflows/"
+            f"{self._workflow_id}"
+        )
+        evidence["workflow_source_commit"]["url"] = (
+            f"https://api.github.com/repos/{source_name}/commits/"
+            f"{self._workflow_source_commit}"
+        )
+        evidence["workflow_runs"][0]["workflow_url"] = evidence["workflow"][
+            "url"
+        ]
+        for ruleset in (
+            evidence["effective_rulesets"][0],
+            evidence["selected_ruleset"],
+        ):
+            ruleset["rules"][2]["parameters"]["workflows"][0][
+                "repository_id"
+            ] = source_id
+
+        admission = ENFORCEMENT_MODULE.validate_enforcement(
+            contract,
+            evidence,
+            expected_ruleset_id=self._ruleset_id,
+            expected_workflow_id=self._workflow_id,
+            expected_workflow_sha=self._workflow_source_commit,
+            candidate_head_sha=self._canonical_commit,
+            pull_request_number=7,
+        )
+
+        self.assertEqual(admission["trusted_run"]["id"], 10101)
+
+    def test_enforcement_accepts_pull_request_target_base_run_sha(
+        self,
+    ) -> None:
+        evidence = self._matching_enforcement_evidence()
+        base_sha = evidence["pull_request"]["base"]["sha"]
+        evidence["workflow_runs"][0]["head_sha"] = base_sha
+        evidence["jobs"][0]["head_sha"] = base_sha
+        evidence["check_runs"][0]["head_sha"] = base_sha
+
+        result = self._run_enforcement_doctor(evidence)
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_enforcement_doctor_rejects_identity_and_scope_drift(
+        self,
+    ) -> None:
+        cases: dict[
+            str,
+            tuple[object, str],
+        ] = {
+            "wrong-organization": (
+                lambda evidence: evidence["organization"].update(
+                    {"id": 999999}
+                ),
+                "organization-identity-mismatch",
+            ),
+            "wrong-target-default-branch": (
+                lambda evidence: evidence["pull_request"]["base"].update(
+                    {"ref": "candidate"}
+                ),
+                "pull-request-identity-mismatch",
+            ),
+            "wrong-provider": (
+                lambda evidence: evidence["check_runs"][0]["app"].update(
+                    {"id": 999999}
+                ),
+                "candidate-duplicate-context",
+            ),
+            "wrong-source-workflow-repository": (
+                lambda evidence: evidence[
+                    "workflow_source_repository"
+                ].update({"id": 999999}),
+                "workflow-source-repository-mismatch",
+            ),
+            "wrong-target-scope": (
+                lambda evidence: (
+                    evidence["effective_rulesets"][0]["conditions"][
+                        "repository_id"
+                    ].update({"repository_ids": [999999]}),
+                    evidence["selected_ruleset"]["conditions"][
+                        "repository_id"
+                    ].update({"repository_ids": [999999]}),
+                ),
+                "ruleset-scope-mismatch",
+            ),
+            "wrong-org-source": (
+                lambda evidence: (
+                    evidence["effective_rulesets"][0].update(
+                        {"source": "Other-Org"}
+                    ),
+                    evidence["selected_ruleset"].update(
+                        {"source": "Other-Org"}
+                    ),
+                ),
+                "ruleset-identity-mismatch",
+            ),
+        }
+        for label, (mutate, reason_code) in cases.items():
+            with self.subTest(drift=label):
+                evidence = self._matching_enforcement_evidence()
+                mutate(evidence)
+                result = self._run_enforcement_doctor(evidence)
+
+                self.assertEqual(result.returncode, 1, result.stderr)
+                outcome = json.loads(result.stdout)
+                self.assertEqual(outcome["reason_code"], reason_code)
+
+    def test_enforcement_doctor_rejects_cross_pr_and_cross_head_lineage(
+        self,
+    ) -> None:
+        cases = {
+            "run-cross-pr": (
+                lambda evidence: evidence["workflow_runs"][0][
+                    "pull_requests"
+                ][0].update({"number": 8}),
+                "workflow-run-linkage-mismatch",
+            ),
+            "check-cross-pr": (
+                lambda evidence: evidence["check_runs"][0][
+                    "pull_requests"
+                ][0].update({"number": 8}),
+                "candidate-pr-mismatch",
+            ),
+            "check-cross-head": (
+                lambda evidence: evidence["check_runs"][0].update(
+                    {"head_sha": "8" * 40}
+                ),
+                "candidate-head-mismatch",
+            ),
+            "run-cross-suite-url": (
+                lambda evidence: evidence["workflow_runs"][0].update(
+                    {
+                        "check_suite_url": (
+                            "https://api.github.com/repos/"
+                            "Joey-Tools/codex-debug-triage/check-suites/40404"
+                        )
+                    }
+                ),
+                "workflow-run-linkage-mismatch",
+            ),
+            "run-cross-workflow-url": (
+                lambda evidence: evidence["workflow_runs"][0].update(
+                    {
+                        "workflow_url": (
+                            "https://api.github.com/repos/"
+                            "Joey-Tools/codex-debug-triage/actions/workflows/99999"
+                        )
+                    }
+                ),
+                "workflow-run-linkage-mismatch",
+            ),
+        }
+        for label, (mutate, reason_code) in cases.items():
+            with self.subTest(lineage=label):
+                evidence = self._matching_enforcement_evidence()
+                mutate(evidence)
+                result = self._run_enforcement_doctor(evidence)
+
+                self.assertEqual(result.returncode, 1, result.stderr)
+                outcome = json.loads(result.stdout)
+                self.assertEqual(outcome["reason_code"], reason_code)
+
     def test_enforcement_doctor_rejects_same_name_status_only_rule(
         self,
     ) -> None:
         evidence = self._matching_enforcement_evidence()
-        evidence["rulesets"][0]["rules"].append(
+        evidence["effective_rulesets"][0]["rules"].append(
             {
                 "type": "required_status_checks",
                 "parameters": {
@@ -4609,13 +5418,10 @@ class BugTriageDocumentationTests(unittest.TestCase):
         self,
     ) -> None:
         evidence = self._matching_enforcement_evidence()
-        evidence["candidate"]["trusted_workflow_run"] = None
-        duplicate = evidence["candidate"]["check_runs"][0]
-        duplicate["id"] = 30303
-        duplicate["workflow_id"] = self._workflow_id + 1
-        duplicate["workflow_path"] = ".github/workflows/candidate.yml"
-        duplicate["workflow_ref"] = "refs/pull/7/head"
-        duplicate["workflow_sha"] = self._canonical_commit
+        evidence["workflow_runs"][0]["workflow_id"] = self._workflow_id + 1
+        evidence["workflow_runs"][0]["path"] = (
+            ".github/workflows/candidate.yml@candidate"
+        )
         result = self._run_enforcement_doctor(evidence)
 
         self.assertEqual(result.returncode, 1, result.stderr)
@@ -4627,22 +5433,59 @@ class BugTriageDocumentationTests(unittest.TestCase):
         self,
     ) -> None:
         evidence = self._matching_enforcement_evidence()
-        evidence["candidate"]["trusted_workflow_run"]["conclusion"] = "failure"
-        evidence["candidate"]["check_runs"][0]["conclusion"] = "failure"
-        duplicate = self._copy_json(
-            evidence["candidate"]["check_runs"][0]
+        evidence["workflow_runs"][0]["conclusion"] = "failure"
+        evidence["jobs"][0]["conclusion"] = "failure"
+        evidence["check_runs"][0]["conclusion"] = "failure"
+        duplicate_run = self._copy_json(evidence["workflow_runs"][0])
+        duplicate_run_url = (
+            "https://api.github.com/repos/"
+            "Joey-Tools/codex-debug-triage/actions/runs/11111"
         )
-        duplicate.update(
+        duplicate_run.update(
             {
-                "id": 30303,
+                "check_suite_id": 40404,
+                "check_suite_url": (
+                    "https://api.github.com/repos/"
+                    "Joey-Tools/codex-debug-triage/check-suites/40404"
+                ),
                 "conclusion": "success",
+                "id": 11111,
+                "jobs_url": f"{duplicate_run_url}/jobs",
+                "path": ".github/workflows/candidate.yml@candidate",
+                "url": duplicate_run_url,
                 "workflow_id": self._workflow_id + 1,
-                "workflow_path": ".github/workflows/candidate.yml",
-                "workflow_ref": "refs/pull/7/head",
-                "workflow_sha": self._canonical_commit,
             }
         )
-        evidence["candidate"]["check_runs"].append(duplicate)
+        duplicate_job = self._copy_json(evidence["jobs"][0])
+        duplicate_check_url = (
+            "https://api.github.com/repos/"
+            "Joey-Tools/codex-debug-triage/check-runs/21212"
+        )
+        duplicate_job.update(
+            {
+                "check_run_url": duplicate_check_url,
+                "conclusion": "success",
+                "id": 21212,
+                "run_id": 11111,
+                "run_url": duplicate_run_url,
+                "url": (
+                    "https://api.github.com/repos/"
+                    "Joey-Tools/codex-debug-triage/actions/jobs/21212"
+                ),
+            }
+        )
+        duplicate_check = self._copy_json(evidence["check_runs"][0])
+        duplicate_check.update(
+            {
+                "check_suite_id": 40404,
+                "conclusion": "success",
+                "id": 21212,
+                "url": duplicate_check_url,
+            }
+        )
+        evidence["workflow_runs"].append(duplicate_run)
+        evidence["jobs"].append(duplicate_job)
+        evidence["check_runs"].append(duplicate_check)
         result = self._run_enforcement_doctor(evidence)
 
         self.assertEqual(result.returncode, 1, result.stderr)
@@ -4654,7 +5497,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
         self,
     ) -> None:
         cases = {
-            "absent": (None, "trusted-workflow-run-missing"),
+            "absent": (None, "workflow-run-linkage-missing"),
             "red": ("failure", "trusted-workflow-run-failed"),
             "pending": (None, "trusted-workflow-run-failed"),
         }
@@ -4662,15 +5505,13 @@ class BugTriageDocumentationTests(unittest.TestCase):
             with self.subTest(run=label):
                 evidence = self._matching_enforcement_evidence()
                 if label == "absent":
-                    evidence["candidate"]["trusted_workflow_run"] = None
+                    evidence["workflow_runs"] = []
                 elif label == "pending":
-                    run = evidence["candidate"]["trusted_workflow_run"]
+                    run = evidence["workflow_runs"][0]
                     run["status"] = "in_progress"
                     run["conclusion"] = conclusion
                 else:
-                    evidence["candidate"]["trusted_workflow_run"][
-                        "conclusion"
-                    ] = conclusion
+                    evidence["workflow_runs"][0]["conclusion"] = conclusion
                 result = self._run_enforcement_doctor(evidence)
 
                 self.assertEqual(result.returncode, 1, result.stderr)
@@ -4711,13 +5552,17 @@ class BugTriageDocumentationTests(unittest.TestCase):
         for label, (field, value, reason_code) in cases.items():
             with self.subTest(binding=label):
                 evidence = self._matching_enforcement_evidence()
-                binding = evidence["rulesets"][0]["rules"][2][
-                    "parameters"
-                ]["workflows"][0]
-                if value is None:
-                    del binding[field]
-                else:
-                    binding[field] = value
+                for ruleset in (
+                    evidence["effective_rulesets"][0],
+                    evidence["selected_ruleset"],
+                ):
+                    binding = ruleset["rules"][2]["parameters"][
+                        "workflows"
+                    ][0]
+                    if value is None:
+                        del binding[field]
+                    else:
+                        binding[field] = value
                 result = self._run_enforcement_doctor(evidence)
 
                 self.assertEqual(result.returncode, 1, result.stderr)
@@ -4733,7 +5578,10 @@ class BugTriageDocumentationTests(unittest.TestCase):
     ) -> None:
         mutations = {
             "wrong-ruleset-id": (
-                lambda evidence: evidence["rulesets"][0].update({"id": 42}),
+                lambda evidence: (
+                    evidence["effective_rulesets"][0].update({"id": 42}),
+                    evidence["selected_ruleset"].update({"id": 42}),
+                ),
                 "ruleset-identity-mismatch",
             ),
             "wrong-workflow-id": (
@@ -4741,28 +5589,51 @@ class BugTriageDocumentationTests(unittest.TestCase):
                 "workflow-identity-mismatch",
             ),
             "disabled": (
-                lambda evidence: evidence["rulesets"][0].update(
-                    {"enforcement": "disabled"}
+                lambda evidence: (
+                    evidence["effective_rulesets"][0].update(
+                        {"enforcement": "disabled"}
+                    ),
+                    evidence["selected_ruleset"].update(
+                        {"enforcement": "disabled"}
+                    ),
                 ),
                 "ruleset-not-active",
             ),
             "evaluate": (
-                lambda evidence: evidence["rulesets"][0].update(
-                    {"enforcement": "evaluate"}
+                lambda evidence: (
+                    evidence["effective_rulesets"][0].update(
+                        {"enforcement": "evaluate"}
+                    ),
+                    evidence["selected_ruleset"].update(
+                        {"enforcement": "evaluate"}
+                    ),
                 ),
                 "ruleset-not-active",
             ),
             "bypass": (
-                lambda evidence: evidence["rulesets"][0].update(
-                    {
-                        "bypass_actors": [
-                            {
-                                "actor_id": 5,
-                                "actor_type": "RepositoryRole",
-                                "bypass_mode": "always",
-                            }
-                        ]
-                    }
+                lambda evidence: (
+                    evidence["effective_rulesets"][0].update(
+                        {
+                            "bypass_actors": [
+                                {
+                                    "actor_id": 5,
+                                    "actor_type": "RepositoryRole",
+                                    "bypass_mode": "always",
+                                }
+                            ]
+                        }
+                    ),
+                    evidence["selected_ruleset"].update(
+                        {
+                            "bypass_actors": [
+                                {
+                                    "actor_id": 5,
+                                    "actor_type": "RepositoryRole",
+                                    "bypass_mode": "always",
+                                }
+                            ]
+                        }
+                    ),
                 ),
                 "ruleset-bypass-configured",
             ),
@@ -4781,15 +5652,20 @@ class BugTriageDocumentationTests(unittest.TestCase):
                 )
                 self.assertEqual(outcome["reason_code"], reason_code)
 
-    def test_enforcement_doctor_requires_complete_api_evidence(self) -> None:
+    def test_enforcement_doctor_rejects_caller_completeness_booleans(
+        self,
+    ) -> None:
         evidence = self._matching_enforcement_evidence()
-        evidence["collection"]["check_runs_complete"] = False
+        evidence["collection"] = {
+            "check_runs_complete": True,
+            "rulesets_complete": True,
+        }
         result = self._run_enforcement_doctor(evidence)
 
         self.assertEqual(result.returncode, 1, result.stderr)
         outcome = json.loads(result.stdout)
         self.assertEqual(outcome["classification"], "blocked_until_trusted")
-        self.assertEqual(outcome["reason_code"], "evidence-incomplete")
+        self.assertEqual(outcome["reason_code"], "invalid-evidence")
 
     def test_private_migration_fixture_binds_atomic_aggregate_cutover(self) -> None:
         fixture = json.loads(MIGRATION_FIXTURE_PATH.read_text(encoding="utf-8"))

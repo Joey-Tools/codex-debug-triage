@@ -1,16 +1,25 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
+  "source_organization": {
+    "id": 283943935,
+    "login": "Joey-Tools"
+  },
   "target_repository": {
     "id": 1242512092,
     "full_name": "Joey-Tools/codex-debug-triage",
     "default_branch": "master"
   },
   "ruleset": {
-    "source_type": "Repository",
-    "source": "Joey-Tools/codex-debug-triage",
+    "source_type": "Organization",
+    "source": "Joey-Tools",
     "target": "branch",
     "enforcement": "active",
     "conditions": {
+      "repository_id": {
+        "repository_ids": [
+          1242512092
+        ]
+      },
       "ref_name": {
         "include": [
           "~DEFAULT_BRANCH"
@@ -28,17 +37,14 @@
     "state": "active",
     "event": "pull_request_target",
     "check_name": "cisco-cutover-admission",
+    "provider": {
+      "id": 15368,
+      "slug": "github-actions"
+    },
     "do_not_enforce_on_create": false,
     "require_exact_sha": true
   },
   "disallowed_status_contexts": [
     "cisco-cutover-admission"
-  ],
-  "required_collection_flags": [
-    "repository_complete",
-    "rulesets_complete",
-    "workflow_metadata_complete",
-    "workflow_run_complete",
-    "check_runs_complete"
   ]
 }
