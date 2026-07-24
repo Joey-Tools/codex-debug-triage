@@ -1539,6 +1539,86 @@ class ArchiveTriageTests(unittest.TestCase):
                     stderr.getvalue(),
                 )
 
+    def test_deflate_standard_compression_option_flag_combinations_are_allowed(
+        self,
+    ) -> None:
+        self.assertEqual(MODULE.DEFLATE_OPTION_FLAGS, 0x0006)
+        for flag_bits in (0x0000, 0x0002, 0x0004, 0x0006):
+            with self.subTest(flag_bits=f"0x{flag_bits:04x}"):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    archive_path = Path(temp_dir) / "deflate-options.zip"
+                    with zipfile.ZipFile(archive_path, "w") as archive:
+                        archive.writestr(
+                            "logs/member.log",
+                            "deflate-option\n",
+                            compress_type=zipfile.ZIP_DEFLATED,
+                        )
+                    self._replace_member_flag_bits(
+                        archive_path,
+                        ordinal=1,
+                        flag_bits=flag_bits,
+                    )
+                    stdout = io.StringIO()
+                    stderr = io.StringIO()
+                    with redirect_stdout(stdout), redirect_stderr(stderr):
+                        rc = MODULE.cmd_zip_show(
+                            self._show_args(
+                                archive_path,
+                                member="logs/member.log",
+                            )
+                        )
+
+                self.assertEqual(rc, 0, stderr.getvalue())
+                self.assertEqual(stderr.getvalue(), "")
+                self.assertIn("deflate-option", stdout.getvalue())
+
+    def test_deflate_options_do_not_allow_encryption_or_dangerous_flags(
+        self,
+    ) -> None:
+        dangerous_bits = {
+            "encryption": 0x0001,
+            "patched-data": 0x0020,
+            "strong-encryption": 0x0040,
+            "masked-header": 0x2000,
+        }
+        for label, dangerous_bit in dangerous_bits.items():
+            with self.subTest(flag=label):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    archive_path = Path(temp_dir) / f"{label}.zip"
+                    with zipfile.ZipFile(archive_path, "w") as archive:
+                        archive.writestr(
+                            "logs/member.log",
+                            "blocked\n",
+                            compress_type=zipfile.ZIP_DEFLATED,
+                        )
+                    self._replace_member_flag_bits(
+                        archive_path,
+                        ordinal=1,
+                        flag_bits=MODULE.DEFLATE_OPTION_FLAGS | dangerous_bit,
+                    )
+                    stdout = io.StringIO()
+                    stderr = io.StringIO()
+                    with mock.patch.object(
+                        MODULE,
+                        "BoundedMemberReader",
+                        wraps=MODULE.BoundedMemberReader,
+                    ) as reader:
+                        with redirect_stdout(stdout), redirect_stderr(stderr):
+                            rc = MODULE.cmd_zip_show(
+                                self._show_args(
+                                    archive_path,
+                                    member="logs/member.log",
+                                )
+                            )
+
+                self.assertEqual(rc, 1)
+                reader.assert_not_called()
+                self.assertEqual(stdout.getvalue(), "")
+                self.assertIn(
+                    "unsupported ZIP general-purpose flag bits",
+                    stderr.getvalue(),
+                )
+
     def test_nonzero_member_disk_start_is_rejected_before_zipfile(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             archive_path = self._make_archive(Path(temp_dir))
@@ -4483,6 +4563,8 @@ class BugTriageDocumentationTests(unittest.TestCase):
         self,
         evidence: dict[str, object],
         *,
+        expected_run_attempt: int = 1,
+        expected_run_id: int = 10101,
         expected_ruleset_id: int | None = None,
         expected_workflow_id: int | None = None,
         expected_workflow_sha: str | None = None,
@@ -4498,6 +4580,8 @@ class BugTriageDocumentationTests(unittest.TestCase):
             admission = ENFORCEMENT_MODULE.validate_enforcement(
                 contract,
                 evidence,
+                expected_run_attempt=expected_run_attempt,
+                expected_run_id=expected_run_id,
                 expected_ruleset_id=ruleset_id,
                 expected_workflow_id=workflow_id,
                 expected_workflow_sha=workflow_sha,
@@ -4628,6 +4712,9 @@ class BugTriageDocumentationTests(unittest.TestCase):
         self.assertIn("without gaps or unreferenced\nrecords", recipe)
         self.assertIn("local and central ZIP64\nextra/version/size", recipe)
         self.assertIn("accepts only stored and DEFLATE members", recipe)
+        self.assertIn("The four DEFLATE option", recipe)
+        self.assertIn("`0x0000`, `0x0002`, `0x0004`, and `0x0006`", recipe)
+        self.assertIn("stored\nmembers still reject", recipe)
         self.assertIn("rejects those\nmethods before opening a decompressor", recipe)
         self.assertIn("absence of trailing compressed data", recipe)
 
@@ -4734,6 +4821,9 @@ class BugTriageDocumentationTests(unittest.TestCase):
         self.assertIn("Post-Cutover Decommission Transaction", migration)
         self.assertIn("create-if-absent repository-variable lease", migration)
         self.assertIn("does not document conditional `If-Match`", migration)
+        self.assertIn("--expected-run-id", migration)
+        self.assertIn("--expected-run-attempt", migration)
+        self.assertIn("A later attempt supersedes an older", migration)
         self.assertIn("blocked-permission", migration)
         self.assertIn("http_status=403", migration)
 
@@ -5195,6 +5285,8 @@ class BugTriageDocumentationTests(unittest.TestCase):
         receipt, admission = ENFORCEMENT_MODULE.collect_and_validate(
             client,
             contract,
+            expected_run_attempt=1,
+            expected_run_id=10101,
             expected_ruleset_id=self._ruleset_id,
             expected_workflow_id=self._workflow_id,
             expected_workflow_sha=self._workflow_source_commit,
@@ -5284,6 +5376,8 @@ class BugTriageDocumentationTests(unittest.TestCase):
             ENFORCEMENT_MODULE.collect_and_validate(
                 client,
                 contract,
+                expected_run_attempt=1,
+                expected_run_id=10101,
                 expected_ruleset_id=self._ruleset_id,
                 expected_workflow_id=self._workflow_id,
                 expected_workflow_sha=self._workflow_source_commit,
@@ -5328,6 +5422,8 @@ class BugTriageDocumentationTests(unittest.TestCase):
             ENFORCEMENT_MODULE.collect_and_validate(
                 client,
                 contract,
+                expected_run_attempt=1,
+                expected_run_id=10101,
                 expected_ruleset_id=self._ruleset_id,
                 expected_workflow_id=self._workflow_id,
                 expected_workflow_sha=self._workflow_source_commit,
@@ -5367,6 +5463,8 @@ class BugTriageDocumentationTests(unittest.TestCase):
         _, admission = ENFORCEMENT_MODULE.collect_and_validate(
             client,
             contract,
+            expected_run_attempt=1,
+            expected_run_id=10101,
             expected_ruleset_id=self._ruleset_id,
             expected_workflow_id=self._workflow_id,
             expected_workflow_sha=self._workflow_source_commit,
@@ -5391,6 +5489,10 @@ class BugTriageDocumentationTests(unittest.TestCase):
                         "7",
                         "--expected-ruleset-id",
                         str(self._ruleset_id),
+                        "--expected-run-id",
+                        "10101",
+                        "--expected-run-attempt",
+                        "1",
                         "--expected-workflow-id",
                         str(self._workflow_id),
                         "--expected-workflow-sha",
@@ -5516,6 +5618,10 @@ class BugTriageDocumentationTests(unittest.TestCase):
             str(self._pull_request_number),
             "--expected-ruleset-id",
             str(self._ruleset_id),
+            "--expected-run-id",
+            "10101",
+            "--expected-run-attempt",
+            "1",
             "--expected-workflow-id",
             str(self._workflow_id),
             "--expected-workflow-sha",
@@ -5569,6 +5675,10 @@ class BugTriageDocumentationTests(unittest.TestCase):
             "7",
             "--expected-ruleset-id",
             str(self._ruleset_id),
+            "--expected-run-id",
+            "10101",
+            "--expected-run-attempt",
+            "1",
             "--expected-workflow-id",
             str(self._workflow_id),
             "--expected-workflow-sha",
@@ -5617,6 +5727,13 @@ class BugTriageDocumentationTests(unittest.TestCase):
             "https://api.github.com/repos/Joey-Tools/codex-debug-triage/pulls/7",
         )
         execution = outcome["trusted_execution"]
+        self.assertEqual(
+            execution["selection"],
+            {
+                "expected_run_attempt": 1,
+                "expected_run_id": 10101,
+            },
+        )
         self.assertEqual(execution["run"]["id"], 10101)
         self.assertEqual(execution["run"]["run_attempt"], 1)
         self.assertEqual(execution["job"]["id"], 20202)
@@ -5672,6 +5789,8 @@ class BugTriageDocumentationTests(unittest.TestCase):
         admission = ENFORCEMENT_MODULE.validate_enforcement(
             contract,
             evidence,
+            expected_run_attempt=1,
+            expected_run_id=10101,
             expected_ruleset_id=self._ruleset_id,
             expected_workflow_id=self._workflow_id,
             expected_workflow_sha=self._workflow_source_commit,
@@ -5924,6 +6043,97 @@ class BugTriageDocumentationTests(unittest.TestCase):
         self.assertEqual(outcome["classification"], "blocked_until_trusted")
         self.assertEqual(outcome["reason_code"], "candidate-duplicate-context")
 
+    def test_enforcement_doctor_selects_exact_successful_rerun_attempt(
+        self,
+    ) -> None:
+        evidence = self._matching_enforcement_evidence()
+        run = evidence["workflow_runs"][0]
+        run["run_attempt"] = 2
+
+        first_job = evidence["jobs"][0]
+        first_check = evidence["check_runs"][0]
+        first_job["conclusion"] = "failure"
+        first_check["conclusion"] = "failure"
+
+        second_check_url = (
+            "https://api.github.com/repos/"
+            "Joey-Tools/codex-debug-triage/check-runs/20203"
+        )
+        second_job = self._copy_json(first_job)
+        second_job.update(
+            {
+                "check_run_url": second_check_url,
+                "conclusion": "success",
+                "html_url": (
+                    "https://github.com/Joey-Tools/codex-debug-triage/"
+                    "actions/runs/10101/job/20203"
+                ),
+                "id": 20203,
+                "run_attempt": 2,
+                "status": "completed",
+                "url": (
+                    "https://api.github.com/repos/"
+                    "Joey-Tools/codex-debug-triage/actions/jobs/20203"
+                ),
+            }
+        )
+        second_check = self._copy_json(first_check)
+        second_check.update(
+            {
+                "conclusion": "success",
+                "details_url": second_job["html_url"],
+                "html_url": second_job["html_url"],
+                "id": 20203,
+                "status": "completed",
+                "url": second_check_url,
+            }
+        )
+        evidence["jobs"].append(second_job)
+        evidence["check_runs"].append(second_check)
+
+        result = self._run_enforcement_doctor(
+            evidence,
+            expected_run_id=10101,
+            expected_run_attempt=2,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        outcome = json.loads(result.stdout)
+        self.assertEqual(outcome["trusted_workflow_run_id"], 10101)
+        self.assertEqual(outcome["trusted_check_run_id"], 20203)
+
+        superseded = self._run_enforcement_doctor(
+            evidence,
+            expected_run_id=10101,
+            expected_run_attempt=1,
+        )
+        self.assertEqual(superseded.returncode, 1)
+        self.assertEqual(
+            json.loads(superseded.stdout)["reason_code"],
+            "selected-run-attempt-superseded",
+        )
+
+    def test_enforcement_doctor_requires_exact_run_and_attempt_selection(
+        self,
+    ) -> None:
+        evidence = self._matching_enforcement_evidence()
+        for label, run_id, run_attempt in (
+            ("wrong-run", 10102, 1),
+            ("missing-attempt", 10101, 2),
+        ):
+            with self.subTest(selection=label):
+                result = self._run_enforcement_doctor(
+                    evidence,
+                    expected_run_id=run_id,
+                    expected_run_attempt=run_attempt,
+                )
+
+                self.assertEqual(result.returncode, 1)
+                self.assertEqual(
+                    json.loads(result.stdout)["reason_code"],
+                    "selected-run-attempt-missing",
+                )
+
     def test_enforcement_doctor_requires_present_successful_trusted_run(
         self,
     ) -> None:
@@ -6120,7 +6330,8 @@ class BugTriageDocumentationTests(unittest.TestCase):
             {
                 "source": "personal_codex/AGENTS.md",
                 "target": "AGENTS.md",
-                "remote_build_provider": "skills/cisco-build-artifacts",
+                "cisco_build_fetch_and_archive": "skills/cisco-build-artifacts",
+                "ordinary_local_diagnosis": "base-model-no-skill-route",
             },
         )
         self.assertEqual(
@@ -6137,6 +6348,15 @@ class BugTriageDocumentationTests(unittest.TestCase):
                 "source": "personal_codex/skills/bug-triage-playbook",
                 "target": "skills/bug-triage-playbook",
                 "replacement_target": "skills/cisco-build-artifacts",
+                "replacement_scope": "cisco-build-fetch-and-archive-only",
+            },
+        )
+        self.assertEqual(
+            activation["public_asset"],
+            {
+                "repository": "Joey-Tools/codex-debug-triage",
+                "status": "optional-source-only",
+                "installed_route": False,
             },
         )
         self.assertEqual(
@@ -6238,6 +6458,39 @@ class BugTriageDocumentationTests(unittest.TestCase):
         trusted_workflow = CUTOVER_TRUSTED_WORKFLOW_PATH.read_text(encoding="utf-8")
         self.assertIn("MAX_RECEIPT_BYTES = 35 * 1024", trusted_workflow)
 
+    def test_post_cutover_routing_does_not_depend_on_removed_skill(self) -> None:
+        fixture = json.loads(MIGRATION_FIXTURE_PATH.read_text(encoding="utf-8"))
+        activation = fixture["activation"]
+        self.assertEqual(
+            activation["routing_policy"]["cisco_build_fetch_and_archive"],
+            "skills/cisco-build-artifacts",
+        )
+        self.assertEqual(
+            activation["routing_policy"]["ordinary_local_diagnosis"],
+            "base-model-no-skill-route",
+        )
+        self.assertEqual(
+            activation["catalog"]["removed_target"],
+            "skills/bug-triage-playbook",
+        )
+        self.assertEqual(
+            activation["removed_link"]["replacement_scope"],
+            "cisco-build-fetch-and-archive-only",
+        )
+        self.assertFalse(activation["public_asset"]["installed_route"])
+
+        migration = (REPO_ROOT / "docs/cisco-build-artifacts-migration.md").read_text(
+            encoding="utf-8"
+        )
+        handoff = migration.split("## Handoff To Base-Model Diagnosis", 1)[1].split(
+            "## Private Migration Tests",
+            1,
+        )[0]
+        self.assertNotIn("explicitly invoke `$bug-triage-playbook`", handoff)
+        self.assertIn("ordinary base-model diagnosis", handoff)
+        self.assertIn("must not invoke or\nrecreate an installed", handoff)
+        self.assertIn("optional source tool", handoff)
+
     def test_cutover_validator_without_receipt_remains_blocked(self) -> None:
         result = self._run_cutover_validator()
 
@@ -6290,6 +6543,42 @@ class BugTriageDocumentationTests(unittest.TestCase):
             f"releases/{self._private_release_commit}",
         )
         self.assertEqual(outcome["receipt_sha256"], receipt_sha256)
+
+    def test_cutover_admission_rejects_route_back_to_removed_skill(self) -> None:
+        fixture = json.loads(MIGRATION_FIXTURE_PATH.read_text(encoding="utf-8"))
+        receipt = self._matching_cutover_receipt(fixture)
+        receipt["activation"]["routing_policy"]["ordinary_local_diagnosis"] = (
+            "skills/bug-triage-playbook"
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            receipt_path = temp_root / "route-back-receipt.json"
+            receipt_sha256 = self._write_cutover_receipt(receipt_path, receipt)
+            local_result = self._run_cutover_validator(
+                receipt_path=receipt_path,
+                receipt_sha256=receipt_sha256,
+            )
+            receipt_payload = receipt_path.read_bytes()
+            workflow_result = self._run_trusted_workflow_program(
+                environment=self._trusted_workflow_environment(
+                    receipt_payload=receipt_payload,
+                ),
+                cwd=temp_root,
+            )
+
+        for label, result in (
+            ("local-validator", local_result),
+            ("protected-workflow", workflow_result),
+        ):
+            with self.subTest(admission=label):
+                self.assertEqual(result.returncode, 1, result.stderr)
+                outcome = json.loads(result.stdout)
+                self.assertEqual(
+                    outcome["classification"],
+                    "blocked_until_trusted",
+                )
+                self.assertIn("receipt activation", outcome["reason"])
+                self.assertIn("differs", outcome["reason"])
 
     def test_cutover_validator_rejects_receipt_digest_not_independently_pinned(
         self,

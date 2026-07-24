@@ -55,7 +55,8 @@ EXPECTED_ACTIVATION = {
     "routing_policy": {
         "source": "personal_codex/AGENTS.md",
         "target": "AGENTS.md",
-        "remote_build_provider": "skills/cisco-build-artifacts",
+        "cisco_build_fetch_and_archive": "skills/cisco-build-artifacts",
+        "ordinary_local_diagnosis": "base-model-no-skill-route",
     },
     "catalog": {
         "manifest": "personal_codex/private-sync-manifest.json",
@@ -66,6 +67,12 @@ EXPECTED_ACTIVATION = {
         "source": "personal_codex/skills/bug-triage-playbook",
         "target": "skills/bug-triage-playbook",
         "replacement_target": "skills/cisco-build-artifacts",
+        "replacement_scope": "cisco-build-fetch-and-archive-only",
+    },
+    "public_asset": {
+        "repository": "Joey-Tools/codex-debug-triage",
+        "status": "optional-source-only",
+        "installed_route": False,
     },
 }
 EXPECTED_TRUST_GATES = [

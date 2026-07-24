@@ -100,6 +100,7 @@ DATA_DESCRIPTOR_SIGNATURE = b"PK\x07\x08"
 DATA_DESCRIPTOR_FLAG = 0x08
 UTF8_FILENAME_FLAG = 0x800
 SUPPORTED_GENERAL_PURPOSE_FLAGS = DATA_DESCRIPTOR_FLAG | UTF8_FILENAME_FLAG
+DEFLATE_OPTION_FLAGS = 0x0002 | 0x0004
 ZIP64_EXTRA_FIELD_ID = 0x0001
 UINT32_MAX = 0xFFFFFFFF
 UINT64_MAX = 0xFFFFFFFFFFFFFFFF
@@ -1609,13 +1610,18 @@ def _decode_central_directory_name(
 def _validate_general_purpose_flags(
     flag_bits: int,
     *,
+    compression_method: int,
     ordinal: int,
 ) -> None:
-    unsupported = flag_bits & ~SUPPORTED_GENERAL_PURPOSE_FLAGS
+    supported = SUPPORTED_GENERAL_PURPOSE_FLAGS
+    if compression_method == zipfile.ZIP_DEFLATED:
+        supported |= DEFLATE_OPTION_FLAGS
+    unsupported = flag_bits & ~supported
     if unsupported:
         raise NotImplementedError(
             "unsupported ZIP general-purpose flag bits: "
-            f"ordinal={ordinal}; flags=0x{flag_bits:04x}; "
+            f"ordinal={ordinal}; method={compression_method}; "
+            f"flags=0x{flag_bits:04x}; "
             f"unsupported=0x{unsupported:04x}"
         )
 
@@ -2318,6 +2324,7 @@ def _member_payload_layout(
         )
     _validate_general_purpose_flags(
         local_flags,
+        compression_method=local_compression,
         ordinal=member.identity.ordinal,
     )
     if local_compression != info.compress_type:
@@ -2488,6 +2495,7 @@ def _preflight_selected_members(
             )
         _validate_general_purpose_flags(
             member.info.flag_bits,
+            compression_method=member.info.compress_type,
             ordinal=member.identity.ordinal,
         )
         total_member_bytes = _validate_member_budget(

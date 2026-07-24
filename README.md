@@ -8,6 +8,13 @@ reference, routing, and tests while adding the bounded local ZIP helper. The
 Jenkins route cannot be retired until the independently trusted cutover
 admission workflow is installed on the protected default branch.
 
+After the admitted private cutover, `cisco-build-artifacts` owns Cisco fetch
+and bounded archive handling, while ordinary local diagnosis falls through to
+the base model without an installed skill route. This public repository and its
+local ZIP helper may remain available as optional source assets, but
+`bug-triage-playbook` is absent from the active private catalog and installed
+links.
+
 ## Private Migration
 
 The proposed authenticated Jenkins retirement and the contract for moving it to
@@ -45,7 +52,9 @@ then pass merge readiness. None of those live mutations is automatic.
 evidence file. It performs an authenticated, read-only `github.com` preflight
 with `gh`, collects every API page through an explicit empty terminal page,
 and revalidates the protected snapshot before admitting the selector, pinned
-ruleset, workflow, PR head, run attempt, job, and check run. Sanitized failures
+ruleset, workflow, PR head, administrator-pinned exact run ID/attempt, job, and
+check run. Older or additional same-name lineage is allowed only when it comes
+from the same trusted workflow identity. Sanitized failures
 retain a fixed endpoint class, HTTP status when available, and stable reason
 code without raw response bodies, headers, environment, or tokens. Until it returns
 `classification=admitted`, retirement remains `blocked_until_trusted` and the

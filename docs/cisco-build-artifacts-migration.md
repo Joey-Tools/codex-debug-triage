@@ -18,14 +18,19 @@ The private skill owns:
 - approval and network preflight
 - build, console, API, and artifact identity resolution
 - bounded remote reads and downloads
+- bounded archive validation, extraction, and evidence publication for fetched
+  Cisco build artifacts
 - authentication and HTTP failure classification
 - private examples and job-family guidance
 
-The public `bug-triage-playbook` owns only the downstream reasoning workflow
-after an authoritative artifact is available locally. Its
-`scripts/archive_triage.py` helper may inspect local ZIP members but performs no
-network or authentication work. That local helper keeps its own conservative
-size and count defaults as immutable hard ceilings. Its in-process
+After cutover, ordinary local-log and local-artifact diagnosis returns directly
+to the base model; it has no installed skill route or catalog dependency. The
+public repository may retain `scripts/archive_triage.py`, references, and tests
+as optional source assets, but the installed private overlay neither links nor
+routes to `bug-triage-playbook`. When explicitly used from this source
+repository, the optional local helper performs no network or authentication
+work and keeps its own conservative size and count defaults as immutable hard
+ceilings. Its in-process
 `ITIMER_REAL` budget is best effort: it covers central-directory validation,
 decompression, the post-selection validation drain, bounded output publication,
 and the underlying output flush when the operating system returns control to
@@ -52,13 +57,16 @@ validate all of these changes together:
 1. install the complete `personal_codex/skills/cisco-build-artifacts` source at
    `skills/cisco-build-artifacts`
 2. update the release's private `AGENTS.md` routing to select that provider for
-   Cisco/Jenkins build acquisition
+   Cisco/Jenkins build acquisition and bounded archive inspection, while
+   ordinary local diagnosis falls through to the base model without a skill
+   route
 3. update `personal_codex/private-sync-manifest.json` so the active catalog
    includes `skills/cisco-build-artifacts` and excludes
    `skills/bug-triage-playbook`
 4. include the `removed_links` record that removes
    `skills/bug-triage-playbook` and names
-   `skills/cisco-build-artifacts` as its replacement
+   `skills/cisco-build-artifacts` as the replacement only for Cisco build fetch
+   and archive handling
 
 Package validation must prove the provider files, routing policy, active
 catalog, and removal record belong to that same release. The private overlay
@@ -73,7 +81,8 @@ the installed pointer transition has been verified. If the aggregate cannot
 machine-prove this atomic activation, retain a compatible
 `bug-triage-playbook` route and omit its `removed_links` retirement; never point
 installed guidance at a provider that the same trusted release does not
-install.
+install. That compatibility fallback exists only before cutover admission; a
+completed cutover has no active or installed `bug-triage-playbook` route.
 
 The non-private cutover fixture at
 `tests/fixtures/cisco-build-artifacts-migration.json` records only repository
@@ -288,10 +297,15 @@ items, page/call/search caps that prevent proof of exhaustion, a missing or
 mutable workflow binding, the wrong organization/repository/ruleset/workflow
 identity, a disabled or evaluating ruleset, any bypass actor, wrong repository
 or default-branch conditions, or any same-name `required_status_checks` rule.
-It also rejects every current `cisco-cutover-admission` check whose native
+It also rejects every collected `cisco-cutover-admission` check whose native
 run/job/provider lineage differs from the pinned workflow. Therefore a green
 candidate-authored duplicate cannot compensate for a red or absent trusted
-workflow run.
+workflow run. Multiple executions or rerun attempts on the same frozen head are
+not ambiguous by themselves: the administrator must pin one exact run ID and
+its current attempt number, every collected same-name lineage must still bind
+to the trusted workflow identity, and only the pinned lineage's run, job, and
+check must be complete and successful. A later attempt supersedes an older
+attempt of the same run.
 
 The live preflight is read-only. It invokes only `gh auth status` and fixed
 GitHub REST `GET` endpoints; it does not create, update, evaluate, disable, or
@@ -317,6 +331,8 @@ python3 scripts/doctor_cisco_cutover_enforcement.py \
   --contract docs/cisco-cutover-enforcement-contract.json \
   --pull-request-number <existing-pr-number> \
   --expected-ruleset-id <numeric-ruleset-id> \
+  --expected-run-id <numeric-actions-run-id> \
+  --expected-run-attempt <positive-decimal-attempt> \
   --expected-workflow-id <numeric-workflow-id> \
   --expected-workflow-sha <protected-base-40-lowercase-hex> \
   --candidate-head-sha <retirement-head-40-lowercase-hex>
@@ -326,8 +342,9 @@ The admitted doctor receipt has exact fields for the schema/operation,
 contract and collected-evidence SHA-256 digests, collection timestamps and
 page bounds, authenticated account identity, organization/target repository,
 PR number/head repository ID/head SHA, ruleset source/ID, source workflow
-repository ID/name/path/ref/SHA, and the trusted run/attempt/job/check
-IDs, URLs, provider, status, and conclusion. Blocked output includes the
+repository ID/name/path/ref/SHA, the administrator-pinned run ID/attempt, and
+the trusted run/job/check IDs, URLs, provider, status, and conclusion. Blocked
+output includes the
 available digests plus `reason_code` and `reason`. The receipt is an output of
 the live collection transaction, not reusable evidence input, and no admitted
 receipt is stored in this repository.
@@ -362,11 +379,12 @@ ordinary PR-merge state machine is therefore:
    without changing the frozen head—for example, rerun the target workflow
    attempt or use one of the declared `pull_request_target` activity
    transitions—and observe selector, target admission, run, job, and check
-   success. This document does not perform that mutation automatically.
+   success. Record the exact successful Actions run ID and its current attempt
+   number; this document does not perform that mutation automatically.
 7. Run the live read-only doctor against that exact retirement PR/head. Its
    fully paginated, twice-stable API snapshot must prove selector variables,
    the exact identity-bound rule, and the current successful target
-   run/job/check lineage.
+   run/job/check lineage selected by that exact run ID/attempt.
 8. Immediately before merge, revalidate that the PR is still open, its
    base/head are unchanged, the selector/ruleset/workflow snapshots still match,
    the receipt expectations still name the same head, and the fresh doctor
@@ -582,7 +600,7 @@ To preserve them:
    automatically. Recovery must first verify destination identity and content,
    then retry only the directory durability step under explicit control.
 
-## Handoff Back To Generic Triage
+## Handoff To Base-Model Diagnosis
 
 On a successful fetch, supply at least:
 
@@ -594,8 +612,13 @@ bytes=<downloaded byte count>
 auth_profile=<profile label, never credential material>
 ```
 
-The caller can then explicitly invoke `$bug-triage-playbook` with the local path
-and provenance. The generic skill should not infer or retry Cisco
+The private `cisco-build-artifacts` provider owns any required bounded archive
+inspection and then supplies the resulting local path or bounded excerpts plus
+this provenance to ordinary base-model diagnosis. The caller must not invoke or
+recreate an installed `$bug-triage-playbook` route. A maintainer may explicitly
+use the public repository's helper as an optional source tool, but that choice
+is not an active-catalog entry, installed link, receipt dependency, or generic
+diagnosis router. Base-model diagnosis must not infer or retry Cisco
 authentication.
 
 ## Private Migration Tests

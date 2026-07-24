@@ -1999,6 +1999,8 @@ def _validate_candidate_evidence(
     snapshot: dict[str, Any],
     *,
     contract: dict[str, Any],
+    expected_run_attempt: int,
+    expected_run_id: int,
     expected_workflow_id: int,
     candidate_head_sha: str,
 ) -> dict[str, Any]:
@@ -2021,7 +2023,6 @@ def _validate_candidate_evidence(
     for job_value in jobs:
         job = _exact_dict(job_value, label="workflow job")
         jobs_by_check_url.setdefault(job["check_run_url"], []).append(job)
-    current_lineage: list[dict[str, Any]] = []
     full_lineage: list[dict[str, Any]] = []
     for check_value in checks:
         check = _exact_dict(check_value, label="candidate check run")
@@ -2105,15 +2106,13 @@ def _validate_candidate_evidence(
             "run": run,
         }
         full_lineage.append(lineage)
-        if job["run_attempt"] == run["run_attempt"]:
-            current_lineage.append(lineage)
-    if not current_lineage:
+    if not full_lineage:
         raise _blocked(
             "trusted-check-missing",
-            "no current-attempt same-name check is linked to the selected PR",
+            "no same-name check is linked to the selected PR",
         )
     trusted: list[dict[str, Any]] = []
-    for lineage in current_lineage:
+    for lineage in full_lineage:
         run = lineage["run"]
         job = lineage["job"]
         check = lineage["check_run"]
@@ -2130,18 +2129,34 @@ def _validate_candidate_evidence(
         ):
             raise _blocked(
                 "candidate-duplicate-context",
-                "current same-name check is outside the pinned workflow identity",
+                "same-name check is outside the pinned workflow identity",
             )
         trusted.append(lineage)
-    if len(trusted) != 1:
+    selected_lineage = [
+        lineage
+        for lineage in trusted
+        if lineage["run"]["id"] == expected_run_id
+        and lineage["job"]["run_attempt"] == expected_run_attempt
+    ]
+    if not selected_lineage:
+        raise _blocked(
+            "selected-run-attempt-missing",
+            "administrator-pinned workflow run and attempt were not found",
+        )
+    if len(selected_lineage) != 1:
         raise _blocked(
             "trusted-check-ambiguous",
-            "exactly one current trusted workflow check must bind the selected PR",
+            "administrator-pinned workflow run and attempt are ambiguous",
         )
-    selected = trusted[0]
+    selected = selected_lineage[0]
     run = selected["run"]
     job = selected["job"]
     check = selected["check_run"]
+    if run["run_attempt"] != expected_run_attempt:
+        raise _blocked(
+            "selected-run-attempt-superseded",
+            "administrator-pinned attempt is not the run's current attempt",
+        )
     if run["status"] != "completed" or run["conclusion"] != "success":
         raise _blocked(
             "trusted-workflow-run-failed",
@@ -2177,6 +2192,8 @@ def validate_enforcement(
     contract: dict[str, Any],
     snapshot: dict[str, Any],
     *,
+    expected_run_attempt: int,
+    expected_run_id: int,
     expected_ruleset_id: int,
     expected_workflow_id: int,
     expected_workflow_sha: str,
@@ -2221,6 +2238,8 @@ def validate_enforcement(
     trusted = _validate_candidate_evidence(
         snapshot,
         contract=contract,
+        expected_run_attempt=expected_run_attempt,
+        expected_run_id=expected_run_id,
         expected_workflow_id=expected_workflow_id,
         candidate_head_sha=candidate_head_sha,
     )
@@ -2248,6 +2267,8 @@ def collect_and_validate(
     client: Any,
     contract: dict[str, Any],
     *,
+    expected_run_attempt: int,
+    expected_run_id: int,
     expected_ruleset_id: int,
     expected_workflow_id: int,
     expected_workflow_sha: str,
@@ -2275,6 +2296,8 @@ def collect_and_validate(
     initial_admission = validate_enforcement(
         contract,
         initial,
+        expected_run_attempt=expected_run_attempt,
+        expected_run_id=expected_run_id,
         expected_ruleset_id=expected_ruleset_id,
         expected_workflow_id=expected_workflow_id,
         expected_workflow_sha=expected_workflow_sha,
@@ -2295,6 +2318,8 @@ def collect_and_validate(
     revalidated_admission = validate_enforcement(
         contract,
         revalidation,
+        expected_run_attempt=expected_run_attempt,
+        expected_run_id=expected_run_id,
         expected_ruleset_id=expected_ruleset_id,
         expected_workflow_id=expected_workflow_id,
         expected_workflow_sha=expected_workflow_sha,
@@ -2362,6 +2387,16 @@ def build_parser() -> argparse.ArgumentParser:
         type=_positive_integer_argument,
     )
     parser.add_argument(
+        "--expected-run-id",
+        required=True,
+        type=_positive_integer_argument,
+    )
+    parser.add_argument(
+        "--expected-run-attempt",
+        required=True,
+        type=_positive_integer_argument,
+    )
+    parser.add_argument(
         "--expected-workflow-id",
         required=True,
         type=_positive_integer_argument,
@@ -2389,6 +2424,8 @@ def main() -> int:
         evidence, admission = collect_and_validate(
             client,
             contract,
+            expected_run_attempt=args.expected_run_attempt,
+            expected_run_id=args.expected_run_id,
             expected_ruleset_id=args.expected_ruleset_id,
             expected_workflow_id=args.expected_workflow_id,
             expected_workflow_sha=args.expected_workflow_sha,
@@ -2465,6 +2502,10 @@ def main() -> int:
                 },
                 "schema_version": 3,
                 "trusted_execution": {
+                    "selection": {
+                        "expected_run_attempt": args.expected_run_attempt,
+                        "expected_run_id": args.expected_run_id,
+                    },
                     "check_run": {
                         "app": trusted_check["app"],
                         "check_suite_id": trusted_check["check_suite_id"],

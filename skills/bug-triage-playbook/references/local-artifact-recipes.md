@@ -158,7 +158,12 @@ records. Data-descriptor width is derived from the local and central ZIP64
 extra/version/size representation rather than only the local size fields. It
 rejects prefixed or concatenated ZIP views and multi-disk member starts.
 Before extracting a selected member, it rejects general-purpose flags other
-than the implemented data-descriptor and UTF-8-name semantics.
+than the implemented data-descriptor and UTF-8-name semantics plus DEFLATE's
+standard `0x0002`/`0x0004` compression-option bits. The four DEFLATE option
+combinations `0x0000`, `0x0002`, `0x0004`, and `0x0006` are hints only; stored
+members still reject those method-specific bits, and encryption, patched-data,
+strong-encryption, masked-header, and every other unsupported bit remain
+blocked.
 For extraction, it accepts only stored and DEFLATE members. Python's BZIP2 and
 LZMA ZIP paths can allocate decompressor-internal output or dictionaries before
 the helper can enforce its actual-byte budget, so the helper rejects those
