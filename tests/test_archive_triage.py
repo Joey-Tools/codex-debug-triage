@@ -27,6 +27,12 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 SKILL_ROOT = REPO_ROOT / "skills/bug-triage-playbook"
 SCRIPT_PATH = SKILL_ROOT / "scripts/archive_triage.py"
 CUTOVER_VALIDATOR_PATH = REPO_ROOT / "scripts/validate_cisco_cutover_receipt.py"
+CUTOVER_ENFORCEMENT_DOCTOR_PATH = (
+    REPO_ROOT / "scripts/doctor_cisco_cutover_enforcement.py"
+)
+CUTOVER_ENFORCEMENT_CONTRACT_PATH = (
+    REPO_ROOT / "docs/cisco-cutover-enforcement-contract.json"
+)
 CUTOVER_TRUSTED_WORKFLOW_PATH = (
     REPO_ROOT / ".github/workflows/cisco-cutover-admission.yml"
 )
@@ -3822,6 +3828,9 @@ class BugTriageDocumentationTests(unittest.TestCase):
     _canonical_commit = "1" * 40
     _private_release_commit = "2" * 40
     _release_manifest_sha256 = "3" * 64
+    _workflow_source_commit = "4" * 40
+    _ruleset_id = 97531
+    _workflow_id = 86420
     _trusted_gate_environment_names = (
         "EVENT_REPOSITORY",
         "PR_BASE_REF",
@@ -3986,6 +3995,144 @@ class BugTriageDocumentationTests(unittest.TestCase):
             env=environment,
             cwd=cwd,
         )
+
+    def _matching_enforcement_evidence(self) -> dict[str, object]:
+        contract = json.loads(
+            CUTOVER_ENFORCEMENT_CONTRACT_PATH.read_text(encoding="utf-8")
+        )
+        repository = contract["target_repository"]
+        workflow = contract["required_workflow"]
+        workflow_identity = {
+            "workflow_id": self._workflow_id,
+            "repository_id": workflow["repository_id"],
+            "workflow_path": workflow["path"],
+            "workflow_ref": workflow["ref"],
+            "workflow_sha": self._workflow_source_commit,
+        }
+        return {
+            "schema_version": 1,
+            "collection": {
+                flag: True for flag in contract["required_collection_flags"]
+            },
+            "repository": {
+                "id": repository["id"],
+                "full_name": repository["full_name"],
+                "default_branch": repository["default_branch"],
+                "archived": False,
+                "disabled": False,
+            },
+            "workflow": {
+                "id": self._workflow_id,
+                "repository_id": workflow["repository_id"],
+                "repository_full_name": workflow["repository_full_name"],
+                "path": workflow["path"],
+                "ref": workflow["ref"],
+                "sha": self._workflow_source_commit,
+                "state": workflow["state"],
+            },
+            "rulesets": [
+                {
+                    "id": self._ruleset_id,
+                    "name": "Cisco cutover required workflow",
+                    "source_type": contract["ruleset"]["source_type"],
+                    "source": contract["ruleset"]["source"],
+                    "target": contract["ruleset"]["target"],
+                    "enforcement": contract["ruleset"]["enforcement"],
+                    "bypass_actors": contract["ruleset"]["bypass_actors"],
+                    "conditions": contract["ruleset"]["conditions"],
+                    "rules": [
+                        {"type": "deletion"},
+                        {"type": "non_fast_forward"},
+                        {
+                            "type": "workflows",
+                            "parameters": {
+                                "do_not_enforce_on_create": workflow[
+                                    "do_not_enforce_on_create"
+                                ],
+                                "workflows": [
+                                    {
+                                        "repository_id": workflow["repository_id"],
+                                        "path": workflow["path"],
+                                        "ref": workflow["ref"],
+                                        "sha": self._workflow_source_commit,
+                                    }
+                                ],
+                            },
+                        },
+                    ],
+                }
+            ],
+            "candidate": {
+                "head_sha": self._canonical_commit,
+                "trusted_workflow_run": {
+                    "id": 10101,
+                    "run_attempt": 1,
+                    **workflow_identity,
+                    "candidate_head_sha": self._canonical_commit,
+                    "event": workflow["event"],
+                    "status": "completed",
+                    "conclusion": "success",
+                },
+                "check_runs": [
+                    {
+                        "id": 20202,
+                        "name": workflow["check_name"],
+                        "head_sha": self._canonical_commit,
+                        "status": "completed",
+                        "conclusion": "success",
+                        **workflow_identity,
+                    }
+                ],
+            },
+        }
+
+    def _run_enforcement_doctor(
+        self,
+        evidence: dict[str, object],
+        *,
+        expected_ruleset_id: int | None = None,
+        expected_workflow_id: int | None = None,
+        expected_workflow_sha: str | None = None,
+        candidate_head_sha: str | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            evidence_path = Path(temp_dir) / "enforcement-evidence.json"
+            evidence_path.write_text(
+                json.dumps(
+                    evidence,
+                    ensure_ascii=True,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            return subprocess.run(
+                [
+                    sys.executable,
+                    str(CUTOVER_ENFORCEMENT_DOCTOR_PATH),
+                    "--contract",
+                    str(CUTOVER_ENFORCEMENT_CONTRACT_PATH),
+                    "--evidence",
+                    str(evidence_path),
+                    "--expected-ruleset-id",
+                    str(expected_ruleset_id or self._ruleset_id),
+                    "--expected-workflow-id",
+                    str(expected_workflow_id or self._workflow_id),
+                    "--expected-workflow-sha",
+                    expected_workflow_sha or self._workflow_source_commit,
+                    "--candidate-head-sha",
+                    candidate_head_sha or self._canonical_commit,
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+
+    @staticmethod
+    def _copy_json(value: dict[str, object]) -> dict[str, object]:
+        return json.loads(json.dumps(value))
 
     def test_bootstrap_retains_legacy_jenkins_entrypoint(self) -> None:
         skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
@@ -4153,6 +4300,13 @@ class BugTriageDocumentationTests(unittest.TestCase):
         )
         self.assertIn("minimum\nordinary PR-merge sequence", migration)
         self.assertIn("restores the Jenkins entrypoint", migration)
+        self.assertIn("is not an enforcement identity", migration)
+        self.assertIn("`type=workflows`, not a named status context", migration)
+        self.assertIn("A branch ref without the exact `sha` is mutable", migration)
+        self.assertIn("candidate-authored\nduplicate cannot compensate", migration)
+        self.assertIn("no `workflows` rule exists", migration)
+        self.assertIn("cannot install a base-owned workflow", migration)
+        self.assertIn("doctor_cisco_cutover_enforcement.py", migration)
 
     def test_trusted_cutover_workflow_has_no_candidate_execution_path(
         self,
@@ -4194,6 +4348,47 @@ class BugTriageDocumentationTests(unittest.TestCase):
                 self.assertIn(name, program)
         self.assertNotIn("CISCO_CUTOVER_", regular_ci)
         self.assertIn("tests.test_jenkins_artifact_probe", regular_ci)
+        self.assertIn("doctor_cisco_cutover_enforcement.py", regular_ci)
+
+    def test_enforcement_contract_binds_required_workflow_identity(self) -> None:
+        contract = json.loads(
+            CUTOVER_ENFORCEMENT_CONTRACT_PATH.read_text(encoding="utf-8")
+        )
+
+        self.assertEqual(contract["schema_version"], 1)
+        self.assertEqual(
+            contract["target_repository"],
+            {
+                "id": 1242512092,
+                "full_name": "Joey-Tools/codex-debug-triage",
+                "default_branch": "master",
+            },
+        )
+        self.assertEqual(contract["ruleset"]["source_type"], "Repository")
+        self.assertEqual(contract["ruleset"]["enforcement"], "active")
+        self.assertEqual(contract["ruleset"]["bypass_actors"], [])
+        self.assertEqual(
+            contract["ruleset"]["conditions"],
+            {
+                "ref_name": {
+                    "include": ["~DEFAULT_BRANCH"],
+                    "exclude": [],
+                }
+            },
+        )
+        workflow = contract["required_workflow"]
+        self.assertEqual(workflow["repository_id"], 1242512092)
+        self.assertEqual(
+            workflow["path"],
+            ".github/workflows/cisco-cutover-admission.yml",
+        )
+        self.assertEqual(workflow["ref"], "refs/heads/master")
+        self.assertTrue(workflow["require_exact_sha"])
+        self.assertFalse(workflow["do_not_enforce_on_create"])
+        self.assertEqual(
+            contract["disallowed_status_contexts"],
+            ["cisco-cutover-admission"],
+        )
 
     def test_trusted_cutover_workflow_cannot_green_without_inputs(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -4355,6 +4550,246 @@ class BugTriageDocumentationTests(unittest.TestCase):
                     "blocked_until_trusted",
                 )
                 self.assertIn("is a placeholder", outcome["reason"])
+
+    def test_enforcement_doctor_admits_exact_required_workflow_identity(
+        self,
+    ) -> None:
+        result = self._run_enforcement_doctor(
+            self._matching_enforcement_evidence()
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stderr, "")
+        outcome = json.loads(result.stdout)
+        self.assertEqual(outcome["classification"], "admitted")
+        self.assertEqual(outcome["ruleset_id"], self._ruleset_id)
+        self.assertEqual(
+            outcome["trusted_workflow"],
+            {
+                "id": self._workflow_id,
+                "path": ".github/workflows/cisco-cutover-admission.yml",
+                "ref": "refs/heads/master",
+                "repository_id": 1242512092,
+                "sha": self._workflow_source_commit,
+            },
+        )
+        self.assertEqual(outcome["candidate_head_sha"], self._canonical_commit)
+        self.assertEqual(outcome["trusted_workflow_run_id"], 10101)
+        self.assertEqual(outcome["trusted_check_run_id"], 20202)
+        self.assertRegex(outcome["contract_sha256"], r"\A[0-9a-f]{64}\Z")
+        self.assertRegex(outcome["evidence_sha256"], r"\A[0-9a-f]{64}\Z")
+
+    def test_enforcement_doctor_rejects_same_name_status_only_rule(
+        self,
+    ) -> None:
+        evidence = self._matching_enforcement_evidence()
+        evidence["rulesets"][0]["rules"].append(
+            {
+                "type": "required_status_checks",
+                "parameters": {
+                    "do_not_enforce_on_create": False,
+                    "required_status_checks": [
+                        {
+                            "context": "cisco-cutover-admission",
+                            "integration_id": 15368,
+                        }
+                    ],
+                    "strict_required_status_checks_policy": True,
+                },
+            }
+        )
+        result = self._run_enforcement_doctor(evidence)
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        outcome = json.loads(result.stdout)
+        self.assertEqual(outcome["classification"], "blocked_until_trusted")
+        self.assertEqual(outcome["reason_code"], "spoofable-status-rule")
+
+    def test_enforcement_doctor_blocks_green_duplicate_without_trusted_run(
+        self,
+    ) -> None:
+        evidence = self._matching_enforcement_evidence()
+        evidence["candidate"]["trusted_workflow_run"] = None
+        duplicate = evidence["candidate"]["check_runs"][0]
+        duplicate["id"] = 30303
+        duplicate["workflow_id"] = self._workflow_id + 1
+        duplicate["workflow_path"] = ".github/workflows/candidate.yml"
+        duplicate["workflow_ref"] = "refs/pull/7/head"
+        duplicate["workflow_sha"] = self._canonical_commit
+        result = self._run_enforcement_doctor(evidence)
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        outcome = json.loads(result.stdout)
+        self.assertEqual(outcome["classification"], "blocked_until_trusted")
+        self.assertEqual(outcome["reason_code"], "candidate-duplicate-context")
+
+    def test_enforcement_doctor_blocks_green_duplicate_and_red_trusted_run(
+        self,
+    ) -> None:
+        evidence = self._matching_enforcement_evidence()
+        evidence["candidate"]["trusted_workflow_run"]["conclusion"] = "failure"
+        evidence["candidate"]["check_runs"][0]["conclusion"] = "failure"
+        duplicate = self._copy_json(
+            evidence["candidate"]["check_runs"][0]
+        )
+        duplicate.update(
+            {
+                "id": 30303,
+                "conclusion": "success",
+                "workflow_id": self._workflow_id + 1,
+                "workflow_path": ".github/workflows/candidate.yml",
+                "workflow_ref": "refs/pull/7/head",
+                "workflow_sha": self._canonical_commit,
+            }
+        )
+        evidence["candidate"]["check_runs"].append(duplicate)
+        result = self._run_enforcement_doctor(evidence)
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        outcome = json.loads(result.stdout)
+        self.assertEqual(outcome["classification"], "blocked_until_trusted")
+        self.assertEqual(outcome["reason_code"], "candidate-duplicate-context")
+
+    def test_enforcement_doctor_requires_present_successful_trusted_run(
+        self,
+    ) -> None:
+        cases = {
+            "absent": (None, "trusted-workflow-run-missing"),
+            "red": ("failure", "trusted-workflow-run-failed"),
+            "pending": (None, "trusted-workflow-run-failed"),
+        }
+        for label, (conclusion, reason_code) in cases.items():
+            with self.subTest(run=label):
+                evidence = self._matching_enforcement_evidence()
+                if label == "absent":
+                    evidence["candidate"]["trusted_workflow_run"] = None
+                elif label == "pending":
+                    run = evidence["candidate"]["trusted_workflow_run"]
+                    run["status"] = "in_progress"
+                    run["conclusion"] = conclusion
+                else:
+                    evidence["candidate"]["trusted_workflow_run"][
+                        "conclusion"
+                    ] = conclusion
+                result = self._run_enforcement_doctor(evidence)
+
+                self.assertEqual(result.returncode, 1, result.stderr)
+                outcome = json.loads(result.stdout)
+                self.assertEqual(
+                    outcome["classification"],
+                    "blocked_until_trusted",
+                )
+                self.assertEqual(outcome["reason_code"], reason_code)
+
+    def test_enforcement_doctor_rejects_mutable_or_wrong_workflow_binding(
+        self,
+    ) -> None:
+        cases = {
+            "missing-sha": ("sha", None, "workflow-binding-not-immutable"),
+            "missing-ref": ("ref", None, "workflow-binding-not-immutable"),
+            "wrong-sha": (
+                "sha",
+                "5" * 40,
+                "required-workflow-binding-mismatch",
+            ),
+            "wrong-ref": (
+                "ref",
+                "refs/heads/candidate",
+                "required-workflow-binding-mismatch",
+            ),
+            "wrong-repository": (
+                "repository_id",
+                999,
+                "required-workflow-binding-mismatch",
+            ),
+            "wrong-path": (
+                "path",
+                ".github/workflows/candidate.yml",
+                "required-workflow-binding-mismatch",
+            ),
+        }
+        for label, (field, value, reason_code) in cases.items():
+            with self.subTest(binding=label):
+                evidence = self._matching_enforcement_evidence()
+                binding = evidence["rulesets"][0]["rules"][2][
+                    "parameters"
+                ]["workflows"][0]
+                if value is None:
+                    del binding[field]
+                else:
+                    binding[field] = value
+                result = self._run_enforcement_doctor(evidence)
+
+                self.assertEqual(result.returncode, 1, result.stderr)
+                outcome = json.loads(result.stdout)
+                self.assertEqual(
+                    outcome["classification"],
+                    "blocked_until_trusted",
+                )
+                self.assertEqual(outcome["reason_code"], reason_code)
+
+    def test_enforcement_doctor_rejects_wrong_ids_inactive_or_bypass_rules(
+        self,
+    ) -> None:
+        mutations = {
+            "wrong-ruleset-id": (
+                lambda evidence: evidence["rulesets"][0].update({"id": 42}),
+                "ruleset-identity-mismatch",
+            ),
+            "wrong-workflow-id": (
+                lambda evidence: evidence["workflow"].update({"id": 42}),
+                "workflow-identity-mismatch",
+            ),
+            "disabled": (
+                lambda evidence: evidence["rulesets"][0].update(
+                    {"enforcement": "disabled"}
+                ),
+                "ruleset-not-active",
+            ),
+            "evaluate": (
+                lambda evidence: evidence["rulesets"][0].update(
+                    {"enforcement": "evaluate"}
+                ),
+                "ruleset-not-active",
+            ),
+            "bypass": (
+                lambda evidence: evidence["rulesets"][0].update(
+                    {
+                        "bypass_actors": [
+                            {
+                                "actor_id": 5,
+                                "actor_type": "RepositoryRole",
+                                "bypass_mode": "always",
+                            }
+                        ]
+                    }
+                ),
+                "ruleset-bypass-configured",
+            ),
+        }
+        for label, (mutate, reason_code) in mutations.items():
+            with self.subTest(configuration=label):
+                evidence = self._matching_enforcement_evidence()
+                mutate(evidence)
+                result = self._run_enforcement_doctor(evidence)
+
+                self.assertEqual(result.returncode, 1, result.stderr)
+                outcome = json.loads(result.stdout)
+                self.assertEqual(
+                    outcome["classification"],
+                    "blocked_until_trusted",
+                )
+                self.assertEqual(outcome["reason_code"], reason_code)
+
+    def test_enforcement_doctor_requires_complete_api_evidence(self) -> None:
+        evidence = self._matching_enforcement_evidence()
+        evidence["collection"]["check_runs_complete"] = False
+        result = self._run_enforcement_doctor(evidence)
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        outcome = json.loads(result.stdout)
+        self.assertEqual(outcome["classification"], "blocked_until_trusted")
+        self.assertEqual(outcome["reason_code"], "evidence-incomplete")
 
     def test_private_migration_fixture_binds_atomic_aggregate_cutover(self) -> None:
         fixture = json.loads(MIGRATION_FIXTURE_PATH.read_text(encoding="utf-8"))

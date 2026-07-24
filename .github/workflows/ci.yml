@@ -28,6 +28,7 @@ jobs:
           python3 -m py_compile \
             skills/bug-triage-playbook/scripts/jenkins_artifact_probe.py \
             skills/bug-triage-playbook/scripts/archive_triage.py \
+            scripts/doctor_cisco_cutover_enforcement.py \
             scripts/validate_cisco_cutover_receipt.py \
             tests/test_archive_triage.py \
             tests/test_jenkins_artifact_probe.py
