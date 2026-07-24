@@ -9,16 +9,17 @@ import os
 import pathlib
 import re
 import selectors
-import shutil
 import signal
 import stat
 import subprocess
+import tempfile
 import time
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-CONTRACT_SCHEMA_VERSION = 3
-COLLECTOR_SCHEMA_VERSION = 2
+CONTRACT_SCHEMA_VERSION = 4
+COLLECTOR_SCHEMA_VERSION = 3
+DOCTOR_SCHEMA_VERSION = 4
 API_HOST = "github.com"
 API_ROOT = "https://api.github.com"
 API_VERSION = "2026-03-10"
@@ -40,7 +41,30 @@ MAX_JSON_NODES = 65_536
 MAX_JSON_CONTAINER_ITEMS = 16_384
 MAX_JSON_INTEGER_DIGITS = 64
 MAX_JSON_STRING_CHARS = 128 * 1024
+MAX_GH_EXECUTABLE_BYTES = 256 * 1024 * 1024
+GH_EXECUTABLE_ENVIRONMENT_PROFILE = "minimal-explicit-config-v1"
+GH_EXECUTION_SOURCE = "owner-private-snapshot"
+CUTOVER_INPUT_VARIABLES = (
+    "CISCO_CUTOVER_TARGET_PR_NUMBER",
+    "CISCO_CUTOVER_TARGET_HEAD_SHA",
+    "CISCO_CUTOVER_RECEIPT_BASE64",
+    "CISCO_CUTOVER_EXPECTED_CANONICAL_COMMIT",
+    "CISCO_CUTOVER_EXPECTED_PRIVATE_RELEASE_COMMIT",
+    "CISCO_CUTOVER_EXPECTED_RELEASE_MANIFEST_SHA256",
+    "CISCO_CUTOVER_EXPECTED_RECEIPT_SHA256",
+    "CISCO_CUTOVER_EXPECTED_WORKFLOW_ID",
+    "CISCO_CUTOVER_EXPECTED_WORKFLOW_SHA",
+    "CISCO_CUTOVER_EXPECTED_INSTALLATION_SCOPE_ID",
+    "CISCO_CUTOVER_EXPECTED_POINTER_GENERATION",
+    "CISCO_CUTOVER_EXPECTED_POINTER_STATE_SHA256",
+)
 SHA1_PATTERN = re.compile(r"[0-9a-f]{40}")
+SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
+RFC3339_UTC_PATTERN = re.compile(
+    r"(?P<year>[0-9]{4})-(?P<month>[0-9]{2})-(?P<day>[0-9]{2})"
+    r"T(?P<hour>[0-9]{2}):(?P<minute>[0-9]{2}):(?P<second>[0-9]{2})"
+    r"(?P<fraction>\.[0-9]{1,9})?Z"
+)
 HTTP_STATUS_PATTERN = re.compile(rb"\(HTTP ([1-5][0-9]{2})\)")
 
 
@@ -258,6 +282,70 @@ def _exact_sha1(value: object, *, label: str) -> str:
     return value
 
 
+def _exact_sha256(value: object, *, label: str) -> str:
+    if type(value) is not str or SHA256_PATTERN.fullmatch(value) is None:
+        raise _blocked("invalid-evidence", f"{label} must be exact lowercase SHA-256")
+    if set(value) == {"0"}:
+        raise _blocked("invalid-evidence", f"{label} must not be all-zero")
+    return value
+
+
+def _normalize_rfc3339_utc(value: object, *, label: str) -> str:
+    if type(value) is not str:
+        raise _blocked("invalid-evidence", f"{label} must be RFC3339 UTC text")
+    matched = RFC3339_UTC_PATTERN.fullmatch(value)
+    if matched is None:
+        raise _blocked(
+            "invalid-evidence",
+            f"{label} must be strict RFC3339 UTC with a Z suffix",
+        )
+    try:
+        datetime(
+            int(matched["year"]),
+            int(matched["month"]),
+            int(matched["day"]),
+            int(matched["hour"]),
+            int(matched["minute"]),
+            int(matched["second"]),
+            tzinfo=timezone.utc,
+        )
+    except ValueError as error:
+        raise _blocked(
+            "invalid-evidence",
+            f"{label} is not a valid RFC3339 UTC timestamp",
+        ) from error
+    return value
+
+
+def _optional_rfc3339_utc(
+    value: object,
+    *,
+    label: str,
+) -> Optional[str]:
+    if value is None:
+        return None
+    return _normalize_rfc3339_utc(value, label=label)
+
+
+def _rfc3339_utc_sort_key(value: str) -> tuple[int, ...]:
+    matched = RFC3339_UTC_PATTERN.fullmatch(value)
+    if matched is None:
+        raise _blocked(
+            "invalid-evidence",
+            "normalized timestamp no longer matches RFC3339 UTC",
+        )
+    fraction = (matched["fraction"] or ".0")[1:].ljust(9, "0")
+    return (
+        int(matched["year"]),
+        int(matched["month"]),
+        int(matched["day"]),
+        int(matched["hour"]),
+        int(matched["minute"]),
+        int(matched["second"]),
+        int(fraction),
+    )
+
+
 def _exact_keys(
     value: dict[str, Any],
     expected: set[str],
@@ -321,6 +409,8 @@ def _load_contract(contract: dict[str, Any]) -> dict[str, Any]:
             "ruleset",
             "required_workflow",
             "applicability_selector",
+            "cutover_input_variables",
+            "pointer_authority",
             "disallowed_status_contexts",
         },
         label="contract",
@@ -460,6 +550,41 @@ def _load_contract(contract: dict[str, Any]) -> dict[str, Any]:
             "invalid-contract",
             "contract applicability selector differs",
         )
+    cutover_input_variables = _exact_list(
+        contract["cutover_input_variables"],
+        label="contract cutover input variables",
+    )
+    if cutover_input_variables != list(CUTOVER_INPUT_VARIABLES) or len(
+        cutover_input_variables
+    ) != len(set(cutover_input_variables)):
+        raise _blocked(
+            "invalid-contract",
+            "contract cutover input variables differ in name, order, or uniqueness",
+        )
+    pointer_authority = _exact_dict(
+        contract["pointer_authority"],
+        label="contract pointer authority",
+    )
+    status = _exact_string(
+        pointer_authority.get("status"),
+        label="contract pointer authority status",
+    )
+    if status == "unavailable":
+        _exact_keys(
+            pointer_authority,
+            {"status", "reason"},
+            label="contract unavailable pointer authority",
+        )
+        if pointer_authority["reason"] != "private-live-authority-not-configured":
+            raise _blocked(
+                "invalid-contract",
+                "contract unavailable pointer-authority reason differs",
+            )
+    else:
+        raise _blocked(
+            "invalid-contract",
+            "contract pointer-authority status is not implemented",
+        )
     disallowed = _exact_list(
         contract["disallowed_status_contexts"],
         label="contract disallowed status contexts",
@@ -523,11 +648,11 @@ def _api_endpoint_class(endpoint: str) -> str:
         if suffix[:2] == ["actions", "workflows"]:
             return "workflow-metadata"
         if suffix[:2] == ["actions", "runs"]:
-            return (
-                "workflow-jobs"
-                if "attempts" in suffix and suffix[-1:] == ["jobs"]
-                else "workflow-runs"
-            )
+            if "attempts" in suffix and suffix[-1:] == ["jobs"]:
+                return "workflow-jobs"
+            if "attempts" in suffix:
+                return "workflow-run-attempt"
+            return "workflow-runs"
         if suffix[:1] == ["commits"]:
             return "check-runs" if suffix[-1:] == ["check-runs"] else "commit"
     return "github-api"
@@ -597,9 +722,39 @@ def _api_request_error(
     )
 
 
+def _sha256_fd_bounded(fd: int) -> tuple[str, int]:
+    digest = hashlib.sha256()
+    offset = 0
+    while True:
+        try:
+            chunk = os.pread(
+                fd, min(64 * 1024, MAX_GH_EXECUTABLE_BYTES + 1 - offset), offset
+            )
+        except OSError:
+            raise
+        if not chunk:
+            break
+        offset += len(chunk)
+        if offset > MAX_GH_EXECUTABLE_BYTES:
+            raise ValueError("executable exceeds the byte ceiling")
+        digest.update(chunk)
+    return digest.hexdigest(), offset
+
+
+def _write_all(fd: int, payload: bytes) -> None:
+    offset = 0
+    while offset < len(payload):
+        written = os.write(fd, payload[offset:])
+        if written <= 0:
+            raise OSError("short write while pinning executable")
+        offset += written
+
+
 def _bounded_subprocess(
     command: list[str],
     *,
+    environment: dict[str, str],
+    execution_cwd: str,
     endpoint_class: str,
     timeout_seconds: int,
     stdout_limit: int,
@@ -612,6 +767,9 @@ def _bounded_subprocess(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             start_new_session=(os.name == "posix"),
+            close_fds=True,
+            cwd=execution_cwd,
+            env=environment,
         )
     except OSError as error:
         raise _blocked(
@@ -692,23 +850,391 @@ def _bounded_subprocess(
 
 
 class GitHubApiClient:
-    def __init__(self) -> None:
-        executable = shutil.which("gh")
-        if executable is None:
+    def __init__(
+        self,
+        gh_executable: pathlib.Path,
+        expected_gh_sha256: str,
+        gh_config_dir: pathlib.Path,
+    ) -> None:
+        self._temporary_directory: Optional[tempfile.TemporaryDirectory[str]] = None
+        self._source_fd: Optional[int] = None
+        self._snapshot_fd: Optional[int] = None
+        self._closed = False
+        self._pinned = False
+        self.executable = ""
+        self.executable_sha256 = expected_gh_sha256
+        self.execution_source = GH_EXECUTION_SOURCE
+        self.environment_profile = GH_EXECUTABLE_ENVIRONMENT_PROFILE
+        if SHA256_PATTERN.fullmatch(expected_gh_sha256) is None or set(
+            expected_gh_sha256
+        ) == {"0"}:
             raise _blocked(
                 "collector-unavailable",
-                "the GitHub CLI executable is unavailable",
+                "expected GitHub CLI SHA-256 is invalid",
             )
-        resolved = pathlib.Path(executable).resolve(strict=True)
-        if not resolved.is_file() or not os.access(resolved, os.X_OK):
-            raise _blocked(
-                "collector-unavailable",
-                "the resolved GitHub CLI is not an executable file",
-            )
-        self.executable = str(resolved)
+        self._environment = self._build_environment(gh_config_dir)
+        try:
+            self._pin_executable(gh_executable, expected_gh_sha256)
+        except BaseException:
+            self._cleanup_noexcept()
+            raise
         self.calls = 0
         self.total_bytes = 0
         self.deadline = time.monotonic() + MAX_COLLECTION_SECONDS
+
+    @staticmethod
+    def _build_environment(gh_config_dir: pathlib.Path) -> dict[str, str]:
+        if not gh_config_dir.is_absolute():
+            raise _blocked(
+                "collector-unavailable",
+                "GitHub CLI config directory must be an absolute path",
+            )
+        try:
+            config_status = os.stat(gh_config_dir)
+        except OSError as error:
+            raise _blocked(
+                "collector-unavailable",
+                "GitHub CLI config directory is unavailable",
+            ) from error
+        if not stat.S_ISDIR(config_status.st_mode):
+            raise _blocked(
+                "collector-unavailable",
+                "GitHub CLI config path must be an existing directory",
+            )
+        # Authentication is deliberately limited to the caller-selected gh config
+        # directory. No ambient HOME, token, loader, proxy, CA, PATH, or other GH_*
+        # variables are inherited by the collector subprocess.
+        return {
+            "GH_CONFIG_DIR": os.fspath(gh_config_dir),
+            "GH_NO_UPDATE_NOTIFIER": "1",
+            "GH_PROMPT_DISABLED": "1",
+            "LC_ALL": "C",
+        }
+
+    @staticmethod
+    def _initial_source_status(
+        gh_executable: pathlib.Path,
+    ) -> tuple[int, os.stat_result]:
+        if not gh_executable.is_absolute():
+            raise _blocked(
+                "collector-unavailable",
+                "GitHub CLI executable must be an absolute path",
+            )
+        if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_NONBLOCK"):
+            raise _blocked(
+                "collector-unavailable",
+                "safe GitHub CLI executable pinning is unavailable",
+            )
+        try:
+            path_status = os.lstat(gh_executable)
+        except OSError as error:
+            raise _blocked(
+                "collector-unavailable",
+                "GitHub CLI executable is unavailable",
+            ) from error
+        if stat.S_ISLNK(path_status.st_mode) or not stat.S_ISREG(path_status.st_mode):
+            raise _blocked(
+                "collector-unavailable",
+                "GitHub CLI executable must be a real regular file",
+            )
+        flags = (
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
+        )
+        try:
+            source_fd = os.open(gh_executable, flags)
+        except OSError as error:
+            raise _blocked(
+                "collector-unavailable",
+                "GitHub CLI executable cannot be safely opened",
+            ) from error
+        try:
+            descriptor_status = os.fstat(source_fd)
+        except OSError as error:
+            os.close(source_fd)
+            raise _blocked(
+                "collector-unavailable",
+                "GitHub CLI executable cannot be inspected",
+            ) from error
+        if (
+            not stat.S_ISREG(descriptor_status.st_mode)
+            or (descriptor_status.st_dev, descriptor_status.st_ino)
+            != (path_status.st_dev, path_status.st_ino)
+            or descriptor_status.st_size <= 0
+            or descriptor_status.st_size > MAX_GH_EXECUTABLE_BYTES
+            or stat.S_IMODE(descriptor_status.st_mode) & 0o111 == 0
+        ):
+            os.close(source_fd)
+            raise _blocked(
+                "collector-unavailable",
+                "GitHub CLI executable identity, size, or execute policy is invalid",
+            )
+        return source_fd, descriptor_status
+
+    def _pin_executable(
+        self,
+        gh_executable: pathlib.Path,
+        expected_gh_sha256: str,
+    ) -> None:
+        source_fd: Optional[int]
+        source_fd, source_before = self._initial_source_status(gh_executable)
+        snapshot_write_fd: Optional[int] = None
+        try:
+            self._temporary_directory = tempfile.TemporaryDirectory(
+                prefix="codex-gh-snapshot-"
+            )
+            directory_path = pathlib.Path(self._temporary_directory.name)
+            directory_status = os.lstat(directory_path)
+            if (
+                not stat.S_ISDIR(directory_status.st_mode)
+                or stat.S_IMODE(directory_status.st_mode) != 0o700
+                or directory_status.st_uid != os.geteuid()
+            ):
+                raise _blocked(
+                    "collector-unavailable",
+                    "GitHub CLI snapshot directory is not owner-private",
+                )
+            self._directory_binding = {
+                "device": directory_status.st_dev,
+                "gid": directory_status.st_gid,
+                "inode": directory_status.st_ino,
+                "mode": stat.S_IMODE(directory_status.st_mode),
+                "uid": directory_status.st_uid,
+            }
+            snapshot_path = directory_path / "gh"
+            flags = (
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | os.O_NOFOLLOW
+                | getattr(os, "O_CLOEXEC", 0)
+            )
+            snapshot_write_fd = os.open(snapshot_path, flags, 0o500)
+            digest = hashlib.sha256()
+            copied = 0
+            while True:
+                chunk = os.pread(
+                    source_fd,
+                    min(64 * 1024, MAX_GH_EXECUTABLE_BYTES + 1 - copied),
+                    copied,
+                )
+                if not chunk:
+                    break
+                copied += len(chunk)
+                if copied > MAX_GH_EXECUTABLE_BYTES:
+                    raise _blocked(
+                        "collector-unavailable",
+                        "GitHub CLI executable exceeds the byte ceiling",
+                    )
+                digest.update(chunk)
+                _write_all(snapshot_write_fd, chunk)
+            source_after = os.fstat(source_fd)
+            source_access_before = (
+                stat.S_IMODE(source_before.st_mode),
+                source_before.st_uid,
+                source_before.st_gid,
+            )
+            source_access_after = (
+                stat.S_IMODE(source_after.st_mode),
+                source_after.st_uid,
+                source_after.st_gid,
+            )
+            if (
+                (source_before.st_dev, source_before.st_ino)
+                != (source_after.st_dev, source_after.st_ino)
+                or source_before.st_size != source_after.st_size
+                or source_access_before != source_access_after
+                or copied != source_before.st_size
+            ):
+                raise _blocked(
+                    "collector-unavailable",
+                    "GitHub CLI executable changed while it was pinned",
+                )
+            actual_sha256 = digest.hexdigest()
+            if actual_sha256 != expected_gh_sha256:
+                raise _blocked(
+                    "collector-digest-mismatch",
+                    "GitHub CLI executable SHA-256 differs from the expected digest",
+                )
+            self._source_path = gh_executable
+            self._source_binding = {
+                "device": source_after.st_dev,
+                "gid": source_after.st_gid,
+                "inode": source_after.st_ino,
+                "mode": stat.S_IMODE(source_after.st_mode),
+                "sha256": actual_sha256,
+                "size": source_after.st_size,
+                "uid": source_after.st_uid,
+            }
+            os.fchmod(snapshot_write_fd, 0o500)
+            os.fsync(snapshot_write_fd)
+            snapshot_status = os.fstat(snapshot_write_fd)
+            if (
+                not stat.S_ISREG(snapshot_status.st_mode)
+                or snapshot_status.st_size != copied
+                or snapshot_status.st_uid != os.geteuid()
+                or stat.S_IMODE(snapshot_status.st_mode) != 0o500
+            ):
+                raise _blocked(
+                    "collector-unavailable",
+                    "GitHub CLI snapshot object or access policy is invalid",
+                )
+            os.close(snapshot_write_fd)
+            snapshot_write_fd = None
+            self._snapshot_fd = os.open(
+                snapshot_path,
+                os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+            )
+            pinned_status = os.fstat(self._snapshot_fd)
+            self._snapshot_path = snapshot_path
+            self._snapshot_binding = {
+                "device": pinned_status.st_dev,
+                "gid": pinned_status.st_gid,
+                "inode": pinned_status.st_ino,
+                "mode": stat.S_IMODE(pinned_status.st_mode),
+                "sha256": actual_sha256,
+                "size": pinned_status.st_size,
+                "uid": pinned_status.st_uid,
+            }
+            self.executable = os.fspath(snapshot_path)
+            self._source_fd = source_fd
+            source_fd = None
+            self._pinned = True
+            self._revalidate_snapshot()
+        except EnforcementDoctorError:
+            raise
+        except (OSError, ValueError) as error:
+            raise _blocked(
+                "collector-unavailable",
+                "GitHub CLI executable could not be pinned safely",
+            ) from error
+        finally:
+            if snapshot_write_fd is not None:
+                try:
+                    os.close(snapshot_write_fd)
+                except OSError:
+                    pass
+            if source_fd is not None:
+                os.close(source_fd)
+
+    def _collector_inconclusive(self) -> EnforcementDoctorError:
+        return _blocked(
+            "collector-inconclusive",
+            "pinned GitHub CLI snapshot could not be revalidated",
+        )
+
+    def _revalidate_snapshot(self) -> None:
+        if (
+            not self._pinned
+            or self._closed
+            or self._source_fd is None
+            or self._snapshot_fd is None
+            or not self.executable
+        ):
+            raise self._collector_inconclusive()
+        try:
+            directory_status = os.lstat(self._snapshot_path.parent)
+            directory_current = {
+                "device": directory_status.st_dev,
+                "gid": directory_status.st_gid,
+                "inode": directory_status.st_ino,
+                "mode": stat.S_IMODE(directory_status.st_mode),
+                "uid": directory_status.st_uid,
+            }
+            source_descriptor_before = os.fstat(self._source_fd)
+            source_path_before = os.lstat(self._source_path)
+            source_digest, source_retained = _sha256_fd_bounded(self._source_fd)
+            source_descriptor_after = os.fstat(self._source_fd)
+            source_path_after = os.lstat(self._source_path)
+            snapshot_descriptor_before = os.fstat(self._snapshot_fd)
+            snapshot_path_before = os.lstat(self._snapshot_path)
+            snapshot_digest, snapshot_retained = _sha256_fd_bounded(self._snapshot_fd)
+            snapshot_descriptor_after = os.fstat(self._snapshot_fd)
+            snapshot_path_after = os.lstat(self._snapshot_path)
+        except (OSError, ValueError):
+            raise self._collector_inconclusive()
+
+        def file_status(status_value: os.stat_result) -> dict[str, int]:
+            return {
+                "device": status_value.st_dev,
+                "gid": status_value.st_gid,
+                "inode": status_value.st_ino,
+                "mode": stat.S_IMODE(status_value.st_mode),
+                "size": status_value.st_size,
+                "uid": status_value.st_uid,
+            }
+
+        source_expected = {
+            key: value for key, value in self._source_binding.items() if key != "sha256"
+        }
+        snapshot_expected = {
+            key: value
+            for key, value in self._snapshot_binding.items()
+            if key != "sha256"
+        }
+        if (
+            not stat.S_ISDIR(directory_status.st_mode)
+            or directory_current != self._directory_binding
+            or not stat.S_ISREG(source_descriptor_before.st_mode)
+            or not stat.S_ISREG(source_path_before.st_mode)
+            or not stat.S_ISREG(source_descriptor_after.st_mode)
+            or not stat.S_ISREG(source_path_after.st_mode)
+            or file_status(source_descriptor_before) != source_expected
+            or file_status(source_path_before) != source_expected
+            or file_status(source_descriptor_after) != source_expected
+            or file_status(source_path_after) != source_expected
+            or source_retained != self._source_binding["size"]
+            or source_digest != self._source_binding["sha256"]
+            or not stat.S_ISREG(snapshot_descriptor_before.st_mode)
+            or not stat.S_ISREG(snapshot_path_before.st_mode)
+            or not stat.S_ISREG(snapshot_descriptor_after.st_mode)
+            or not stat.S_ISREG(snapshot_path_after.st_mode)
+            or file_status(snapshot_descriptor_before) != snapshot_expected
+            or file_status(snapshot_path_before) != snapshot_expected
+            or file_status(snapshot_descriptor_after) != snapshot_expected
+            or file_status(snapshot_path_after) != snapshot_expected
+            or snapshot_retained != self._snapshot_binding["size"]
+            or snapshot_digest != self._snapshot_binding["sha256"]
+        ):
+            raise self._collector_inconclusive()
+
+    def revalidate_for_admission(self) -> None:
+        self._revalidate_snapshot()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if self._source_fd is not None:
+            try:
+                os.close(self._source_fd)
+            finally:
+                self._source_fd = None
+        if self._snapshot_fd is not None:
+            try:
+                os.close(self._snapshot_fd)
+            finally:
+                self._snapshot_fd = None
+        if self._temporary_directory is not None:
+            self._temporary_directory.cleanup()
+            self._temporary_directory = None
+
+    def _cleanup_noexcept(self) -> None:
+        try:
+            self.close()
+        except OSError:
+            pass
+
+    def __enter__(self) -> GitHubApiClient:
+        return self
+
+    def __exit__(
+        self,
+        exception_type: object,
+        exception: object,
+        traceback: object,
+    ) -> bool:
+        self.close()
+        return False
 
     def _run(
         self,
@@ -740,13 +1266,22 @@ class GitHubApiClient:
                 ),
             )
         self.calls += 1
-        return_code, stdout, stderr = _bounded_subprocess(
-            command,
-            endpoint_class=endpoint_class,
-            timeout_seconds=max(1, min(MAX_API_SECONDS, int(remaining))),
-            stdout_limit=stdout_limit,
-            stderr_limit=MAX_API_STDERR_BYTES,
-        )
+        self._revalidate_snapshot()
+        try:
+            process_result = _bounded_subprocess(
+                command,
+                environment=dict(self._environment),
+                execution_cwd=self._temporary_directory.name,
+                endpoint_class=endpoint_class,
+                timeout_seconds=max(1, min(MAX_API_SECONDS, int(remaining))),
+                stdout_limit=stdout_limit,
+                stderr_limit=MAX_API_STDERR_BYTES,
+            )
+        except BaseException:
+            self._revalidate_snapshot()
+            raise
+        self._revalidate_snapshot()
+        return_code, stdout, stderr = process_result
         if return_code != 0:
             raise _api_request_error(
                 endpoint_class=endpoint_class,
@@ -1185,9 +1720,87 @@ def _normalize_actions_variable(value: dict[str, Any]) -> dict[str, str]:
             value.get("name"),
             label="Actions variable name",
         ),
+        "updated_at": _normalize_rfc3339_utc(
+            value.get("updated_at"),
+            label="Actions variable updated timestamp",
+        ),
         "value": _exact_string(
             value.get("value"),
             label="Actions variable value",
+        ),
+    }
+
+
+def _select_cutover_input_variables(
+    values: list[Any],
+    *,
+    expected_names: list[str],
+) -> list[dict[str, str]]:
+    expected = set(expected_names)
+    selected: dict[str, dict[str, str]] = {}
+    for value in values:
+        normalized = _normalize_actions_variable(
+            _exact_dict(value, label="Actions variable")
+        )
+        name = normalized["name"]
+        if name not in expected:
+            continue
+        if name in selected:
+            raise _blocked(
+                "cutover-input-duplicate",
+                "cutover input variable is duplicated in the repository snapshot",
+            )
+        selected[name] = normalized
+    missing = [name for name in expected_names if name not in selected]
+    if missing:
+        raise _blocked(
+            "cutover-input-missing",
+            "one or more required cutover input variables are missing",
+        )
+    return [selected[name] for name in expected_names]
+
+
+def _validate_cutover_input_variables(
+    values: object,
+    *,
+    expected_names: list[str],
+) -> list[dict[str, str]]:
+    variables = _exact_list(values, label="cutover input variables")
+    normalized: list[dict[str, str]] = []
+    for value in variables:
+        variable = _exact_dict(value, label="cutover input variable")
+        _exact_keys(
+            variable,
+            {"name", "updated_at", "value"},
+            label="cutover input variable",
+        )
+        normalized.append(_normalize_actions_variable(variable))
+    names = [variable["name"] for variable in normalized]
+    if (
+        names != expected_names
+        or len(names) != len(set(names))
+        or len(normalized) != len(expected_names)
+    ):
+        raise _blocked(
+            "cutover-input-set-mismatch",
+            "cutover input variables differ in name, order, or uniqueness",
+        )
+    return normalized
+
+
+def _normalize_run_attempt(value: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": _exact_positive_integer(
+            value.get("id"),
+            label="selected workflow run ID",
+        ),
+        "run_attempt": _exact_positive_integer(
+            value.get("run_attempt"),
+            label="selected workflow run attempt",
+        ),
+        "run_started_at": _normalize_rfc3339_utc(
+            value.get("run_started_at"),
+            label="selected workflow run start timestamp",
         ),
     }
 
@@ -1292,6 +1905,10 @@ def _normalize_run(value: dict[str, Any]) -> dict[str, Any]:
             value.get("run_attempt"),
             label="workflow run attempt",
         ),
+        "run_started_at": _normalize_rfc3339_utc(
+            value.get("run_started_at"),
+            label="workflow run start timestamp",
+        ),
         "status": _exact_string(value.get("status"), label="workflow run status"),
         "url": _exact_string(value.get("url"), label="workflow run API URL"),
         "workflow_id": _exact_positive_integer(
@@ -1313,6 +1930,10 @@ def _normalize_job(value: dict[str, Any], *, run_attempt: int) -> dict[str, Any]
         "check_run_url": _exact_string(
             value.get("check_run_url"),
             label="workflow job check-run URL",
+        ),
+        "completed_at": _optional_rfc3339_utc(
+            value.get("completed_at"),
+            label="workflow job completion timestamp",
         ),
         "conclusion": conclusion,
         "head_sha": _exact_sha1(
@@ -1337,6 +1958,10 @@ def _normalize_job(value: dict[str, Any], *, run_attempt: int) -> dict[str, Any]
         "status": _exact_string(
             value.get("status"),
             label="workflow job status",
+        ),
+        "started_at": _normalize_rfc3339_utc(
+            value.get("started_at"),
+            label="workflow job start timestamp",
         ),
         "url": _exact_string(value.get("url"), label="workflow job API URL"),
         "workflow_name": _exact_string(
@@ -1365,6 +1990,10 @@ def _normalize_check_run(value: dict[str, Any]) -> dict[str, Any]:
             check_suite.get("id"),
             label="check-run suite ID",
         ),
+        "completed_at": _optional_rfc3339_utc(
+            value.get("completed_at"),
+            label="check-run completion timestamp",
+        ),
         "conclusion": conclusion,
         "details_url": _exact_string(
             value.get("details_url"),
@@ -1385,6 +2014,10 @@ def _normalize_check_run(value: dict[str, Any]) -> dict[str, Any]:
             for item in pull_requests
         ],
         "status": _exact_string(value.get("status"), label="check-run status"),
+        "started_at": _normalize_rfc3339_utc(
+            value.get("started_at"),
+            label="check-run start timestamp",
+        ),
         "url": _exact_string(value.get("url"), label="check-run API URL"),
     }
 
@@ -1450,17 +2083,25 @@ def _assert_static_identity(
         )
     selector = contract["applicability_selector"]
     expected_selector_variables = {
-        "selector_target_pr_number": {
+        selector["target_pr_number_variable"]: {
             "name": selector["target_pr_number_variable"],
             "value": str(pull_request_number),
         },
-        "selector_target_head_sha": {
+        selector["target_head_sha_variable"]: {
             "name": selector["target_head_sha_variable"],
             "value": candidate_head_sha,
         },
     }
-    for field, expected_variable in expected_selector_variables.items():
-        if snapshot[field] != expected_variable:
+    cutover_variables = {
+        variable["name"]: variable for variable in snapshot["cutover_input_variables"]
+    }
+    for name, expected_variable in expected_selector_variables.items():
+        selected = cutover_variables.get(name)
+        if (
+            selected is None
+            or selected["name"] != expected_variable["name"]
+            or selected["value"] != expected_variable["value"]
+        ):
             raise _blocked(
                 "selector-mismatch",
                 "administrator applicability selector differs from the target PR",
@@ -1531,6 +2172,8 @@ def _collect_snapshot(
     contract: dict[str, Any],
     *,
     phase: str,
+    expected_run_attempt: int,
+    expected_run_id: int,
     expected_ruleset_id: int,
     expected_workflow_id: int,
     expected_workflow_sha: str,
@@ -1568,31 +2211,39 @@ def _collect_snapshot(
             endpoint=f"/repos/{target_name}/pulls/{pull_request_number}",
         )
     )
-    selector_contract = contract["applicability_selector"]
-    selector_target_pr_number = _normalize_actions_variable(
+    variable_values = _collect_pages(
+        client,
+        trace,
+        phase=phase,
+        label="repository Actions variables",
+        endpoint=f"/repos/{target_name}/actions/variables",
+        parameters={},
+        item_key="variables",
+    )
+    cutover_input_variables = _select_cutover_input_variables(
+        variable_values,
+        expected_names=contract["cutover_input_variables"],
+    )
+    selected_run_attempt = _normalize_run_attempt(
         _get_object(
             client,
             trace,
             phase=phase,
-            label="selector target pull-request number",
+            label="selected workflow run attempt",
             endpoint=(
-                f"/repos/{target_name}/actions/variables/"
-                f"{selector_contract['target_pr_number_variable']}"
+                f"/repos/{target_name}/actions/runs/{expected_run_id}"
+                f"/attempts/{expected_run_attempt}"
             ),
         )
     )
-    selector_target_head_sha = _normalize_actions_variable(
-        _get_object(
-            client,
-            trace,
-            phase=phase,
-            label="selector target head SHA",
-            endpoint=(
-                f"/repos/{target_name}/actions/variables/"
-                f"{selector_contract['target_head_sha_variable']}"
-            ),
+    if (
+        selected_run_attempt["id"] != expected_run_id
+        or selected_run_attempt["run_attempt"] != expected_run_attempt
+    ):
+        raise _blocked(
+            "selected-run-attempt-mismatch",
+            "exact workflow run-attempt endpoint returned another object",
         )
-    )
     effective_ruleset_values = _collect_pages(
         client,
         trace,
@@ -1669,12 +2320,12 @@ def _collect_snapshot(
         )
     )
     partial_snapshot = {
+        "cutover_input_variables": cutover_input_variables,
         "effective_rulesets": effective_rulesets,
         "organization": organization,
         "pull_request": pull_request,
         "repository": repository,
-        "selector_target_head_sha": selector_target_head_sha,
-        "selector_target_pr_number": selector_target_pr_number,
+        "selected_run_attempt": selected_run_attempt,
         "selected_ruleset": selected_ruleset,
         "workflow": workflow,
         "workflow_source_commit": workflow_source_commit,
@@ -2172,8 +2823,57 @@ def _validate_candidate_evidence(
             "trusted-check-failed",
             "trusted workflow check is incomplete or not successful",
         )
+    selected_attempt = _exact_dict(
+        snapshot["selected_run_attempt"],
+        label="selected workflow run attempt",
+    )
+    _exact_keys(
+        selected_attempt,
+        {"id", "run_attempt", "run_started_at"},
+        label="selected workflow run attempt",
+    )
+    selected_attempt = _normalize_run_attempt(selected_attempt)
+    if (
+        selected_attempt["id"] != expected_run_id
+        or selected_attempt["run_attempt"] != expected_run_attempt
+        or selected_attempt["run_started_at"] != run["run_started_at"]
+    ):
+        raise _blocked(
+            "selected-run-attempt-mismatch",
+            "exact workflow run-attempt identity or start timestamp differs",
+        )
+    cutover_variables = _exact_list(
+        snapshot["cutover_input_variables"],
+        label="cutover input variables",
+    )
+    latest_variable_updated_at = max(
+        (
+            _normalize_rfc3339_utc(
+                _exact_dict(value, label="cutover input variable").get("updated_at"),
+                label="cutover input variable updated timestamp",
+            )
+            for value in cutover_variables
+        ),
+        key=_rfc3339_utc_sort_key,
+    )
+    run_started_key = _rfc3339_utc_sort_key(selected_attempt["run_started_at"])
+    latest_variable_key = _rfc3339_utc_sort_key(latest_variable_updated_at)
+    if run_started_key == latest_variable_key:
+        raise _blocked(
+            "cutover-freshness-inconclusive",
+            "selected run started at the latest cutover-input update timestamp",
+        )
+    if run_started_key < latest_variable_key:
+        raise _blocked(
+            "selected-run-predates-cutover-inputs",
+            "selected run started before the latest cutover-input update",
+        )
     return {
         "check_run": selected["check_run"],
+        "freshness": {
+            "latest_cutover_input_updated_at": latest_variable_updated_at,
+            "run_started_at": selected_attempt["run_started_at"],
+        },
         "job": selected["job"],
         "run": selected["run"],
         "same_name_lineage": sorted(
@@ -2188,7 +2888,7 @@ def _validate_candidate_evidence(
     }
 
 
-def validate_enforcement(
+def _validate_snapshot_enforcement(
     contract: dict[str, Any],
     snapshot: dict[str, Any],
     *,
@@ -2207,9 +2907,9 @@ def validate_enforcement(
             "organization",
             "repository",
             "pull_request",
-            "selector_target_head_sha",
-            "selector_target_pr_number",
+            "cutover_input_variables",
             "effective_rulesets",
+            "selected_run_attempt",
             "selected_ruleset",
             "workflow_source_repository",
             "workflow",
@@ -2219,6 +2919,10 @@ def validate_enforcement(
             "check_runs",
         },
         label="collected snapshot",
+    )
+    _validate_cutover_input_variables(
+        snapshot["cutover_input_variables"],
+        expected_names=contract["cutover_input_variables"],
     )
     _assert_static_identity(
         snapshot,
@@ -2244,11 +2948,11 @@ def validate_enforcement(
         candidate_head_sha=candidate_head_sha,
     )
     protected = {
+        "cutover_input_variables": snapshot["cutover_input_variables"],
         "organization": snapshot["organization"],
         "repository": snapshot["repository"],
         "pull_request": snapshot["pull_request"],
-        "selector_target_head_sha": snapshot["selector_target_head_sha"],
-        "selector_target_pr_number": snapshot["selector_target_pr_number"],
+        "selected_run_attempt": snapshot["selected_run_attempt"],
         "selected_ruleset": _ruleset_protected_fields(snapshot["selected_ruleset"]),
         "workflow_source_repository": snapshot["workflow_source_repository"],
         "workflow": snapshot["workflow"],
@@ -2256,6 +2960,7 @@ def validate_enforcement(
         "same_name_lineage": trusted["same_name_lineage"],
     }
     return {
+        "freshness": trusted["freshness"],
         "protected": protected,
         "trusted_check_run": trusted["check_run"],
         "trusted_job": trusted["job"],
@@ -2263,7 +2968,48 @@ def validate_enforcement(
     }
 
 
-def collect_and_validate(
+def _require_pointer_proof(contract: dict[str, Any]) -> None:
+    pointer_authority = contract["pointer_authority"]
+    if pointer_authority["status"] == "unavailable":
+        raise _blocked(
+            "pointer-proof-unavailable",
+            "live private pointer authority is not configured",
+        )
+    raise _blocked(
+        "pointer-proof-unavailable",
+        "live private pointer proof has not been implemented for this authority",
+    )
+
+
+def validate_enforcement(
+    contract: dict[str, Any],
+    snapshot: dict[str, Any],
+    *,
+    expected_run_attempt: int,
+    expected_run_id: int,
+    expected_ruleset_id: int,
+    expected_workflow_id: int,
+    expected_workflow_sha: str,
+    candidate_head_sha: str,
+    pull_request_number: int,
+) -> dict[str, Any]:
+    loaded_contract = _load_contract(contract)
+    admission = _validate_snapshot_enforcement(
+        loaded_contract,
+        snapshot,
+        expected_run_attempt=expected_run_attempt,
+        expected_run_id=expected_run_id,
+        expected_ruleset_id=expected_ruleset_id,
+        expected_workflow_id=expected_workflow_id,
+        expected_workflow_sha=expected_workflow_sha,
+        candidate_head_sha=candidate_head_sha,
+        pull_request_number=pull_request_number,
+    )
+    _require_pointer_proof(loaded_contract)
+    return admission
+
+
+def _collect_and_validate_static(
     client: Any,
     contract: dict[str, Any],
     *,
@@ -2287,13 +3033,15 @@ def collect_and_validate(
         trace,
         contract,
         phase="initial",
+        expected_run_attempt=expected_run_attempt,
+        expected_run_id=expected_run_id,
         expected_ruleset_id=expected_ruleset_id,
         expected_workflow_id=expected_workflow_id,
         expected_workflow_sha=expected_workflow_sha,
         candidate_head_sha=candidate_head_sha,
         pull_request_number=pull_request_number,
     )
-    initial_admission = validate_enforcement(
+    initial_admission = _validate_snapshot_enforcement(
         contract,
         initial,
         expected_run_attempt=expected_run_attempt,
@@ -2309,13 +3057,20 @@ def collect_and_validate(
         trace,
         contract,
         phase="revalidation",
+        expected_run_attempt=expected_run_attempt,
+        expected_run_id=expected_run_id,
         expected_ruleset_id=expected_ruleset_id,
         expected_workflow_id=expected_workflow_id,
         expected_workflow_sha=expected_workflow_sha,
         candidate_head_sha=candidate_head_sha,
         pull_request_number=pull_request_number,
     )
-    revalidated_admission = validate_enforcement(
+    if initial["cutover_input_variables"] != revalidation["cutover_input_variables"]:
+        raise _blocked(
+            "cutover-input-drift",
+            "cutover input variables changed during evidence collection",
+        )
+    revalidated_admission = _validate_snapshot_enforcement(
         contract,
         revalidation,
         expected_run_attempt=expected_run_attempt,
@@ -2337,6 +3092,15 @@ def collect_and_validate(
         "api_version": API_VERSION,
         "authenticated_user": authenticated_user,
         "completed_at": completed_at,
+        "gh_executable": {
+            "environment_profile": getattr(
+                client,
+                "environment_profile",
+                "test-double",
+            ),
+            "execution_source": getattr(client, "execution_source", "test-double"),
+            "sha256": getattr(client, "executable_sha256", None),
+        },
         "mode": "live-gh-rest",
         "object_reads": trace["object_reads"],
         "page_bounds": trace["page_bounds"],
@@ -2350,6 +3114,34 @@ def collect_and_validate(
         "schema_version": COLLECTOR_SCHEMA_VERSION,
     }
     return evidence, revalidated_admission
+
+
+def collect_and_validate(
+    client: Any,
+    contract: dict[str, Any],
+    *,
+    expected_run_attempt: int,
+    expected_run_id: int,
+    expected_ruleset_id: int,
+    expected_workflow_id: int,
+    expected_workflow_sha: str,
+    candidate_head_sha: str,
+    pull_request_number: int,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    loaded_contract = _load_contract(contract)
+    evidence, static_admission = _collect_and_validate_static(
+        client,
+        loaded_contract,
+        expected_run_attempt=expected_run_attempt,
+        expected_run_id=expected_run_id,
+        expected_ruleset_id=expected_ruleset_id,
+        expected_workflow_id=expected_workflow_id,
+        expected_workflow_sha=expected_workflow_sha,
+        candidate_head_sha=candidate_head_sha,
+        pull_request_number=pull_request_number,
+    )
+    _require_pointer_proof(loaded_contract)
+    return evidence, static_admission
 
 
 def _positive_integer_argument(value: str) -> int:
@@ -2368,6 +3160,12 @@ def _sha1_argument(value: str) -> str:
     return value
 
 
+def _sha256_argument(value: str) -> str:
+    if SHA256_PATTERN.fullmatch(value) is None or set(value) == {"0"}:
+        raise argparse.ArgumentTypeError("must be exact nonzero lowercase SHA-256")
+    return value
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
@@ -2376,6 +3174,21 @@ def build_parser() -> argparse.ArgumentParser:
         )
     )
     parser.add_argument("--contract", required=True, type=pathlib.Path)
+    parser.add_argument(
+        "--gh-executable",
+        required=True,
+        type=pathlib.Path,
+    )
+    parser.add_argument(
+        "--expected-gh-sha256",
+        required=True,
+        type=_sha256_argument,
+    )
+    parser.add_argument(
+        "--gh-config-dir",
+        required=True,
+        type=pathlib.Path,
+    )
     parser.add_argument(
         "--pull-request-number",
         required=True,
@@ -2420,19 +3233,26 @@ def main() -> int:
     evidence_sha256 = None
     try:
         contract, contract_sha256 = _read_json(args.contract, label="contract")
-        client = GitHubApiClient()
-        evidence, admission = collect_and_validate(
-            client,
-            contract,
-            expected_run_attempt=args.expected_run_attempt,
-            expected_run_id=args.expected_run_id,
-            expected_ruleset_id=args.expected_ruleset_id,
-            expected_workflow_id=args.expected_workflow_id,
-            expected_workflow_sha=args.expected_workflow_sha,
-            candidate_head_sha=args.candidate_head_sha,
-            pull_request_number=args.pull_request_number,
-        )
-        evidence_sha256 = hashlib.sha256(_canonical_json_bytes(evidence)).hexdigest()
+        with GitHubApiClient(
+            args.gh_executable,
+            args.expected_gh_sha256,
+            args.gh_config_dir,
+        ) as client:
+            evidence, admission = collect_and_validate(
+                client,
+                contract,
+                expected_run_attempt=args.expected_run_attempt,
+                expected_run_id=args.expected_run_id,
+                expected_ruleset_id=args.expected_ruleset_id,
+                expected_workflow_id=args.expected_workflow_id,
+                expected_workflow_sha=args.expected_workflow_sha,
+                candidate_head_sha=args.candidate_head_sha,
+                pull_request_number=args.pull_request_number,
+            )
+            evidence_sha256 = hashlib.sha256(
+                _canonical_json_bytes(evidence)
+            ).hexdigest()
+            client.revalidate_for_admission()
     except EnforcementDoctorError as error:
         blocked_receipt = {
             "classification": "blocked_until_trusted",
@@ -2441,7 +3261,7 @@ def main() -> int:
             "operation": "cisco-cutover-enforcement-doctor",
             "reason": str(error),
             "reason_code": error.reason_code,
-            "schema_version": 3,
+            "schema_version": DOCTOR_SCHEMA_VERSION,
         }
         if error.api_failure is not None:
             blocked_receipt["api_failure"] = error.api_failure
@@ -2462,15 +3282,19 @@ def main() -> int:
     pull_request = revalidated_snapshot["pull_request"]
     selected_ruleset = revalidated_snapshot["selected_ruleset"]
     workflow_metadata = revalidated_snapshot["workflow"]
+    sanitized_cutover_variables = [
+        {
+            "name": variable["name"],
+            "updated_at": variable["updated_at"],
+            "value_sha256": hashlib.sha256(
+                variable["value"].encode("utf-8")
+            ).hexdigest(),
+        }
+        for variable in revalidated_snapshot["cutover_input_variables"]
+    ]
     print(
         json.dumps(
             {
-                "applicability_selector": {
-                    "target_head_sha": revalidated_snapshot["selector_target_head_sha"],
-                    "target_pr_number": revalidated_snapshot[
-                        "selector_target_pr_number"
-                    ],
-                },
                 "candidate": {
                     "base_ref": pull_request["base"]["ref"],
                     "base_repository_id": pull_request["base"]["repository"]["id"],
@@ -2487,6 +3311,8 @@ def main() -> int:
                 "classification": "admitted",
                 "collection": evidence["collector"],
                 "contract_sha256": contract_sha256,
+                "cutover_freshness": admission["freshness"],
+                "cutover_input_variables": sanitized_cutover_variables,
                 "evidence_sha256": evidence_sha256,
                 "operation": "cisco-cutover-enforcement-doctor",
                 "organization": contract["source_organization"],
@@ -2500,7 +3326,7 @@ def main() -> int:
                     "source_type": contract["ruleset"]["source_type"],
                     "target": selected_ruleset["target"],
                 },
-                "schema_version": 3,
+                "schema_version": DOCTOR_SCHEMA_VERSION,
                 "trusted_execution": {
                     "selection": {
                         "expected_run_attempt": args.expected_run_attempt,
@@ -2509,17 +3335,20 @@ def main() -> int:
                     "check_run": {
                         "app": trusted_check["app"],
                         "check_suite_id": trusted_check["check_suite_id"],
+                        "completed_at": trusted_check["completed_at"],
                         "conclusion": trusted_check["conclusion"],
                         "details_url": trusted_check["details_url"],
                         "head_sha": trusted_check["head_sha"],
                         "html_url": trusted_check["html_url"],
                         "id": trusted_check["id"],
                         "name": trusted_check["name"],
+                        "started_at": trusted_check["started_at"],
                         "status": trusted_check["status"],
                         "url": trusted_check["url"],
                     },
                     "job": {
                         "check_run_url": trusted_job["check_run_url"],
+                        "completed_at": trusted_job["completed_at"],
                         "conclusion": trusted_job["conclusion"],
                         "head_sha": trusted_job["head_sha"],
                         "html_url": trusted_job["html_url"],
@@ -2528,6 +3357,7 @@ def main() -> int:
                         "run_attempt": trusted_job["run_attempt"],
                         "run_id": trusted_job["run_id"],
                         "run_url": trusted_job["run_url"],
+                        "started_at": trusted_job["started_at"],
                         "status": trusted_job["status"],
                         "url": trusted_job["url"],
                         "workflow_name": trusted_job["workflow_name"],
@@ -2543,6 +3373,7 @@ def main() -> int:
                         "id": trusted_run["id"],
                         "path": trusted_run["path"],
                         "run_attempt": trusted_run["run_attempt"],
+                        "run_started_at": trusted_run["run_started_at"],
                         "status": trusted_run["status"],
                         "url": trusted_run["url"],
                         "workflow_id": trusted_run["workflow_id"],

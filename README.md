@@ -29,6 +29,18 @@ merge places it on the protected base. Its job name is not an enforcement
 identity: another GitHub Actions workflow can emit the same
 `cisco-cutover-admission` context.
 
+The checked-in enforcement contract is deliberately non-admitting. Its
+`pointer_authority` is
+`status=unavailable,reason=private-live-authority-not-configured`; it contains
+no invented private repository, workflow, run, artifact, or locator ID. The
+workflow and local validator can verify a schema-3 receipt's exact static
+equivalence—including its independently pinned installation scope, monotonic
+pointer generation, domain-separated pointer-state digest, freshness window,
+provider provenance, and active PR/head-bound merge lease—but they then return
+`classification=blocked_until_trusted,reason=pointer-proof-unavailable`.
+Static receipt bytes and repository variables never establish that the private
+authority still serves that pointer state.
+
 Retirement additionally requires an active, bypass-free organization ruleset
 (`source_type=Organization`, organization ID `283943935`) whose conditions
 target only repository ID `1242512092` and `~DEFAULT_BRANCH`. Its `workflows`
@@ -50,15 +62,25 @@ then pass merge readiness. None of those live mutations is automatic.
 
 `scripts/doctor_cisco_cutover_enforcement.py` accepts no caller-produced
 evidence file. It performs an authenticated, read-only `github.com` preflight
-with `gh`, collects every API page through an explicit empty terminal page,
+with an absolute administrator-pinned `gh` executable and SHA-256, an explicit
+absolute `GH_CONFIG_DIR`, an owner-private executable snapshot, and a minimal
+environment that inherits no ambient `PATH`, token, loader, proxy, or CA
+variables. It revalidates the source and snapshot identities, access policy,
+and content before and after each invocation and before admission. It collects
+every API page through an explicit empty terminal page,
 and revalidates the protected snapshot before admitting the selector, pinned
 ruleset, workflow, PR head, administrator-pinned exact run ID/attempt, job, and
-check run. Older or additional same-name lineage is allowed only when it comes
-from the same trusted workflow identity. Sanitized failures
+check run. Pointer admission additionally requires an exact authority
+repository/workflow/run/current-attempt/artifact locator and twice-stable live
+reads of the scoped current state and active merge lease; artifact name or
+latest-run discovery is not an authority. Older or additional same-name lineage
+is allowed only when it comes from the same trusted workflow identity. Sanitized failures
 retain a fixed endpoint class, HTTP status when available, and stable reason
 code without raw response bodies, headers, environment, or tokens. Until it returns
 `classification=admitted`, retirement remains `blocked_until_trusted` and the
-Jenkins entrypoint stays installed.
+Jenkins entrypoint stays installed. With the checked-in
+`private-live-authority-not-configured` policy, that compatibility route
+therefore remains mandatory.
 
 ## Test
 

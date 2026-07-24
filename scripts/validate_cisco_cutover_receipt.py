@@ -10,10 +10,11 @@ import pathlib
 import re
 import stat
 import time
+from datetime import datetime, timezone
 from typing import Any
 
 CONTRACT_SCHEMA_VERSION = 3
-RECEIPT_SCHEMA_VERSION = 2
+RECEIPT_SCHEMA_VERSION = 3
 DEFAULT_MAX_JSON_BYTES = 64 * 1024
 MAX_RECEIPT_BYTES = 35 * 1024
 JSON_READ_TIMEOUT_SECONDS = 1.0
@@ -22,11 +23,17 @@ MAX_JSON_CONTAINERS = 1_024
 MAX_JSON_NODES = 4_096
 MAX_JSON_CONTAINER_ITEMS = 1_024
 MAX_JSON_INTEGER_DIGITS = 64
+MAX_SIGNED_64_INTEGER = (1 << 63) - 1
 MAX_JSON_STRING_CHARS = 32 * 1024
 MAX_BLOCKED_REASON_CHARS = 1_024
 SHA1_PATTERN = re.compile(r"[0-9a-f]{40}")
 SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 POSITIVE_DECIMAL_PATTERN = re.compile(r"[1-9][0-9]*")
+CANONICAL_IDENTIFIER_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
+RFC3339_UTC_PATTERN = re.compile(
+    r"[0-9]{4}-[0-9]{2}-[0-9]{2}T"
+    r"[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,6})?Z"
+)
 VALIDATOR_PATH = "scripts/validate_cisco_cutover_receipt.py"
 REQUIRED_EXACT_INPUTS = [
     "expected_canonical_commit",
@@ -36,15 +43,41 @@ REQUIRED_EXACT_INPUTS = [
     "expected_receipt_sha256",
     "expected_workflow_id",
     "expected_workflow_sha",
+    "expected_installation_scope_id",
+    "expected_pointer_generation",
+    "expected_pointer_state_sha256",
+]
+EXPECTED_CUTOVER_INPUT_VARIABLES = [
+    "CISCO_CUTOVER_TARGET_PR_NUMBER",
+    "CISCO_CUTOVER_TARGET_HEAD_SHA",
+    "CISCO_CUTOVER_RECEIPT_BASE64",
+    "CISCO_CUTOVER_EXPECTED_CANONICAL_COMMIT",
+    "CISCO_CUTOVER_EXPECTED_PRIVATE_RELEASE_COMMIT",
+    "CISCO_CUTOVER_EXPECTED_RELEASE_MANIFEST_SHA256",
+    "CISCO_CUTOVER_EXPECTED_RECEIPT_SHA256",
+    "CISCO_CUTOVER_EXPECTED_WORKFLOW_ID",
+    "CISCO_CUTOVER_EXPECTED_WORKFLOW_SHA",
+    "CISCO_CUTOVER_EXPECTED_INSTALLATION_SCOPE_ID",
+    "CISCO_CUTOVER_EXPECTED_POINTER_GENERATION",
+    "CISCO_CUTOVER_EXPECTED_POINTER_STATE_SHA256",
 ]
 EXPECTED_CANONICAL_REPOSITORY = "Joey-Tools/codex-debug-triage"
 EXPECTED_CANONICAL_REPOSITORY_ID = 1242512092
 EXPECTED_DEFAULT_BRANCH = "master"
 EXPECTED_PRIVATE_AGGREGATE_REPOSITORY = "Joey-Tools/codex-private-workflows"
+EXPECTED_PRIVATE_RELEASE_WORKFLOW_PATH = ".github/workflows/release.yml"
+EXPECTED_PRIVATE_RELEASE_WORKFLOW_REF = "refs/heads/master"
 EXPECTED_WORKFLOW_PATH = ".github/workflows/cisco-cutover-admission.yml"
 EXPECTED_WORKFLOW_REF = "refs/heads/master"
 EXPECTED_WORKFLOW_EVENT = "pull_request_target"
 EXPECTED_WORKFLOW_CHECK_NAME = "cisco-cutover-admission"
+EXPECTED_GITHUB_ACTIONS_PROVIDER = {
+    "id": 15368,
+    "slug": "github-actions",
+}
+POINTER_STATE_HASH_DOMAIN = "cisco-installed-pointer-state-v1"
+POINTER_PROOF_UNAVAILABLE_REASON = "pointer-proof-unavailable"
+POINTER_AUTHORITY_REASON = "private-live-authority-not-configured"
 EXPECTED_ACTIVATION = {
     "release_kind": "immutable-private-overlay",
     "atomic": True,
@@ -104,6 +137,7 @@ EXPECTED_RETIREMENT_STATE_MACHINE = {
 EXPECTED_POST_CUTOVER_DECOMMISSION = {
     "trigger": "retirement-pr-merged-at-frozen-head",
     "lease_variable": "CISCO_CUTOVER_DECOMMISSION_LEASE",
+    "cutover_input_variables": EXPECTED_CUTOVER_INPUT_VARIABLES,
     "compare_and_swap": {
         "coordination": "create-if-absent-repository-variable-lease",
         "observations": [
@@ -427,7 +461,69 @@ def _require_positive_decimal(value: object, *, label: str) -> int:
     rendered = _require_string(value, label=label)
     if POSITIVE_DECIMAL_PATTERN.fullmatch(rendered) is None:
         raise ReceiptAdmissionError(f"{label} must be canonical positive decimal")
-    return int(rendered, 10)
+    parsed = int(rendered, 10)
+    if parsed > MAX_SIGNED_64_INTEGER:
+        raise ReceiptAdmissionError(f"{label} exceeds signed 64-bit range")
+    return parsed
+
+
+def _require_positive_integer(value: object, *, label: str) -> int:
+    if type(value) is not int or value <= 0 or value > MAX_SIGNED_64_INTEGER:
+        raise ReceiptAdmissionError(
+            f"{label} must be an exact positive signed 64-bit integer"
+        )
+    return value
+
+
+def _require_canonical_identifier(value: object, *, label: str) -> str:
+    rendered = _require_string(value, label=label)
+    if CANONICAL_IDENTIFIER_PATTERN.fullmatch(rendered) is None:
+        raise ReceiptAdmissionError(
+            f"{label} must be a canonical 1-128 character ASCII identifier"
+        )
+    return rendered
+
+
+def _require_rfc3339_utc(value: object, *, label: str) -> datetime:
+    rendered = _require_string(value, label=label)
+    if RFC3339_UTC_PATTERN.fullmatch(rendered) is None:
+        raise ReceiptAdmissionError(f"{label} must be RFC3339 UTC with a Z suffix")
+    try:
+        parsed = datetime.fromisoformat(f"{rendered[:-1]}+00:00")
+    except ValueError as error:
+        raise ReceiptAdmissionError(
+            f"{label} must be a valid RFC3339 timestamp"
+        ) from error
+    if parsed.utcoffset() != timezone.utc.utcoffset(parsed):
+        raise ReceiptAdmissionError(f"{label} must use UTC")
+    return parsed
+
+
+def _pointer_state_sha256(
+    *,
+    installation_scope_id: str,
+    name: str,
+    generation: int,
+    target: str,
+    resolved_release_commit: str,
+    release_manifest_sha256: str,
+) -> str:
+    state = {
+        "generation": generation,
+        "installation_scope_id": installation_scope_id,
+        "name": name,
+        "release_manifest_sha256": release_manifest_sha256,
+        "resolved_release_commit": resolved_release_commit,
+        "target": target,
+    }
+    canonical = json.dumps(
+        state,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    domain = f"{POINTER_STATE_HASH_DOMAIN}\0".encode("ascii")
+    return hashlib.sha256(domain + canonical).hexdigest()
 
 
 def _validate_contract(contract: dict[str, Any]) -> dict[str, Any]:
@@ -542,7 +638,11 @@ def _validate_receipt(
     expected_pull_request_number: int,
     expected_workflow_id: int,
     expected_workflow_sha: str,
-) -> str:
+    expected_installation_scope_id: str,
+    expected_pointer_generation: int,
+    expected_pointer_state_sha256: str,
+    validation_time: datetime,
+) -> dict[str, Any]:
     receipt = _require_exact_keys(
         receipt,
         {
@@ -671,31 +771,235 @@ def _validate_receipt(
             "target",
             "resolved_release_commit",
             "release_manifest_sha256",
+            "installation_scope_id",
+            "generation",
+            "state_sha256",
+            "observed_at",
+            "expires_at",
+            "live_authority",
+            "merge_lease",
         },
         label="receipt installed pointer",
+    )
+    _require_exact_json(pointer["name"], "current", label="receipt pointer name")
+    _require_exact_json(
+        pointer["target"],
+        expected_target,
+        label="receipt pointer target",
+    )
+    resolved_release_commit = _require_sha1(
+        pointer["resolved_release_commit"],
+        label="receipt pointer resolved release commit",
+    )
+    if resolved_release_commit != expected_private_release_commit:
+        raise ReceiptAdmissionError("receipt pointer release differs")
+    pointer_manifest_sha256 = _require_sha256(
+        pointer["release_manifest_sha256"],
+        label="receipt pointer release manifest sha256",
+    )
+    if pointer_manifest_sha256 != expected_release_manifest_sha256:
+        raise ReceiptAdmissionError("receipt pointer manifest differs")
+    installation_scope_id = _require_canonical_identifier(
+        pointer["installation_scope_id"],
+        label="receipt pointer installation scope ID",
+    )
+    if installation_scope_id != expected_installation_scope_id:
+        raise ReceiptAdmissionError("receipt pointer installation scope differs")
+    generation = _require_positive_integer(
+        pointer["generation"],
+        label="receipt pointer generation",
+    )
+    if generation != expected_pointer_generation:
+        raise ReceiptAdmissionError("receipt pointer generation differs")
+    pointer_state_sha256 = _require_sha256(
+        pointer["state_sha256"],
+        label="receipt pointer state sha256",
+    )
+    if pointer_state_sha256 != expected_pointer_state_sha256:
+        raise ReceiptAdmissionError("receipt pointer state digest differs")
+    recomputed_state_sha256 = _pointer_state_sha256(
+        installation_scope_id=installation_scope_id,
+        name=pointer["name"],
+        generation=generation,
+        target=pointer["target"],
+        resolved_release_commit=resolved_release_commit,
+        release_manifest_sha256=pointer_manifest_sha256,
+    )
+    if recomputed_state_sha256 != pointer_state_sha256:
+        raise ReceiptAdmissionError(
+            "receipt pointer state digest differs from canonical pointer state"
+        )
+
+    observed_at = _require_rfc3339_utc(
+        pointer["observed_at"],
+        label="receipt pointer observed_at",
+    )
+    expires_at = _require_rfc3339_utc(
+        pointer["expires_at"],
+        label="receipt pointer expires_at",
+    )
+    if expires_at <= observed_at:
+        raise ReceiptAdmissionError(
+            "receipt pointer expires_at must be after observed_at"
+        )
+    if observed_at > validation_time:
+        raise ReceiptAdmissionError("receipt pointer observed_at is in the future")
+    if expires_at <= validation_time:
+        raise ReceiptAdmissionError("receipt pointer proof has expired")
+
+    live_authority = _require_exact_keys(
+        pointer["live_authority"],
+        {
+            "repository_id",
+            "repository_full_name",
+            "workflow_id",
+            "workflow_path",
+            "workflow_ref",
+            "workflow_sha",
+            "run_id",
+            "run_attempt",
+            "provider",
+            "proof_artifact_id",
+            "proof_artifact_sha256",
+        },
+        label="receipt pointer live authority",
+    )
+    _require_positive_integer(
+        live_authority["repository_id"],
+        label="receipt pointer authority repository ID",
     )
     _require_exact_json(
-        pointer,
-        {
-            "name": "current",
-            "target": expected_target,
-            "resolved_release_commit": expected_private_release_commit,
-            "release_manifest_sha256": expected_release_manifest_sha256,
-        },
-        label="receipt installed pointer",
+        live_authority["repository_full_name"],
+        EXPECTED_PRIVATE_AGGREGATE_REPOSITORY,
+        label="receipt pointer authority repository",
     )
-    return expected_target
+    _require_positive_integer(
+        live_authority["workflow_id"],
+        label="receipt pointer authority workflow ID",
+    )
+    _require_exact_json(
+        live_authority["workflow_path"],
+        EXPECTED_PRIVATE_RELEASE_WORKFLOW_PATH,
+        label="receipt pointer authority workflow path",
+    )
+    _require_exact_json(
+        live_authority["workflow_ref"],
+        EXPECTED_PRIVATE_RELEASE_WORKFLOW_REF,
+        label="receipt pointer authority workflow ref",
+    )
+    _require_sha1(
+        live_authority["workflow_sha"],
+        label="receipt pointer authority workflow SHA",
+    )
+    _require_positive_integer(
+        live_authority["run_id"],
+        label="receipt pointer authority run ID",
+    )
+    _require_positive_integer(
+        live_authority["run_attempt"],
+        label="receipt pointer authority run attempt",
+    )
+    _require_exact_json(
+        live_authority["provider"],
+        EXPECTED_GITHUB_ACTIONS_PROVIDER,
+        label="receipt pointer authority provider",
+    )
+    _require_positive_integer(
+        live_authority["proof_artifact_id"],
+        label="receipt pointer authority proof artifact ID",
+    )
+    _require_sha256(
+        live_authority["proof_artifact_sha256"],
+        label="receipt pointer authority proof artifact SHA-256",
+    )
+
+    merge_lease = _require_exact_keys(
+        pointer["merge_lease"],
+        {
+            "lease_id",
+            "status",
+            "target_repository_id",
+            "pull_request_number",
+            "pull_request_head_sha",
+            "installation_scope_id",
+            "pointer_generation",
+            "acquired_at",
+            "expires_at",
+        },
+        label="receipt pointer merge lease",
+    )
+    _require_canonical_identifier(
+        merge_lease["lease_id"],
+        label="receipt pointer merge lease ID",
+    )
+    _require_exact_json(
+        merge_lease["status"],
+        "active",
+        label="receipt pointer merge lease status",
+    )
+    _require_exact_json(
+        merge_lease["target_repository_id"],
+        EXPECTED_CANONICAL_REPOSITORY_ID,
+        label="receipt pointer merge lease target repository ID",
+    )
+    _require_exact_json(
+        merge_lease["pull_request_number"],
+        expected_pull_request_number,
+        label="receipt pointer merge lease pull-request number",
+    )
+    _require_exact_json(
+        merge_lease["pull_request_head_sha"],
+        expected_canonical_commit,
+        label="receipt pointer merge lease pull-request head SHA",
+    )
+    _require_exact_json(
+        merge_lease["installation_scope_id"],
+        installation_scope_id,
+        label="receipt pointer merge lease installation scope ID",
+    )
+    _require_exact_json(
+        merge_lease["pointer_generation"],
+        generation,
+        label="receipt pointer merge lease generation",
+    )
+    acquired_at = _require_rfc3339_utc(
+        merge_lease["acquired_at"],
+        label="receipt pointer merge lease acquired_at",
+    )
+    lease_expires_at = _require_rfc3339_utc(
+        merge_lease["expires_at"],
+        label="receipt pointer merge lease expires_at",
+    )
+    if lease_expires_at <= acquired_at:
+        raise ReceiptAdmissionError(
+            "receipt pointer merge lease expires_at must be after acquired_at"
+        )
+    if acquired_at > observed_at:
+        raise ReceiptAdmissionError(
+            "receipt pointer merge lease was acquired after pointer observation"
+        )
+    if lease_expires_at <= validation_time:
+        raise ReceiptAdmissionError("receipt pointer merge lease has expired")
+    return pointer
 
 
-def _blocked(reason: str) -> int:
+def _blocked(
+    reason: str,
+    *,
+    details: dict[str, Any] | None = None,
+) -> int:
     if len(reason) > MAX_BLOCKED_REASON_CHARS:
         reason = f"{reason[: MAX_BLOCKED_REASON_CHARS - 16]}... [truncated]"
+    outcome = {
+        "classification": "blocked_until_trusted",
+        "reason": reason,
+        "validation_scope": "static-equivalence-only",
+    }
+    if details is not None:
+        outcome.update(details)
     print(
         json.dumps(
-            {
-                "classification": "blocked_until_trusted",
-                "reason": reason,
-            },
+            outcome,
             ensure_ascii=True,
             separators=(",", ":"),
             sort_keys=True,
@@ -712,7 +1016,10 @@ class ReceiptArgumentParser(argparse.ArgumentParser):
 
 def _parser() -> argparse.ArgumentParser:
     parser = ReceiptArgumentParser(
-        description=("Admit an exact private Cisco cutover release/pointer receipt.")
+        description=(
+            "Validate static equivalence for a private Cisco cutover "
+            "release/pointer receipt."
+        )
     )
     parser.add_argument("--contract", required=True)
     parser.add_argument("--receipt")
@@ -723,6 +1030,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--expected-receipt-sha256")
     parser.add_argument("--expected-workflow-id")
     parser.add_argument("--expected-workflow-sha")
+    parser.add_argument("--expected-installation-scope-id")
+    parser.add_argument("--expected-pointer-generation")
+    parser.add_argument("--expected-pointer-state-sha256")
     return parser
 
 
@@ -746,6 +1056,9 @@ def main(argv: list[str] | None = None) -> int:
             "expected_receipt_sha256": args.expected_receipt_sha256,
             "expected_workflow_id": args.expected_workflow_id,
             "expected_workflow_sha": args.expected_workflow_sha,
+            "expected_installation_scope_id": (args.expected_installation_scope_id),
+            "expected_pointer_generation": args.expected_pointer_generation,
+            "expected_pointer_state_sha256": args.expected_pointer_state_sha256,
         }
         missing = [name for name in REQUIRED_EXACT_INPUTS if not expectations[name]]
         if missing:
@@ -781,6 +1094,18 @@ def main(argv: list[str] | None = None) -> int:
             args.expected_workflow_sha,
             label="expected workflow SHA",
         )
+        expected_installation_scope_id = _require_canonical_identifier(
+            args.expected_installation_scope_id,
+            label="expected installation scope ID",
+        )
+        expected_pointer_generation = _require_positive_decimal(
+            args.expected_pointer_generation,
+            label="expected pointer generation",
+        )
+        expected_pointer_state_sha256 = _require_sha256(
+            args.expected_pointer_state_sha256,
+            label="expected pointer state SHA-256",
+        )
         receipt, receipt_sha256 = _read_exact_json(
             pathlib.Path(args.receipt),
             label="receipt",
@@ -790,7 +1115,7 @@ def main(argv: list[str] | None = None) -> int:
             raise ReceiptAdmissionError(
                 "receipt bytes do not match the trusted exact digest"
             )
-        pointer_target = _validate_receipt(
+        pointer = _validate_receipt(
             receipt,
             contract,
             expected_canonical_commit=expected_canonical_commit,
@@ -799,29 +1124,33 @@ def main(argv: list[str] | None = None) -> int:
             expected_pull_request_number=expected_pull_request_number,
             expected_workflow_id=expected_workflow_id,
             expected_workflow_sha=expected_workflow_sha,
+            expected_installation_scope_id=expected_installation_scope_id,
+            expected_pointer_generation=expected_pointer_generation,
+            expected_pointer_state_sha256=expected_pointer_state_sha256,
+            validation_time=datetime.now(timezone.utc),
         )
     except (OSError, ReceiptAdmissionError) as error:
         return _blocked(str(error))
 
-    print(
-        json.dumps(
-            {
-                "canonical_commit": expected_canonical_commit,
-                "classification": "admitted",
-                "pointer_target": pointer_target,
-                "private_release_commit": expected_private_release_commit,
-                "pull_request_number": expected_pull_request_number,
-                "receipt_sha256": receipt_sha256,
-                "release_manifest_sha256": expected_release_manifest_sha256,
-                "workflow_id": expected_workflow_id,
-                "workflow_sha": expected_workflow_sha,
-            },
-            ensure_ascii=True,
-            separators=(",", ":"),
-            sort_keys=True,
-        )
+    return _blocked(
+        POINTER_PROOF_UNAVAILABLE_REASON,
+        details={
+            "canonical_commit": expected_canonical_commit,
+            "installation_scope_id": pointer["installation_scope_id"],
+            "pointer_authority_reason": POINTER_AUTHORITY_REASON,
+            "pointer_authority_status": "unavailable",
+            "pointer_generation": pointer["generation"],
+            "pointer_state_sha256": pointer["state_sha256"],
+            "pointer_target": pointer["target"],
+            "private_release_commit": expected_private_release_commit,
+            "pull_request_number": expected_pull_request_number,
+            "receipt_sha256": receipt_sha256,
+            "release_manifest_sha256": expected_release_manifest_sha256,
+            "static_equivalence": "validated",
+            "workflow_id": expected_workflow_id,
+            "workflow_sha": expected_workflow_sha,
+        },
     )
-    return 0
 
 
 if __name__ == "__main__":

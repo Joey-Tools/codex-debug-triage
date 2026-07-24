@@ -63,6 +63,20 @@
   "post_cutover_decommission": {
     "trigger": "retirement-pr-merged-at-frozen-head",
     "lease_variable": "CISCO_CUTOVER_DECOMMISSION_LEASE",
+    "cutover_input_variables": [
+      "CISCO_CUTOVER_TARGET_PR_NUMBER",
+      "CISCO_CUTOVER_TARGET_HEAD_SHA",
+      "CISCO_CUTOVER_RECEIPT_BASE64",
+      "CISCO_CUTOVER_EXPECTED_CANONICAL_COMMIT",
+      "CISCO_CUTOVER_EXPECTED_PRIVATE_RELEASE_COMMIT",
+      "CISCO_CUTOVER_EXPECTED_RELEASE_MANIFEST_SHA256",
+      "CISCO_CUTOVER_EXPECTED_RECEIPT_SHA256",
+      "CISCO_CUTOVER_EXPECTED_WORKFLOW_ID",
+      "CISCO_CUTOVER_EXPECTED_WORKFLOW_SHA",
+      "CISCO_CUTOVER_EXPECTED_INSTALLATION_SCOPE_ID",
+      "CISCO_CUTOVER_EXPECTED_POINTER_GENERATION",
+      "CISCO_CUTOVER_EXPECTED_POINTER_STATE_SHA256"
+    ],
     "compare_and_swap": {
       "coordination": "create-if-absent-repository-variable-lease",
       "observations": [
@@ -95,7 +109,7 @@
   "receipt_admission": {
     "status_without_receipt": "blocked_until_trusted",
     "validator": "scripts/validate_cisco_cutover_receipt.py",
-    "receipt_schema_version": 2,
+    "receipt_schema_version": 3,
     "receipt_max_bytes": 35840,
     "producer_workflow": ".github/workflows/release.yml",
     "pointer_name": "current",
@@ -107,7 +121,10 @@
       "expected_release_manifest_sha256",
       "expected_receipt_sha256",
       "expected_workflow_id",
-      "expected_workflow_sha"
+      "expected_workflow_sha",
+      "expected_installation_scope_id",
+      "expected_pointer_generation",
+      "expected_pointer_state_sha256"
     ]
   }
 }

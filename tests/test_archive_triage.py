@@ -3920,6 +3920,10 @@ class BugTriageDocumentationTests(unittest.TestCase):
     _workflow_source_commit = "4" * 40
     _ruleset_id = 97531
     _workflow_id = 86420
+    _installation_scope_id = "fixture-installation-scope"
+    _pointer_generation = 17
+    _pointer_observed_at = "2026-07-24T12:00:00Z"
+    _pointer_expires_at = "2099-07-24T13:00:00Z"
     _trusted_gate_environment_names = (
         "EVENT_REPOSITORY",
         "PR_BASE_REF",
@@ -3935,6 +3939,9 @@ class BugTriageDocumentationTests(unittest.TestCase):
         "CISCO_CUTOVER_EXPECTED_RECEIPT_SHA256",
         "CISCO_CUTOVER_EXPECTED_WORKFLOW_ID",
         "CISCO_CUTOVER_EXPECTED_WORKFLOW_SHA",
+        "CISCO_CUTOVER_EXPECTED_INSTALLATION_SCOPE_ID",
+        "CISCO_CUTOVER_EXPECTED_POINTER_GENERATION",
+        "CISCO_CUTOVER_EXPECTED_POINTER_STATE_SHA256",
     )
     _selector_environment_names = (
         "EVENT_REPOSITORY",
@@ -3947,13 +3954,39 @@ class BugTriageDocumentationTests(unittest.TestCase):
         "GITHUB_OUTPUT",
     )
 
+    def _pointer_state_sha256(
+        self,
+        *,
+        generation: int | None = None,
+        installation_scope_id: str | None = None,
+        target: str | None = None,
+    ) -> str:
+        selected_generation = generation or self._pointer_generation
+        selected_scope = installation_scope_id or self._installation_scope_id
+        selected_target = target or f"releases/{self._private_release_commit}"
+        state = {
+            "generation": selected_generation,
+            "installation_scope_id": selected_scope,
+            "name": "current",
+            "release_manifest_sha256": self._release_manifest_sha256,
+            "resolved_release_commit": self._private_release_commit,
+            "target": selected_target,
+        }
+        canonical_state = b"cisco-installed-pointer-state-v1\0" + json.dumps(
+            state,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        return hashlib.sha256(canonical_state).hexdigest()
+
     def _matching_cutover_receipt(
         self,
         fixture: dict[str, object],
     ) -> dict[str, object]:
         release_target = f"releases/{self._private_release_commit}"
         return {
-            "schema_version": 2,
+            "schema_version": 3,
             "canonical_repository": fixture["canonical_repository"],
             "canonical_commit": self._canonical_commit,
             "private_aggregate_repository": fixture["private_aggregate_repository"],
@@ -3997,6 +4030,38 @@ class BugTriageDocumentationTests(unittest.TestCase):
                 "target": release_target,
                 "resolved_release_commit": self._private_release_commit,
                 "release_manifest_sha256": self._release_manifest_sha256,
+                "installation_scope_id": self._installation_scope_id,
+                "generation": self._pointer_generation,
+                "state_sha256": self._pointer_state_sha256(),
+                "observed_at": self._pointer_observed_at,
+                "expires_at": self._pointer_expires_at,
+                "live_authority": {
+                    "repository_id": 223344,
+                    "repository_full_name": fixture["private_aggregate_repository"],
+                    "workflow_id": 334455,
+                    "workflow_path": ".github/workflows/release.yml",
+                    "workflow_ref": "refs/heads/master",
+                    "workflow_sha": "5" * 40,
+                    "run_id": 445566,
+                    "run_attempt": 1,
+                    "provider": {
+                        "id": 15368,
+                        "slug": "github-actions",
+                    },
+                    "proof_artifact_id": 556677,
+                    "proof_artifact_sha256": "6" * 64,
+                },
+                "merge_lease": {
+                    "lease_id": "fixture-merge-lease",
+                    "status": "active",
+                    "target_repository_id": 1242512092,
+                    "pull_request_number": self._pull_request_number,
+                    "pull_request_head_sha": self._canonical_commit,
+                    "installation_scope_id": self._installation_scope_id,
+                    "pointer_generation": self._pointer_generation,
+                    "acquired_at": self._pointer_observed_at,
+                    "expires_at": self._pointer_expires_at,
+                },
             },
         }
 
@@ -4023,6 +4088,9 @@ class BugTriageDocumentationTests(unittest.TestCase):
         contract_path: Path = MIGRATION_FIXTURE_PATH,
         receipt_path: Path | None = None,
         receipt_sha256: str | None = None,
+        expected_installation_scope_id: str | None = None,
+        expected_pointer_generation: int | None = None,
+        expected_pointer_state_sha256: str | None = None,
     ) -> subprocess.CompletedProcess[str]:
         command = [
             sys.executable,
@@ -4049,6 +4117,12 @@ class BugTriageDocumentationTests(unittest.TestCase):
                     str(self._workflow_id),
                     "--expected-workflow-sha",
                     self._workflow_source_commit,
+                    "--expected-installation-scope-id",
+                    (expected_installation_scope_id or self._installation_scope_id),
+                    "--expected-pointer-generation",
+                    str(expected_pointer_generation or self._pointer_generation),
+                    "--expected-pointer-state-sha256",
+                    (expected_pointer_state_sha256 or self._pointer_state_sha256()),
                 ]
             )
         return subprocess.run(
@@ -4122,6 +4196,15 @@ class BugTriageDocumentationTests(unittest.TestCase):
                 ),
                 "CISCO_CUTOVER_EXPECTED_WORKFLOW_ID": str(self._workflow_id),
                 "CISCO_CUTOVER_EXPECTED_WORKFLOW_SHA": (self._workflow_source_commit),
+                "CISCO_CUTOVER_EXPECTED_INSTALLATION_SCOPE_ID": (
+                    self._installation_scope_id
+                ),
+                "CISCO_CUTOVER_EXPECTED_POINTER_GENERATION": str(
+                    self._pointer_generation
+                ),
+                "CISCO_CUTOVER_EXPECTED_POINTER_STATE_SHA256": (
+                    self._pointer_state_sha256()
+                ),
             }
         )
         if overrides:
@@ -4272,6 +4355,8 @@ class BugTriageDocumentationTests(unittest.TestCase):
         base_sha = pull_request["base"]["sha"]
         run_url = f"{repository_api}/actions/runs/10101"
         check_url = f"{repository_api}/check-runs/20202"
+        run_started_at = "2026-07-24T12:05:00Z"
+        completed_at = "2026-07-24T12:06:00Z"
         run = {
             "check_suite_id": 30303,
             "check_suite_url": f"{repository_api}/check-suites/30303",
@@ -4294,6 +4379,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
                 "id": repository["id"],
             },
             "run_attempt": 1,
+            "run_started_at": run_started_at,
             "status": "completed",
             "url": run_url,
             "workflow_id": self._workflow_id,
@@ -4316,6 +4402,8 @@ class BugTriageDocumentationTests(unittest.TestCase):
             "run_attempt": 1,
             "run_id": 10101,
             "run_url": run_url,
+            "started_at": run_started_at,
+            "completed_at": completed_at,
             "status": "completed",
             "url": f"{repository_api}/actions/jobs/20202",
             "workflow_name": "Cisco cutover admission",
@@ -4330,9 +4418,41 @@ class BugTriageDocumentationTests(unittest.TestCase):
             "id": 20202,
             "name": workflow["check_name"],
             "pull_requests": [self._copy_json(pull_request_link)],
+            "started_at": run_started_at,
+            "completed_at": completed_at,
             "status": "completed",
             "url": check_url,
         }
+        cutover_values = {
+            "CISCO_CUTOVER_TARGET_PR_NUMBER": str(self._pull_request_number),
+            "CISCO_CUTOVER_TARGET_HEAD_SHA": self._canonical_commit,
+            "CISCO_CUTOVER_RECEIPT_BASE64": "Zml4dHVyZS1yZWNlaXB0",
+            "CISCO_CUTOVER_EXPECTED_CANONICAL_COMMIT": self._canonical_commit,
+            "CISCO_CUTOVER_EXPECTED_PRIVATE_RELEASE_COMMIT": (
+                self._private_release_commit
+            ),
+            "CISCO_CUTOVER_EXPECTED_RELEASE_MANIFEST_SHA256": (
+                self._release_manifest_sha256
+            ),
+            "CISCO_CUTOVER_EXPECTED_RECEIPT_SHA256": "7" * 64,
+            "CISCO_CUTOVER_EXPECTED_WORKFLOW_ID": str(self._workflow_id),
+            "CISCO_CUTOVER_EXPECTED_WORKFLOW_SHA": self._workflow_source_commit,
+            "CISCO_CUTOVER_EXPECTED_INSTALLATION_SCOPE_ID": (
+                self._installation_scope_id
+            ),
+            "CISCO_CUTOVER_EXPECTED_POINTER_GENERATION": str(self._pointer_generation),
+            "CISCO_CUTOVER_EXPECTED_POINTER_STATE_SHA256": (
+                self._pointer_state_sha256()
+            ),
+        }
+        cutover_variables = [
+            {
+                "name": name,
+                "updated_at": "2026-07-24T12:00:00Z",
+                "value": cutover_values[name],
+            }
+            for name in contract["cutover_input_variables"]
+        ]
         return {
             "organization": organization,
             "repository": {
@@ -4348,14 +4468,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
                 },
             },
             "pull_request": pull_request,
-            "selector_target_pr_number": {
-                "name": "CISCO_CUTOVER_TARGET_PR_NUMBER",
-                "value": str(self._pull_request_number),
-            },
-            "selector_target_head_sha": {
-                "name": "CISCO_CUTOVER_TARGET_HEAD_SHA",
-                "value": self._canonical_commit,
-            },
+            "cutover_input_variables": cutover_variables,
             "effective_rulesets": [self._copy_json(ruleset)],
             "selected_ruleset": ruleset,
             "workflow_source_repository": {
@@ -4399,6 +4512,11 @@ class BugTriageDocumentationTests(unittest.TestCase):
                 ),
             },
             "workflow_runs": [run],
+            "selected_run_attempt": {
+                "id": 10101,
+                "run_attempt": 1,
+                "run_started_at": run_started_at,
+            },
             "jobs": [job],
             "check_runs": [check_run],
         }
@@ -4449,6 +4567,10 @@ class BugTriageDocumentationTests(unittest.TestCase):
         check_run["pull_requests"] = [
             self._api_pr_link(link) for link in check_run["pull_requests"]
         ]
+        cutover_variables = self._copy_json(
+            {"values": evidence["cutover_input_variables"]}
+        )["values"]
+        selected_run_attempt = self._copy_json(evidence["selected_run_attempt"])
         ruleset_summaries = [
             {
                 field: ruleset[field]
@@ -4475,6 +4597,9 @@ class BugTriageDocumentationTests(unittest.TestCase):
                 self.collections = collections
                 self.auth_calls = 0
                 self.calls: list[tuple[str, dict[str, object]]] = []
+                self.executable_sha256 = "a" * 64
+                self.execution_source = "owner-private-snapshot"
+                self.environment_profile = "minimal-explicit-config-v1"
 
             def auth_preflight(self) -> dict[str, object]:
                 self.auth_calls += 1
@@ -4482,6 +4607,20 @@ class BugTriageDocumentationTests(unittest.TestCase):
                     "id": 4242,
                     "login": "fixture-admin",
                 }
+
+            def __enter__(self) -> object:
+                return self
+
+            def __exit__(
+                self,
+                exception_type: object,
+                exception: object,
+                traceback: object,
+            ) -> bool:
+                return False
+
+            def revalidate_for_admission(self) -> None:
+                return None
 
             def get_json(
                 self,
@@ -4513,13 +4652,8 @@ class BugTriageDocumentationTests(unittest.TestCase):
             f"/repos/{target_name}": evidence["repository"],
             f"/repos/{target_name}/pulls/7": pull_request,
             (
-                f"/repos/{target_name}/actions/variables/"
-                f"{contract['applicability_selector']['target_pr_number_variable']}"
-            ): evidence["selector_target_pr_number"],
-            (
-                f"/repos/{target_name}/actions/variables/"
-                f"{contract['applicability_selector']['target_head_sha_variable']}"
-            ): evidence["selector_target_head_sha"],
+                f"/repos/{target_name}/actions/runs/10101/attempts/1"
+            ): selected_run_attempt,
             (
                 f"/orgs/{contract['source_organization']['login']}/rulesets/"
                 f"{self._ruleset_id}"
@@ -4533,6 +4667,10 @@ class BugTriageDocumentationTests(unittest.TestCase):
             ): evidence["workflow_source_commit"],
         }
         collections = {
+            f"/repos/{target_name}/actions/variables": {
+                "item_key": "variables",
+                "pages": [cutover_variables],
+            },
             f"/repos/{target_name}/rulesets": {
                 "item_key": None,
                 "pages": [ruleset_summaries],
@@ -4630,9 +4768,52 @@ class BugTriageDocumentationTests(unittest.TestCase):
             stderr="",
         )
 
+    def _validate_static_enforcement(
+        self,
+        evidence: dict[str, object],
+        *,
+        contract: dict[str, object] | None = None,
+        expected_run_attempt: int = 1,
+        expected_run_id: int = 10101,
+        expected_ruleset_id: int | None = None,
+        expected_workflow_id: int | None = None,
+        expected_workflow_sha: str | None = None,
+        candidate_head_sha: str | None = None,
+    ) -> dict[str, object]:
+        selected_contract = contract or json.loads(
+            CUTOVER_ENFORCEMENT_CONTRACT_PATH.read_text(encoding="utf-8")
+        )
+        return ENFORCEMENT_MODULE._validate_snapshot_enforcement(
+            selected_contract,
+            evidence,
+            expected_run_attempt=expected_run_attempt,
+            expected_run_id=expected_run_id,
+            expected_ruleset_id=expected_ruleset_id or self._ruleset_id,
+            expected_workflow_id=expected_workflow_id or self._workflow_id,
+            expected_workflow_sha=(
+                expected_workflow_sha or self._workflow_source_commit
+            ),
+            candidate_head_sha=candidate_head_sha or self._canonical_commit,
+            pull_request_number=7,
+        )
+
     @staticmethod
     def _copy_json(value: dict[str, object]) -> dict[str, object]:
         return json.loads(json.dumps(value))
+
+    @staticmethod
+    def _cutover_variable(
+        evidence: dict[str, object],
+        name: str,
+    ) -> dict[str, object]:
+        matches = [
+            value
+            for value in evidence["cutover_input_variables"]
+            if value["name"] == name
+        ]
+        if len(matches) != 1:
+            raise AssertionError(f"expected one cutover variable: {name}")
+        return matches[0]
 
     def test_bootstrap_retains_legacy_jenkins_entrypoint(self) -> None:
         skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
@@ -4787,7 +4968,10 @@ class BugTriageDocumentationTests(unittest.TestCase):
         )
         self.assertIn("limits integers to 64 digits", migration)
         self.assertIn("require exact JSON scalar and container types", migration)
-        self.assertIn("does not authenticate where the caller obtained", migration)
+        self.assertIn(
+            "independent trusted source, not copied from the receipt",
+            migration,
+        )
         self.assertIn(
             "Protected-Base Admission And Exact Unblocking Inputs",
             migration,
@@ -4823,6 +5007,11 @@ class BugTriageDocumentationTests(unittest.TestCase):
         self.assertIn("does not document conditional `If-Match`", migration)
         self.assertIn("--expected-run-id", migration)
         self.assertIn("--expected-run-attempt", migration)
+        self.assertIn("--gh-executable", migration)
+        self.assertIn("--expected-gh-sha256", migration)
+        self.assertIn("--gh-config-dir", migration)
+        self.assertIn("owner-private executable snapshot", migration)
+        self.assertIn("returns `collector-inconclusive`", migration)
         self.assertIn("A later attempt supersedes an older", migration)
         self.assertIn("blocked-permission", migration)
         self.assertIn("http_status=403", migration)
@@ -4836,9 +5025,10 @@ class BugTriageDocumentationTests(unittest.TestCase):
         checkpoints = (
             "Separately review and merge a compatibility/bootstrap PR",
             "create the separate\n   retirement PR",
-            "producer-authored schema-2 receipt",
+            "producer-authored schema-3 receipt",
             "configures both selector variables",
             "creates or updates the active,\n   bypass-free organization",
+            "Configure and independently validate the live pointer authority",
             "trigger a new target evaluation",
             "Run the live read-only doctor against that exact retirement PR/head",
             "Immediately before merge, revalidate",
@@ -5014,7 +5204,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
             CUTOVER_ENFORCEMENT_CONTRACT_PATH.read_text(encoding="utf-8")
         )
 
-        self.assertEqual(contract["schema_version"], 3)
+        self.assertEqual(contract["schema_version"], 4)
         self.assertEqual(
             contract["source_organization"],
             {
@@ -5075,6 +5265,30 @@ class BugTriageDocumentationTests(unittest.TestCase):
                 "target_job_name": "cisco-cutover-admission",
                 "neutral_job_name": "cisco-cutover-neutral",
                 "non_target_classification": "not_applicable",
+            },
+        )
+        self.assertEqual(
+            contract["cutover_input_variables"],
+            [
+                "CISCO_CUTOVER_TARGET_PR_NUMBER",
+                "CISCO_CUTOVER_TARGET_HEAD_SHA",
+                "CISCO_CUTOVER_RECEIPT_BASE64",
+                "CISCO_CUTOVER_EXPECTED_CANONICAL_COMMIT",
+                "CISCO_CUTOVER_EXPECTED_PRIVATE_RELEASE_COMMIT",
+                "CISCO_CUTOVER_EXPECTED_RELEASE_MANIFEST_SHA256",
+                "CISCO_CUTOVER_EXPECTED_RECEIPT_SHA256",
+                "CISCO_CUTOVER_EXPECTED_WORKFLOW_ID",
+                "CISCO_CUTOVER_EXPECTED_WORKFLOW_SHA",
+                "CISCO_CUTOVER_EXPECTED_INSTALLATION_SCOPE_ID",
+                "CISCO_CUTOVER_EXPECTED_POINTER_GENERATION",
+                "CISCO_CUTOVER_EXPECTED_POINTER_STATE_SHA256",
+            ],
+        )
+        self.assertEqual(
+            contract["pointer_authority"],
+            {
+                "status": "unavailable",
+                "reason": "private-live-authority-not-configured",
             },
         )
 
@@ -5166,6 +5380,88 @@ class BugTriageDocumentationTests(unittest.TestCase):
                         "blocked_until_trusted",
                     )
 
+    def test_trusted_cutover_workflow_rejects_pointer_and_lease_drift(
+        self,
+    ) -> None:
+        fixture = json.loads(MIGRATION_FIXTURE_PATH.read_text(encoding="utf-8"))
+        cases = {
+            "scope": (
+                lambda pointer: pointer.update(
+                    {"installation_scope_id": "other-installation-scope"}
+                ),
+                "installation scope differs",
+            ),
+            "state": (
+                lambda pointer: pointer.update({"state_sha256": "7" * 64}),
+                "state digest differs",
+            ),
+            "authority": (
+                lambda pointer: pointer["live_authority"].update(
+                    {"repository_full_name": "attacker/private-workflows"}
+                ),
+                "authority repository differs",
+            ),
+            "lease-status": (
+                lambda pointer: pointer["merge_lease"].update({"status": "released"}),
+                "merge lease is not active",
+            ),
+            "lease-head": (
+                lambda pointer: pointer["merge_lease"].update(
+                    {"pull_request_head_sha": "8" * 40}
+                ),
+                "merge lease head differs",
+            ),
+            "lease-generation": (
+                lambda pointer: pointer["merge_lease"].update(
+                    {"pointer_generation": self._pointer_generation + 1}
+                ),
+                "merge lease generation differs",
+            ),
+            "expired": (
+                lambda pointer: (
+                    pointer.update(
+                        {
+                            "observed_at": "2000-01-01T00:00:00Z",
+                            "expires_at": "2000-01-02T00:00:00Z",
+                        }
+                    ),
+                    pointer["merge_lease"].update(
+                        {"acquired_at": "2000-01-01T00:00:00Z"}
+                    ),
+                ),
+                "pointer proof has expired",
+            ),
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            for label, (mutate, expected_reason) in cases.items():
+                with self.subTest(pointer_drift=label):
+                    receipt = self._matching_cutover_receipt(fixture)
+                    mutate(receipt["installed_pointer"])
+                    receipt_payload = (
+                        json.dumps(
+                            receipt,
+                            ensure_ascii=True,
+                            separators=(",", ":"),
+                            sort_keys=True,
+                        )
+                        + "\n"
+                    ).encode("utf-8")
+                    result = self._run_trusted_workflow_program(
+                        environment=self._trusted_workflow_environment(
+                            receipt_payload=receipt_payload,
+                        ),
+                        cwd=temp_root,
+                    )
+
+                    self.assertEqual(result.returncode, 1, result.stdout)
+                    outcome = json.loads(result.stdout)
+                    self.assertEqual(
+                        outcome["classification"],
+                        "blocked_until_trusted",
+                    )
+                    self.assertIn(expected_reason, outcome["reason"])
+
     def test_trusted_cutover_workflow_ignores_malicious_candidate_files(
         self,
     ) -> None:
@@ -5215,11 +5511,13 @@ class BugTriageDocumentationTests(unittest.TestCase):
             )
             candidate_executed = marker.exists()
 
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertEqual(result.stderr, "")
         self.assertFalse(candidate_executed)
         outcome = json.loads(result.stdout)
-        self.assertEqual(outcome["classification"], "admitted")
+        self.assertEqual(outcome["classification"], "blocked_until_trusted")
+        self.assertEqual(outcome["reason"], "pointer-proof-unavailable")
+        self.assertEqual(outcome["static_equivalence"], "validated")
         self.assertEqual(
             outcome["receipt_sha256"],
             hashlib.sha256(receipt_payload).hexdigest(),
@@ -5248,31 +5546,16 @@ class BugTriageDocumentationTests(unittest.TestCase):
                 )
                 self.assertIn("is a placeholder", outcome["reason"])
 
-    def test_enforcement_doctor_admits_exact_required_workflow_identity(
+    def test_enforcement_doctor_blocks_without_live_pointer_authority(
         self,
     ) -> None:
         result = self._run_enforcement_doctor(self._matching_enforcement_evidence())
 
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertEqual(result.stderr, "")
         outcome = json.loads(result.stdout)
-        self.assertEqual(outcome["classification"], "admitted")
-        self.assertEqual(outcome["ruleset_id"], self._ruleset_id)
-        self.assertEqual(
-            outcome["trusted_workflow"],
-            {
-                "id": self._workflow_id,
-                "path": ".github/workflows/cisco-cutover-admission.yml",
-                "ref": "refs/heads/master",
-                "repository_id": 1242512092,
-                "sha": self._workflow_source_commit,
-            },
-        )
-        self.assertEqual(outcome["candidate_head_sha"], self._canonical_commit)
-        self.assertEqual(outcome["trusted_workflow_run_id"], 10101)
-        self.assertEqual(outcome["trusted_check_run_id"], 20202)
-        self.assertRegex(outcome["contract_sha256"], r"\A[0-9a-f]{64}\Z")
-        self.assertRegex(outcome["evidence_sha256"], r"\A[0-9a-f]{64}\Z")
+        self.assertEqual(outcome["classification"], "blocked_until_trusted")
+        self.assertEqual(outcome["reason_code"], "pointer-proof-unavailable")
 
     def test_enforcement_live_collector_exhausts_pages_and_binds_lineage(
         self,
@@ -5282,7 +5565,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
         )
         client = self._matching_live_api_client()
 
-        receipt, admission = ENFORCEMENT_MODULE.collect_and_validate(
+        receipt, admission = ENFORCEMENT_MODULE._collect_and_validate_static(
             client,
             contract,
             expected_run_attempt=1,
@@ -5294,8 +5577,16 @@ class BugTriageDocumentationTests(unittest.TestCase):
             pull_request_number=7,
         )
 
-        self.assertEqual(receipt["schema_version"], 2)
+        self.assertEqual(receipt["schema_version"], 3)
         self.assertEqual(receipt["collector"]["mode"], "live-gh-rest")
+        self.assertEqual(
+            receipt["collector"]["gh_executable"],
+            {
+                "environment_profile": "minimal-explicit-config-v1",
+                "execution_source": "owner-private-snapshot",
+                "sha256": "a" * 64,
+            },
+        )
         self.assertEqual(client.auth_calls, 1)
         self.assertNotIn("collection", receipt["initial"])
         self.assertEqual(admission["trusted_run"]["id"], 10101)
@@ -5460,7 +5751,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
 
         client.get_json = timestamped_get_json
 
-        _, admission = ENFORCEMENT_MODULE.collect_and_validate(
+        _, admission = ENFORCEMENT_MODULE._collect_and_validate_static(
             client,
             contract,
             expected_run_attempt=1,
@@ -5473,6 +5764,321 @@ class BugTriageDocumentationTests(unittest.TestCase):
         )
 
         self.assertEqual(admission["trusted_run"]["id"], 10101)
+
+    def test_enforcement_live_collector_fully_paginates_cutover_variables(
+        self,
+    ) -> None:
+        contract = json.loads(
+            CUTOVER_ENFORCEMENT_CONTRACT_PATH.read_text(encoding="utf-8")
+        )
+        client = self._matching_live_api_client()
+        variable_endpoint = "/repos/Joey-Tools/codex-debug-triage/actions/variables"
+        variables = client.collections[variable_endpoint]["pages"][0]
+        client.collections[variable_endpoint]["pages"] = [
+            variables[:5],
+            variables[5:],
+        ]
+
+        receipt, _ = ENFORCEMENT_MODULE._collect_and_validate_static(
+            client,
+            contract,
+            expected_run_attempt=1,
+            expected_run_id=10101,
+            expected_ruleset_id=self._ruleset_id,
+            expected_workflow_id=self._workflow_id,
+            expected_workflow_sha=self._workflow_source_commit,
+            candidate_head_sha=self._canonical_commit,
+            pull_request_number=7,
+        )
+
+        bounds = [
+            value
+            for value in receipt["collector"]["page_bounds"]
+            if value["label"] == "repository Actions variables"
+        ]
+        self.assertEqual(len(bounds), 2)
+        self.assertEqual(
+            {value["phase"] for value in bounds},
+            {"initial", "revalidation"},
+        )
+        self.assertTrue(all(value["item_count"] == 12 for value in bounds))
+        self.assertTrue(all(value["terminal_empty_page"] == 3 for value in bounds))
+
+    def test_enforcement_live_collector_rejects_missing_or_duplicate_variables(
+        self,
+    ) -> None:
+        contract = json.loads(
+            CUTOVER_ENFORCEMENT_CONTRACT_PATH.read_text(encoding="utf-8")
+        )
+        variable_endpoint = "/repos/Joey-Tools/codex-debug-triage/actions/variables"
+        cases = (
+            ("missing", "cutover-input-missing"),
+            ("duplicate", "cutover-input-duplicate"),
+        )
+        for label, reason_code in cases:
+            with self.subTest(variable_set=label):
+                client = self._matching_live_api_client()
+                variables = client.collections[variable_endpoint]["pages"][0]
+                if label == "missing":
+                    client.collections[variable_endpoint]["pages"] = [variables[:-1]]
+                else:
+                    client.collections[variable_endpoint]["pages"] = [
+                        variables,
+                        [self._copy_json(variables[0])],
+                    ]
+
+                with self.assertRaises(
+                    ENFORCEMENT_MODULE.EnforcementDoctorError
+                ) as raised:
+                    ENFORCEMENT_MODULE.collect_and_validate(
+                        client,
+                        contract,
+                        expected_run_attempt=1,
+                        expected_run_id=10101,
+                        expected_ruleset_id=self._ruleset_id,
+                        expected_workflow_id=self._workflow_id,
+                        expected_workflow_sha=self._workflow_source_commit,
+                        candidate_head_sha=self._canonical_commit,
+                        pull_request_number=7,
+                    )
+
+                self.assertEqual(raised.exception.reason_code, reason_code)
+
+    def test_enforcement_live_collector_detects_cutover_input_timestamp_drift(
+        self,
+    ) -> None:
+        contract = json.loads(
+            CUTOVER_ENFORCEMENT_CONTRACT_PATH.read_text(encoding="utf-8")
+        )
+        client = self._matching_live_api_client()
+        variable_endpoint = "/repos/Joey-Tools/codex-debug-triage/actions/variables"
+        original_get_json = client.get_json
+        first_page_reads = 0
+
+        def drifting_get_json(
+            endpoint: str,
+            parameters: dict[str, object] | None = None,
+        ) -> object:
+            nonlocal first_page_reads
+            result = original_get_json(endpoint, parameters)
+            if (
+                endpoint == variable_endpoint
+                and int((parameters or {}).get("page", 0)) == 1
+            ):
+                first_page_reads += 1
+                if first_page_reads == 2:
+                    result["variables"][0]["updated_at"] = "2026-07-24T12:00:01Z"
+            return result
+
+        client.get_json = drifting_get_json
+        with self.assertRaises(ENFORCEMENT_MODULE.EnforcementDoctorError) as raised:
+            ENFORCEMENT_MODULE.collect_and_validate(
+                client,
+                contract,
+                expected_run_attempt=1,
+                expected_run_id=10101,
+                expected_ruleset_id=self._ruleset_id,
+                expected_workflow_id=self._workflow_id,
+                expected_workflow_sha=self._workflow_source_commit,
+                candidate_head_sha=self._canonical_commit,
+                pull_request_number=7,
+            )
+
+        self.assertEqual(first_page_reads, 2)
+        self.assertEqual(raised.exception.reason_code, "cutover-input-drift")
+
+    def test_enforcement_live_collector_detects_cutover_input_value_drift(
+        self,
+    ) -> None:
+        contract = json.loads(
+            CUTOVER_ENFORCEMENT_CONTRACT_PATH.read_text(encoding="utf-8")
+        )
+        client = self._matching_live_api_client()
+        variable_endpoint = "/repos/Joey-Tools/codex-debug-triage/actions/variables"
+        original_get_json = client.get_json
+        first_page_reads = 0
+
+        def drifting_get_json(
+            endpoint: str,
+            parameters: dict[str, object] | None = None,
+        ) -> object:
+            nonlocal first_page_reads
+            result = original_get_json(endpoint, parameters)
+            if (
+                endpoint == variable_endpoint
+                and int((parameters or {}).get("page", 0)) == 1
+            ):
+                first_page_reads += 1
+                if first_page_reads == 2:
+                    selected = next(
+                        value
+                        for value in result["variables"]
+                        if value["name"] == "CISCO_CUTOVER_RECEIPT_BASE64"
+                    )
+                    selected["value"] = "ZHJpZnRlZC1yZWNlaXB0"
+            return result
+
+        client.get_json = drifting_get_json
+        with self.assertRaises(ENFORCEMENT_MODULE.EnforcementDoctorError) as raised:
+            ENFORCEMENT_MODULE.collect_and_validate(
+                client,
+                contract,
+                expected_run_attempt=1,
+                expected_run_id=10101,
+                expected_ruleset_id=self._ruleset_id,
+                expected_workflow_id=self._workflow_id,
+                expected_workflow_sha=self._workflow_source_commit,
+                candidate_head_sha=self._canonical_commit,
+                pull_request_number=7,
+            )
+
+        self.assertEqual(first_page_reads, 2)
+        self.assertEqual(raised.exception.reason_code, "cutover-input-drift")
+
+    def test_enforcement_live_collector_binds_exact_attempt_endpoint(
+        self,
+    ) -> None:
+        contract = json.loads(
+            CUTOVER_ENFORCEMENT_CONTRACT_PATH.read_text(encoding="utf-8")
+        )
+        client = self._matching_live_api_client()
+        attempt_endpoint = (
+            "/repos/Joey-Tools/codex-debug-triage/actions/runs/10101/attempts/1"
+        )
+        client.objects[attempt_endpoint]["run_attempt"] = 2
+
+        with self.assertRaises(ENFORCEMENT_MODULE.EnforcementDoctorError) as raised:
+            ENFORCEMENT_MODULE.collect_and_validate(
+                client,
+                contract,
+                expected_run_attempt=1,
+                expected_run_id=10101,
+                expected_ruleset_id=self._ruleset_id,
+                expected_workflow_id=self._workflow_id,
+                expected_workflow_sha=self._workflow_source_commit,
+                candidate_head_sha=self._canonical_commit,
+                pull_request_number=7,
+            )
+
+        self.assertEqual(
+            raised.exception.reason_code,
+            "selected-run-attempt-mismatch",
+        )
+
+    def test_enforcement_run_must_be_strictly_newer_than_every_cutover_input(
+        self,
+    ) -> None:
+        contract = json.loads(
+            CUTOVER_ENFORCEMENT_CONTRACT_PATH.read_text(encoding="utf-8")
+        )
+        for variable_name in contract["cutover_input_variables"]:
+            with self.subTest(variable=variable_name):
+                evidence = self._matching_enforcement_evidence()
+                self._cutover_variable(
+                    evidence,
+                    variable_name,
+                )["updated_at"] = "2026-07-24T12:05:01Z"
+                result = self._run_enforcement_doctor(evidence)
+
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertEqual(
+                    json.loads(result.stdout)["reason_code"],
+                    "selected-run-predates-cutover-inputs",
+                )
+
+        evidence = self._matching_enforcement_evidence()
+        self._cutover_variable(
+            evidence,
+            "CISCO_CUTOVER_EXPECTED_POINTER_GENERATION",
+        )["updated_at"] = "2026-07-24T12:05:00Z"
+        result = self._run_enforcement_doctor(evidence)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertEqual(
+            json.loads(result.stdout)["reason_code"],
+            "cutover-freshness-inconclusive",
+        )
+
+    def test_enforcement_older_selected_run_is_not_rescued_by_newer_success(
+        self,
+    ) -> None:
+        evidence = self._matching_enforcement_evidence()
+        for variable in evidence["cutover_input_variables"]:
+            variable["updated_at"] = "2026-07-24T12:07:00Z"
+        original_run = evidence["workflow_runs"][0]
+        original_job = evidence["jobs"][0]
+        original_check = evidence["check_runs"][0]
+        newer_run = self._copy_json(original_run)
+        newer_run_url = (
+            "https://api.github.com/repos/Joey-Tools/"
+            "codex-debug-triage/actions/runs/10102"
+        )
+        newer_run.update(
+            {
+                "check_suite_id": 30304,
+                "check_suite_url": (
+                    "https://api.github.com/repos/Joey-Tools/"
+                    "codex-debug-triage/check-suites/30304"
+                ),
+                "html_url": (
+                    "https://github.com/Joey-Tools/codex-debug-triage/"
+                    "actions/runs/10102"
+                ),
+                "id": 10102,
+                "jobs_url": f"{newer_run_url}/jobs",
+                "run_started_at": "2026-07-24T12:10:00Z",
+                "url": newer_run_url,
+            }
+        )
+        newer_check_url = (
+            "https://api.github.com/repos/Joey-Tools/"
+            "codex-debug-triage/check-runs/20204"
+        )
+        newer_job = self._copy_json(original_job)
+        newer_job.update(
+            {
+                "check_run_url": newer_check_url,
+                "completed_at": "2026-07-24T12:11:00Z",
+                "html_url": (
+                    "https://github.com/Joey-Tools/codex-debug-triage/"
+                    "actions/runs/10102/job/20204"
+                ),
+                "id": 20204,
+                "run_id": 10102,
+                "run_url": newer_run_url,
+                "started_at": "2026-07-24T12:10:00Z",
+                "url": (
+                    "https://api.github.com/repos/Joey-Tools/"
+                    "codex-debug-triage/actions/jobs/20204"
+                ),
+            }
+        )
+        newer_check = self._copy_json(original_check)
+        newer_check.update(
+            {
+                "check_suite_id": 30304,
+                "completed_at": "2026-07-24T12:11:00Z",
+                "details_url": newer_job["html_url"],
+                "html_url": newer_job["html_url"],
+                "id": 20204,
+                "started_at": "2026-07-24T12:10:00Z",
+                "url": newer_check_url,
+            }
+        )
+        evidence["workflow_runs"].append(newer_run)
+        evidence["jobs"].append(newer_job)
+        evidence["check_runs"].append(newer_check)
+
+        result = self._run_enforcement_doctor(
+            evidence,
+            expected_run_id=10101,
+            expected_run_attempt=1,
+        )
+
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertEqual(
+            json.loads(result.stdout)["reason_code"],
+            "selected-run-predates-cutover-inputs",
+        )
 
     def test_enforcement_doctor_cli_has_no_untrusted_evidence_input(
         self,
@@ -5504,6 +6110,268 @@ class BugTriageDocumentationTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.code, 2)
 
+    def test_enforcement_doctor_requires_pinned_gh_arguments(self) -> None:
+        required_arguments = (
+            "--gh-executable",
+            "--expected-gh-sha256",
+            "--gh-config-dir",
+        )
+        base_arguments = [
+            "--contract",
+            str(CUTOVER_ENFORCEMENT_CONTRACT_PATH),
+            "--gh-executable",
+            "/usr/bin/true",
+            "--expected-gh-sha256",
+            "a" * 64,
+            "--gh-config-dir",
+            tempfile.gettempdir(),
+            "--pull-request-number",
+            "7",
+            "--expected-ruleset-id",
+            str(self._ruleset_id),
+            "--expected-run-id",
+            "10101",
+            "--expected-run-attempt",
+            "1",
+            "--expected-workflow-id",
+            str(self._workflow_id),
+            "--expected-workflow-sha",
+            self._workflow_source_commit,
+            "--candidate-head-sha",
+            self._canonical_commit,
+        ]
+        for argument in required_arguments:
+            with self.subTest(required=argument):
+                index = base_arguments.index(argument)
+                incomplete = base_arguments[:index] + base_arguments[index + 2 :]
+                with redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit) as raised:
+                        ENFORCEMENT_MODULE.build_parser().parse_args(incomplete)
+                self.assertEqual(raised.exception.code, 2)
+
+    def test_enforcement_gh_pin_uses_exact_digest_and_minimal_environment(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            trusted_gh = temp_root / "trusted-gh"
+            trusted_payload = b"#!/bin/sh\nexit 0\n"
+            trusted_gh.write_bytes(trusted_payload)
+            trusted_gh.chmod(0o700)
+            expected_digest = hashlib.sha256(trusted_payload).hexdigest()
+            config_dir = temp_root / "gh-config"
+            config_dir.mkdir()
+            malicious_dir = temp_root / "malicious-path"
+            malicious_dir.mkdir()
+            malicious_gh = malicious_dir / "gh"
+            malicious_gh.write_bytes(b"#!/bin/sh\nexit 99\n")
+            malicious_gh.chmod(0o700)
+            observed: dict[str, object] = {}
+
+            def fixed_result(
+                command: list[str],
+                **kwargs: object,
+            ) -> tuple[int, bytes, bytes]:
+                observed["command"] = command
+                observed["environment"] = kwargs["environment"]
+                return 0, b'{"id":1,"login":"fixture"}', b""
+
+            ambient = {
+                "PATH": str(malicious_dir),
+                "HOME": "/ambient-home",
+                "GH_TOKEN": "ambient-gh-token",
+                "GH_HOST": "attacker.invalid",
+                "HTTPS_PROXY": "https://proxy.invalid",
+                "SSL_CERT_FILE": "/ambient-ca.pem",
+                "DYLD_INSERT_LIBRARIES": "/ambient.dylib",
+                "LD_PRELOAD": "/ambient.so",
+            }
+            with mock.patch.dict(os.environ, ambient, clear=False):
+                with ENFORCEMENT_MODULE.GitHubApiClient(
+                    trusted_gh,
+                    expected_digest,
+                    config_dir,
+                ) as client:
+                    with mock.patch.object(
+                        ENFORCEMENT_MODULE,
+                        "_bounded_subprocess",
+                        side_effect=fixed_result,
+                    ):
+                        response = client.get_json("/user")
+
+                    self.assertEqual(response["login"], "fixture")
+                    self.assertEqual(observed["command"][0], client.executable)
+                    self.assertNotEqual(observed["command"][0], str(malicious_gh))
+                    self.assertEqual(
+                        observed["environment"],
+                        {
+                            "GH_CONFIG_DIR": str(config_dir),
+                            "GH_NO_UPDATE_NOTIFIER": "1",
+                            "GH_PROMPT_DISABLED": "1",
+                            "LC_ALL": "C",
+                        },
+                    )
+                    self.assertEqual(client.executable_sha256, expected_digest)
+                    self.assertEqual(
+                        client.execution_source,
+                        "owner-private-snapshot",
+                    )
+                    self.assertEqual(
+                        client.environment_profile,
+                        "minimal-explicit-config-v1",
+                    )
+
+    def test_enforcement_gh_pin_rejects_initial_digest_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            trusted_gh = temp_root / "trusted-gh"
+            trusted_gh.write_bytes(b"#!/bin/sh\nexit 0\n")
+            trusted_gh.chmod(0o700)
+            config_dir = temp_root / "gh-config"
+            config_dir.mkdir()
+
+            with self.assertRaises(ENFORCEMENT_MODULE.EnforcementDoctorError) as raised:
+                ENFORCEMENT_MODULE.GitHubApiClient(
+                    trusted_gh,
+                    "a" * 64,
+                    config_dir,
+                )
+
+        self.assertEqual(
+            raised.exception.reason_code,
+            "collector-digest-mismatch",
+        )
+
+    def test_enforcement_gh_pin_rejects_relative_or_symlink_trust_roots(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            trusted_gh = temp_root / "trusted-gh"
+            trusted_payload = b"#!/bin/sh\nexit 0\n"
+            trusted_gh.write_bytes(trusted_payload)
+            trusted_gh.chmod(0o700)
+            trusted_digest = hashlib.sha256(trusted_payload).hexdigest()
+            symlink_gh = temp_root / "symlink-gh"
+            symlink_gh.symlink_to(trusted_gh)
+            config_dir = temp_root / "gh-config"
+            config_dir.mkdir()
+            cases = (
+                ("relative-executable", Path("trusted-gh"), config_dir),
+                ("symlink-executable", symlink_gh, config_dir),
+                ("relative-config", trusted_gh, Path("gh-config")),
+            )
+            for label, executable, selected_config in cases:
+                with self.subTest(trust_root=label):
+                    with self.assertRaises(
+                        ENFORCEMENT_MODULE.EnforcementDoctorError
+                    ) as raised:
+                        ENFORCEMENT_MODULE.GitHubApiClient(
+                            executable,
+                            trusted_digest,
+                            selected_config,
+                        )
+                    self.assertEqual(
+                        raised.exception.reason_code,
+                        "collector-unavailable",
+                    )
+
+    def test_enforcement_gh_pin_rejects_pre_exec_source_replacement(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            trusted_gh = temp_root / "trusted-gh"
+            trusted_payload = b"#!/bin/sh\nexit 0\n"
+            trusted_gh.write_bytes(trusted_payload)
+            trusted_gh.chmod(0o700)
+            config_dir = temp_root / "gh-config"
+            config_dir.mkdir()
+            with ENFORCEMENT_MODULE.GitHubApiClient(
+                trusted_gh,
+                hashlib.sha256(trusted_payload).hexdigest(),
+                config_dir,
+            ) as client:
+                trusted_gh.rename(temp_root / "trusted-gh.original")
+                trusted_gh.write_bytes(b"#!/bin/sh\nexit 99\n")
+                trusted_gh.chmod(0o700)
+                with mock.patch.object(
+                    ENFORCEMENT_MODULE,
+                    "_bounded_subprocess",
+                    return_value=(0, b'{"id":1}', b""),
+                ) as spawned:
+                    with self.assertRaises(
+                        ENFORCEMENT_MODULE.EnforcementDoctorError
+                    ) as raised:
+                        client.get_json("/user")
+
+                self.assertEqual(
+                    raised.exception.reason_code,
+                    "collector-inconclusive",
+                )
+                spawned.assert_not_called()
+
+    def test_enforcement_gh_pin_discards_output_after_post_exec_drift(
+        self,
+    ) -> None:
+        mutations = {
+            "source-content": lambda client, temp_root: client._source_path.write_bytes(
+                b"#!/bin/sh\nexit 77\n"
+            ),
+            "source-path": lambda client, temp_root: (
+                client._source_path.rename(temp_root / "source.original"),
+                client._source_path.write_bytes(b"#!/bin/sh\nexit 77\n"),
+                client._source_path.chmod(0o700),
+            ),
+            "snapshot-path": lambda client, temp_root: (
+                client._snapshot_path.rename(
+                    client._snapshot_path.with_name("gh.original")
+                ),
+                client._snapshot_path.write_bytes(b"#!/bin/sh\nexit 77\n"),
+                client._snapshot_path.chmod(0o500),
+            ),
+            "snapshot-mode": lambda client, temp_root: client._snapshot_path.chmod(
+                0o700
+            ),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(drift=label):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    temp_root = Path(temp_dir)
+                    trusted_gh = temp_root / "trusted-gh"
+                    trusted_payload = b"#!/bin/sh\nexit 0\n"
+                    trusted_gh.write_bytes(trusted_payload)
+                    trusted_gh.chmod(0o700)
+                    config_dir = temp_root / "gh-config"
+                    config_dir.mkdir()
+                    with ENFORCEMENT_MODULE.GitHubApiClient(
+                        trusted_gh,
+                        hashlib.sha256(trusted_payload).hexdigest(),
+                        config_dir,
+                    ) as client:
+
+                        def drift_after_exec(
+                            command: list[str],
+                            **kwargs: object,
+                        ) -> tuple[int, bytes, bytes]:
+                            mutate(client, temp_root)
+                            return 0, b'{"id":1,"login":"must-not-be-used"}', b""
+
+                        with mock.patch.object(
+                            ENFORCEMENT_MODULE,
+                            "_bounded_subprocess",
+                            side_effect=drift_after_exec,
+                        ):
+                            with self.assertRaises(
+                                ENFORCEMENT_MODULE.EnforcementDoctorError
+                            ) as raised:
+                                client.get_json("/user")
+
+                        self.assertEqual(
+                            raised.exception.reason_code,
+                            "collector-inconclusive",
+                        )
+
     def test_enforcement_api_failures_are_sanitized_and_actionable(
         self,
     ) -> None:
@@ -5524,6 +6392,13 @@ class BugTriageDocumentationTests(unittest.TestCase):
                 client.calls = 0
                 client.total_bytes = 0
                 client.deadline = time.monotonic() + 30
+                client._environment = {}
+                client._temporary_directory = type(
+                    "TemporaryDirectoryStub",
+                    (),
+                    {"name": tempfile.gettempdir()},
+                )()
+                client._revalidate_snapshot = mock.Mock()
                 detail = (
                     "rate limit exceeded"
                     if label == "rate-limit-403"
@@ -5572,6 +6447,13 @@ class BugTriageDocumentationTests(unittest.TestCase):
         client.calls = 0
         client.total_bytes = 0
         client.deadline = time.monotonic() + 30
+        client._environment = {}
+        client._temporary_directory = type(
+            "TemporaryDirectoryStub",
+            (),
+            {"name": tempfile.gettempdir()},
+        )()
+        client._revalidate_snapshot = mock.Mock()
         with mock.patch.object(
             ENFORCEMENT_MODULE,
             "_bounded_subprocess",
@@ -5614,6 +6496,12 @@ class BugTriageDocumentationTests(unittest.TestCase):
             str(CUTOVER_ENFORCEMENT_DOCTOR_PATH),
             "--contract",
             str(CUTOVER_ENFORCEMENT_CONTRACT_PATH),
+            "--gh-executable",
+            "/fixed/gh",
+            "--expected-gh-sha256",
+            "a" * 64,
+            "--gh-config-dir",
+            "/fixed/config",
             "--pull-request-number",
             str(self._pull_request_number),
             "--expected-ruleset-id",
@@ -5671,6 +6559,12 @@ class BugTriageDocumentationTests(unittest.TestCase):
             str(CUTOVER_ENFORCEMENT_DOCTOR_PATH),
             "--contract",
             str(CUTOVER_ENFORCEMENT_CONTRACT_PATH),
+            "--gh-executable",
+            "/fixed/gh",
+            "--expected-gh-sha256",
+            "a" * 64,
+            "--gh-config-dir",
+            "/fixed/config",
             "--pull-request-number",
             "7",
             "--expected-ruleset-id",
@@ -5696,59 +6590,27 @@ class BugTriageDocumentationTests(unittest.TestCase):
                 with redirect_stdout(output):
                     return_code = ENFORCEMENT_MODULE.main()
 
-        self.assertEqual(return_code, 0)
+        self.assertEqual(return_code, 1)
         outcome = json.loads(output.getvalue())
-        self.assertEqual(outcome["classification"], "admitted")
-        self.assertEqual(outcome["schema_version"], 3)
+        self.assertEqual(outcome["classification"], "blocked_until_trusted")
+        self.assertEqual(outcome["reason_code"], "pointer-proof-unavailable")
+        self.assertEqual(client.auth_calls, 1)
+        self.assertTrue(client.calls)
+        variable_endpoint = "/repos/Joey-Tools/codex-debug-triage/actions/variables"
         self.assertEqual(
-            outcome["applicability_selector"],
-            {
-                "target_head_sha": {
-                    "name": "CISCO_CUTOVER_TARGET_HEAD_SHA",
-                    "value": self._canonical_commit,
-                },
-                "target_pr_number": {
-                    "name": "CISCO_CUTOVER_TARGET_PR_NUMBER",
-                    "value": str(self._pull_request_number),
-                },
-            },
+            [
+                query["page"]
+                for endpoint, query in client.calls
+                if endpoint == variable_endpoint
+            ],
+            [1, 2, 1, 2],
         )
-        candidate = outcome["candidate"]
-        self.assertEqual(candidate["head_repository_id"], 1242512092)
-        self.assertEqual(
-            candidate["head_repository_full_name"],
-            "Joey-Tools/codex-debug-triage",
-        )
-        self.assertEqual(candidate["head_sha"], self._canonical_commit)
-        self.assertEqual(candidate["pull_request_id"], 7007)
-        self.assertEqual(candidate["pull_request_number"], 7)
-        self.assertEqual(
-            candidate["pull_request_url"],
-            "https://api.github.com/repos/Joey-Tools/codex-debug-triage/pulls/7",
-        )
-        execution = outcome["trusted_execution"]
-        self.assertEqual(
-            execution["selection"],
-            {
-                "expected_run_attempt": 1,
-                "expected_run_id": 10101,
-            },
-        )
-        self.assertEqual(execution["run"]["id"], 10101)
-        self.assertEqual(execution["run"]["run_attempt"], 1)
-        self.assertEqual(execution["job"]["id"], 20202)
-        self.assertEqual(execution["check_run"]["id"], 20202)
-        self.assertEqual(
-            execution["check_run"]["app"],
-            {"id": 15368, "slug": "github-actions"},
+        attempt_endpoint = (
+            "/repos/Joey-Tools/codex-debug-triage/actions/runs/10101/attempts/1"
         )
         self.assertEqual(
-            execution["workflow"]["repository_full_name"],
-            "Joey-Tools/codex-debug-triage",
-        )
-        self.assertEqual(
-            outcome["collection"]["authenticated_user"],
-            {"id": 4242, "login": "fixture-admin"},
+            [endpoint for endpoint, _ in client.calls if endpoint == attempt_endpoint],
+            [attempt_endpoint, attempt_endpoint],
         )
 
     def test_enforcement_accepts_distinct_source_workflow_repository(
@@ -5786,16 +6648,9 @@ class BugTriageDocumentationTests(unittest.TestCase):
                 source_id
             )
 
-        admission = ENFORCEMENT_MODULE.validate_enforcement(
-            contract,
+        admission = self._validate_static_enforcement(
             evidence,
-            expected_run_attempt=1,
-            expected_run_id=10101,
-            expected_ruleset_id=self._ruleset_id,
-            expected_workflow_id=self._workflow_id,
-            expected_workflow_sha=self._workflow_source_commit,
-            candidate_head_sha=self._canonical_commit,
-            pull_request_number=7,
+            contract=contract,
         )
 
         self.assertEqual(admission["trusted_run"]["id"], 10101)
@@ -5809,9 +6664,16 @@ class BugTriageDocumentationTests(unittest.TestCase):
         evidence["jobs"][0]["head_sha"] = base_sha
         evidence["check_runs"][0]["head_sha"] = base_sha
 
-        result = self._run_enforcement_doctor(evidence)
+        admission = self._validate_static_enforcement(evidence)
+        self.assertEqual(admission["trusted_run"]["id"], 10101)
+        self.assertEqual(admission["trusted_check_run"]["id"], 20202)
 
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        result = self._run_enforcement_doctor(evidence)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(
+            json.loads(result.stdout)["reason_code"],
+            "pointer-proof-unavailable",
+        )
 
     def test_enforcement_doctor_rejects_identity_and_scope_drift(
         self,
@@ -5861,15 +6723,17 @@ class BugTriageDocumentationTests(unittest.TestCase):
                 "ruleset-identity-mismatch",
             ),
             "selector-pr-tamper": (
-                lambda evidence: evidence["selector_target_pr_number"].update(
-                    {"value": "8"}
-                ),
+                lambda evidence: self._cutover_variable(
+                    evidence,
+                    "CISCO_CUTOVER_TARGET_PR_NUMBER",
+                ).update({"value": "8"}),
                 "selector-mismatch",
             ),
             "selector-head-tamper": (
-                lambda evidence: evidence["selector_target_head_sha"].update(
-                    {"value": "8" * 40}
-                ),
+                lambda evidence: self._cutover_variable(
+                    evidence,
+                    "CISCO_CUTOVER_TARGET_HEAD_SHA",
+                ).update({"value": "8" * 40}),
                 "selector-mismatch",
             ),
         }
@@ -6049,6 +6913,13 @@ class BugTriageDocumentationTests(unittest.TestCase):
         evidence = self._matching_enforcement_evidence()
         run = evidence["workflow_runs"][0]
         run["run_attempt"] = 2
+        run["run_started_at"] = "2026-07-24T12:10:00Z"
+        evidence["selected_run_attempt"].update(
+            {
+                "run_attempt": 2,
+                "run_started_at": "2026-07-24T12:10:00Z",
+            }
+        )
 
         first_job = evidence["jobs"][0]
         first_check = evidence["check_runs"][0]
@@ -6070,6 +6941,8 @@ class BugTriageDocumentationTests(unittest.TestCase):
                 ),
                 "id": 20203,
                 "run_attempt": 2,
+                "started_at": "2026-07-24T12:10:00Z",
+                "completed_at": "2026-07-24T12:11:00Z",
                 "status": "completed",
                 "url": (
                     "https://api.github.com/repos/"
@@ -6084,6 +6957,8 @@ class BugTriageDocumentationTests(unittest.TestCase):
                 "details_url": second_job["html_url"],
                 "html_url": second_job["html_url"],
                 "id": 20203,
+                "started_at": "2026-07-24T12:10:00Z",
+                "completed_at": "2026-07-24T12:11:00Z",
                 "status": "completed",
                 "url": second_check_url,
             }
@@ -6091,16 +6966,24 @@ class BugTriageDocumentationTests(unittest.TestCase):
         evidence["jobs"].append(second_job)
         evidence["check_runs"].append(second_check)
 
+        admission = self._validate_static_enforcement(
+            evidence,
+            expected_run_id=10101,
+            expected_run_attempt=2,
+        )
+        self.assertEqual(admission["trusted_run"]["id"], 10101)
+        self.assertEqual(admission["trusted_check_run"]["id"], 20203)
+
         result = self._run_enforcement_doctor(
             evidence,
             expected_run_id=10101,
             expected_run_attempt=2,
         )
-
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        outcome = json.loads(result.stdout)
-        self.assertEqual(outcome["trusted_workflow_run_id"], 10101)
-        self.assertEqual(outcome["trusted_check_run_id"], 20203)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(
+            json.loads(result.stdout)["reason_code"],
+            "pointer-proof-unavailable",
+        )
 
         superseded = self._run_enforcement_doctor(
             evidence,
@@ -6434,7 +7317,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
             {
                 "status_without_receipt": "blocked_until_trusted",
                 "validator": ("scripts/validate_cisco_cutover_receipt.py"),
-                "receipt_schema_version": 2,
+                "receipt_schema_version": 3,
                 "receipt_max_bytes": 35840,
                 "producer_workflow": ".github/workflows/release.yml",
                 "pointer_name": "current",
@@ -6447,6 +7330,9 @@ class BugTriageDocumentationTests(unittest.TestCase):
                     "expected_receipt_sha256",
                     "expected_workflow_id",
                     "expected_workflow_sha",
+                    "expected_installation_scope_id",
+                    "expected_pointer_generation",
+                    "expected_pointer_state_sha256",
                 ],
             },
         )
@@ -6518,7 +7404,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
         self.assertEqual(outcome["classification"], "blocked_until_trusted")
         self.assertIn("argument error", outcome["reason"])
 
-    def test_cutover_validator_admits_exact_release_and_pointer_receipt(
+    def test_cutover_validator_blocks_static_receipt_without_live_authority(
         self,
     ) -> None:
         fixture = json.loads(MIGRATION_FIXTURE_PATH.read_text(encoding="utf-8"))
@@ -6534,15 +7420,263 @@ class BugTriageDocumentationTests(unittest.TestCase):
                 receipt_sha256=receipt_sha256,
             )
 
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertEqual(result.stderr, "")
         outcome = json.loads(result.stdout)
-        self.assertEqual(outcome["classification"], "admitted")
+        self.assertEqual(outcome["classification"], "blocked_until_trusted")
+        self.assertEqual(outcome["reason"], "pointer-proof-unavailable")
+        self.assertEqual(outcome["static_equivalence"], "validated")
+        self.assertEqual(
+            outcome["validation_scope"],
+            "static-equivalence-only",
+        )
         self.assertEqual(
             outcome["pointer_target"],
             f"releases/{self._private_release_commit}",
         )
         self.assertEqual(outcome["receipt_sha256"], receipt_sha256)
+
+    def test_cutover_validator_rejects_pointer_authority_and_lease_drift(
+        self,
+    ) -> None:
+        fixture = json.loads(MIGRATION_FIXTURE_PATH.read_text(encoding="utf-8"))
+        cases = {
+            "installation-scope": (
+                lambda pointer: pointer.update(
+                    {"installation_scope_id": "other-installation-scope"}
+                ),
+                "installation scope differs",
+            ),
+            "generation": (
+                lambda pointer: pointer.update(
+                    {"generation": self._pointer_generation + 1}
+                ),
+                "generation differs",
+            ),
+            "state-digest": (
+                lambda pointer: pointer.update({"state_sha256": "7" * 64}),
+                "state digest differs",
+            ),
+            "authority-repository": (
+                lambda pointer: pointer["live_authority"].update(
+                    {"repository_full_name": "attacker/private-workflows"}
+                ),
+                "authority repository differs",
+            ),
+            "authority-workflow": (
+                lambda pointer: pointer["live_authority"].update(
+                    {"workflow_path": ".github/workflows/other.yml"}
+                ),
+                "authority workflow path differs",
+            ),
+            "authority-provider": (
+                lambda pointer: pointer["live_authority"]["provider"].update(
+                    {"id": 99999}
+                ),
+                "authority provider.id differs",
+            ),
+            "lease-status": (
+                lambda pointer: pointer["merge_lease"].update({"status": "released"}),
+                "merge lease status differs",
+            ),
+            "lease-head": (
+                lambda pointer: pointer["merge_lease"].update(
+                    {"pull_request_head_sha": "8" * 40}
+                ),
+                "merge lease pull-request head SHA differs",
+            ),
+            "lease-scope": (
+                lambda pointer: pointer["merge_lease"].update(
+                    {"installation_scope_id": "other-installation-scope"}
+                ),
+                "merge lease installation scope ID differs",
+            ),
+            "lease-generation": (
+                lambda pointer: pointer["merge_lease"].update(
+                    {"pointer_generation": self._pointer_generation + 1}
+                ),
+                "merge lease generation differs",
+            ),
+            "pointer-expired": (
+                lambda pointer: (
+                    pointer.update(
+                        {
+                            "observed_at": "2000-01-01T00:00:00Z",
+                            "expires_at": "2000-01-02T00:00:00Z",
+                        }
+                    ),
+                    pointer["merge_lease"].update(
+                        {
+                            "acquired_at": "2000-01-01T00:00:00Z",
+                        }
+                    ),
+                ),
+                "pointer proof has expired",
+            ),
+            "pointer-future": (
+                lambda pointer: (
+                    pointer.update(
+                        {
+                            "observed_at": "2099-01-01T00:00:00Z",
+                            "expires_at": "2100-01-01T00:00:00Z",
+                        }
+                    ),
+                    pointer["merge_lease"].update(
+                        {
+                            "acquired_at": "2099-01-01T00:00:00Z",
+                            "expires_at": "2100-01-01T00:00:00Z",
+                        }
+                    ),
+                ),
+                "observed_at is in the future",
+            ),
+            "lease-expired": (
+                lambda pointer: (
+                    pointer.update(
+                        {
+                            "observed_at": "2000-01-01T00:00:00Z",
+                        }
+                    ),
+                    pointer["merge_lease"].update(
+                        {
+                            "acquired_at": "2000-01-01T00:00:00Z",
+                            "expires_at": "2000-01-02T00:00:00Z",
+                        }
+                    ),
+                ),
+                "merge lease has expired",
+            ),
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            for label, (mutate, expected_reason) in cases.items():
+                with self.subTest(pointer_drift=label):
+                    receipt = self._matching_cutover_receipt(fixture)
+                    mutate(receipt["installed_pointer"])
+                    receipt_path = temp_root / f"{label}.json"
+                    receipt_sha256 = self._write_cutover_receipt(
+                        receipt_path,
+                        receipt,
+                    )
+                    result = self._run_cutover_validator(
+                        receipt_path=receipt_path,
+                        receipt_sha256=receipt_sha256,
+                    )
+
+                    self.assertEqual(result.returncode, 1, result.stdout)
+                    outcome = json.loads(result.stdout)
+                    self.assertEqual(
+                        outcome["classification"],
+                        "blocked_until_trusted",
+                    )
+                    self.assertIn(expected_reason, outcome["reason"])
+
+    def test_cutover_pointer_generation_prevents_switch_and_rollback_replay(
+        self,
+    ) -> None:
+        fixture = json.loads(MIGRATION_FIXTURE_PATH.read_text(encoding="utf-8"))
+        old_receipt = self._matching_cutover_receipt(fixture)
+        old_payload = (
+            json.dumps(
+                old_receipt,
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            + "\n"
+        ).encode("utf-8")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            old_path = temp_root / "old-generation.json"
+            old_digest = self._write_cutover_receipt(old_path, old_receipt)
+            for expected_generation in (
+                self._pointer_generation + 1,
+                self._pointer_generation + 2,
+            ):
+                with self.subTest(expected_generation=expected_generation):
+                    result = self._run_cutover_validator(
+                        receipt_path=old_path,
+                        receipt_sha256=old_digest,
+                        expected_pointer_generation=expected_generation,
+                        expected_pointer_state_sha256=self._pointer_state_sha256(
+                            generation=expected_generation
+                        ),
+                    )
+                    self.assertEqual(result.returncode, 1, result.stdout)
+                    self.assertIn(
+                        "pointer generation differs",
+                        json.loads(result.stdout)["reason"],
+                    )
+
+            rollback_generation = self._pointer_generation + 2
+            rollback_receipt = self._matching_cutover_receipt(fixture)
+            rollback_pointer = rollback_receipt["installed_pointer"]
+            rollback_pointer["generation"] = rollback_generation
+            rollback_pointer["state_sha256"] = self._pointer_state_sha256(
+                generation=rollback_generation
+            )
+            rollback_pointer["merge_lease"]["pointer_generation"] = rollback_generation
+            rollback_path = temp_root / "rollback-generation.json"
+            rollback_digest = self._write_cutover_receipt(
+                rollback_path,
+                rollback_receipt,
+            )
+            rollback_result = self._run_cutover_validator(
+                receipt_path=rollback_path,
+                receipt_sha256=rollback_digest,
+                expected_pointer_generation=rollback_generation,
+                expected_pointer_state_sha256=self._pointer_state_sha256(
+                    generation=rollback_generation
+                ),
+            )
+
+            workflow_result = self._run_trusted_workflow_program(
+                environment=self._trusted_workflow_environment(
+                    receipt_payload=old_payload,
+                    overrides={
+                        "CISCO_CUTOVER_EXPECTED_POINTER_GENERATION": str(
+                            rollback_generation
+                        ),
+                        "CISCO_CUTOVER_EXPECTED_POINTER_STATE_SHA256": (
+                            self._pointer_state_sha256(generation=rollback_generation)
+                        ),
+                    },
+                ),
+                cwd=temp_root,
+            )
+
+        self.assertEqual(rollback_result.returncode, 1, rollback_result.stdout)
+        rollback_outcome = json.loads(rollback_result.stdout)
+        self.assertEqual(
+            rollback_outcome["reason"],
+            "pointer-proof-unavailable",
+        )
+        self.assertEqual(
+            rollback_outcome["static_equivalence"],
+            "validated",
+        )
+        self.assertEqual(workflow_result.returncode, 1, workflow_result.stdout)
+        self.assertIn(
+            "pointer generation differs",
+            json.loads(workflow_result.stdout)["reason"],
+        )
+
+    def test_cutover_validator_rejects_legacy_pointer_receipt_schema(
+        self,
+    ) -> None:
+        fixture = json.loads(MIGRATION_FIXTURE_PATH.read_text(encoding="utf-8"))
+        receipt = self._matching_cutover_receipt(fixture)
+        receipt["schema_version"] = 2
+        with tempfile.TemporaryDirectory() as temp_dir:
+            receipt_path = Path(temp_dir) / "legacy-receipt.json"
+            receipt_digest = self._write_cutover_receipt(receipt_path, receipt)
+            result = self._run_cutover_validator(
+                receipt_path=receipt_path,
+                receipt_sha256=receipt_digest,
+            )
+
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("schema_version differs", json.loads(result.stdout)["reason"])
 
     def test_cutover_admission_rejects_route_back_to_removed_skill(self) -> None:
         fixture = json.loads(MIGRATION_FIXTURE_PATH.read_text(encoding="utf-8"))
@@ -6618,7 +7752,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1, result.stderr)
         outcome = json.loads(result.stdout)
         self.assertEqual(outcome["classification"], "blocked_until_trusted")
-        self.assertIn("installed pointer", outcome["reason"])
+        self.assertIn("pointer target", outcome["reason"])
 
     def test_cutover_validator_rejects_repo_pr_head_or_workflow_drift(
         self,

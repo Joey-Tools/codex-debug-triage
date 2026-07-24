@@ -166,6 +166,9 @@ jobs:
           CISCO_CUTOVER_EXPECTED_RECEIPT_SHA256: ${{ vars.CISCO_CUTOVER_EXPECTED_RECEIPT_SHA256 }}
           CISCO_CUTOVER_EXPECTED_WORKFLOW_ID: ${{ vars.CISCO_CUTOVER_EXPECTED_WORKFLOW_ID }}
           CISCO_CUTOVER_EXPECTED_WORKFLOW_SHA: ${{ vars.CISCO_CUTOVER_EXPECTED_WORKFLOW_SHA }}
+          CISCO_CUTOVER_EXPECTED_INSTALLATION_SCOPE_ID: ${{ vars.CISCO_CUTOVER_EXPECTED_INSTALLATION_SCOPE_ID }}
+          CISCO_CUTOVER_EXPECTED_POINTER_GENERATION: ${{ vars.CISCO_CUTOVER_EXPECTED_POINTER_GENERATION }}
+          CISCO_CUTOVER_EXPECTED_POINTER_STATE_SHA256: ${{ vars.CISCO_CUTOVER_EXPECTED_POINTER_STATE_SHA256 }}
         run: |
           python3 - <<'ADMISSION_PY'
           import base64
@@ -175,10 +178,13 @@ jobs:
           import os
           import re
           import sys
+          from datetime import datetime, timezone
 
           EXPECTED_REPOSITORY = "Joey-Tools/codex-debug-triage"
           EXPECTED_REPOSITORY_ID = 1242512092
           EXPECTED_PRIVATE_REPOSITORY = "Joey-Tools/codex-private-workflows"
+          EXPECTED_PRIVATE_RELEASE_WORKFLOW_PATH = ".github/workflows/release.yml"
+          EXPECTED_PRIVATE_RELEASE_WORKFLOW_REF = "refs/heads/master"
           EXPECTED_BASE_REF = "master"
           EXPECTED_WORKFLOW_PATH = ".github/workflows/cisco-cutover-admission.yml"
           EXPECTED_WORKFLOW_REF = "refs/heads/master"
@@ -190,10 +196,25 @@ jobs:
           MAX_JSON_NODES = 4_096
           MAX_JSON_CONTAINER_ITEMS = 1_024
           MAX_JSON_INTEGER_DIGITS = 64
+          MAX_SIGNED_64_INTEGER = (1 << 63) - 1
           MAX_JSON_STRING_CHARS = 32 * 1024
           SHA1_PATTERN = re.compile(r"[0-9a-f]{40}")
           SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
           POSITIVE_INTEGER_PATTERN = re.compile(r"[1-9][0-9]*")
+          CANONICAL_IDENTIFIER_PATTERN = re.compile(
+              r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}"
+          )
+          RFC3339_UTC_PATTERN = re.compile(
+              r"[0-9]{4}-[0-9]{2}-[0-9]{2}T"
+              r"[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,6})?Z"
+          )
+          EXPECTED_GITHUB_ACTIONS_PROVIDER = {
+              "id": 15368,
+              "slug": "github-actions",
+          }
+          POINTER_STATE_HASH_DOMAIN = "cisco-installed-pointer-state-v1"
+          POINTER_PROOF_UNAVAILABLE_REASON = "pointer-proof-unavailable"
+          POINTER_AUTHORITY_REASON = "private-live-authority-not-configured"
           PLACEHOLDERS = frozenset(
               {
                   "change-me",
@@ -247,13 +268,17 @@ jobs:
               pass
 
 
-          def blocked(reason):
+          def blocked(reason, details=None):
+              outcome = {
+                  "classification": "blocked_until_trusted",
+                  "reason": reason,
+                  "validation_scope": "static-equivalence-only",
+              }
+              if details is not None:
+                  outcome.update(details)
               print(
                   json.dumps(
-                      {
-                          "classification": "blocked_until_trusted",
-                          "reason": reason,
-                      },
+                      outcome,
                       ensure_ascii=True,
                       separators=(",", ":"),
                       sort_keys=True,
@@ -293,7 +318,79 @@ jobs:
                   or POSITIVE_INTEGER_PATTERN.fullmatch(value) is None
               ):
                   raise AdmissionError(f"{label} must be canonical positive decimal")
-              return int(value, 10)
+              parsed = int(value, 10)
+              if parsed > MAX_SIGNED_64_INTEGER:
+                  raise AdmissionError(f"{label} exceeds signed 64-bit range")
+              return parsed
+
+
+          def require_positive_json_integer(value, label):
+              if (
+                  type(value) is not int
+                  or value <= 0
+                  or value > MAX_SIGNED_64_INTEGER
+              ):
+                  raise AdmissionError(
+                      f"{label} must be an exact positive signed 64-bit integer"
+                  )
+              return value
+
+
+          def require_canonical_identifier(value, label):
+              if (
+                  type(value) is not str
+                  or CANONICAL_IDENTIFIER_PATTERN.fullmatch(value) is None
+              ):
+                  raise AdmissionError(
+                      f"{label} must be a canonical 1-128 character ASCII identifier"
+                  )
+              return value
+
+
+          def require_rfc3339_utc(value, label):
+              if (
+                  type(value) is not str
+                  or RFC3339_UTC_PATTERN.fullmatch(value) is None
+              ):
+                  raise AdmissionError(
+                      f"{label} must be RFC3339 UTC with a Z suffix"
+                  )
+              try:
+                  parsed = datetime.fromisoformat(f"{value[:-1]}+00:00")
+              except ValueError as error:
+                  raise AdmissionError(
+                      f"{label} must be a valid RFC3339 timestamp"
+                  ) from error
+              if parsed.utcoffset() != timezone.utc.utcoffset(parsed):
+                  raise AdmissionError(f"{label} must use UTC")
+              return parsed
+
+
+          def pointer_state_sha256(
+              *,
+              installation_scope_id,
+              name,
+              generation,
+              target,
+              resolved_release_commit,
+              release_manifest_sha256,
+          ):
+              state = {
+                  "generation": generation,
+                  "installation_scope_id": installation_scope_id,
+                  "name": name,
+                  "release_manifest_sha256": release_manifest_sha256,
+                  "resolved_release_commit": resolved_release_commit,
+                  "target": target,
+              }
+              canonical = json.dumps(
+                  state,
+                  ensure_ascii=True,
+                  separators=(",", ":"),
+                  sort_keys=True,
+              ).encode("utf-8")
+              domain = f"{POINTER_STATE_HASH_DOMAIN}\0".encode("ascii")
+              return hashlib.sha256(domain + canonical).hexdigest()
 
 
           def reject_float(_value):
@@ -407,7 +504,7 @@ jobs:
               return actual == expected
 
 
-          def validate_receipt(receipt, expected):
+          def validate_receipt(receipt, expected, validation_time):
               receipt = exact_keys(
                   receipt,
                   {
@@ -427,7 +524,7 @@ jobs:
               )
               if type(receipt["schema_version"]) is not int:
                   raise AdmissionError("receipt schema_version must be an integer")
-              if receipt["schema_version"] != 2:
+              if receipt["schema_version"] != 3:
                   raise AdmissionError("receipt schema_version differs")
               if receipt["canonical_repository"] != EXPECTED_REPOSITORY:
                   raise AdmissionError("receipt canonical repository differs")
@@ -498,16 +595,222 @@ jobs:
                       "target",
                       "resolved_release_commit",
                       "release_manifest_sha256",
+                      "installation_scope_id",
+                      "generation",
+                      "state_sha256",
+                      "observed_at",
+                      "expires_at",
+                      "live_authority",
+                      "merge_lease",
                   },
                   "installed pointer",
               )
               if pointer["name"] != "current" or pointer["target"] != release_target:
                   raise AdmissionError("installed pointer target differs")
-              if pointer["resolved_release_commit"] != expected["private_release"]:
+              resolved_release_commit = require_sha(
+                  pointer["resolved_release_commit"],
+                  SHA1_PATTERN,
+                  "installed pointer resolved release commit",
+              )
+              if resolved_release_commit != expected["private_release"]:
                   raise AdmissionError("installed pointer release differs")
-              if pointer["release_manifest_sha256"] != expected["manifest_sha256"]:
+              pointer_manifest_sha256 = require_sha(
+                  pointer["release_manifest_sha256"],
+                  SHA256_PATTERN,
+                  "installed pointer release manifest SHA-256",
+              )
+              if pointer_manifest_sha256 != expected["manifest_sha256"]:
                   raise AdmissionError("installed pointer manifest differs")
-              return release_target
+              installation_scope_id = require_canonical_identifier(
+                  pointer["installation_scope_id"],
+                  "installed pointer installation scope ID",
+              )
+              if installation_scope_id != expected["installation_scope_id"]:
+                  raise AdmissionError("installed pointer installation scope differs")
+              generation = require_positive_json_integer(
+                  pointer["generation"],
+                  "installed pointer generation",
+              )
+              if generation != expected["pointer_generation"]:
+                  raise AdmissionError("installed pointer generation differs")
+              pointer_state_digest = require_sha(
+                  pointer["state_sha256"],
+                  SHA256_PATTERN,
+                  "installed pointer state SHA-256",
+              )
+              if pointer_state_digest != expected["pointer_state_sha256"]:
+                  raise AdmissionError("installed pointer state digest differs")
+              recomputed_state_digest = pointer_state_sha256(
+                  installation_scope_id=installation_scope_id,
+                  name=pointer["name"],
+                  generation=generation,
+                  target=pointer["target"],
+                  resolved_release_commit=resolved_release_commit,
+                  release_manifest_sha256=pointer_manifest_sha256,
+              )
+              if recomputed_state_digest != pointer_state_digest:
+                  raise AdmissionError(
+                      "installed pointer state digest differs from canonical state"
+                  )
+
+              observed_at = require_rfc3339_utc(
+                  pointer["observed_at"],
+                  "installed pointer observed_at",
+              )
+              expires_at = require_rfc3339_utc(
+                  pointer["expires_at"],
+                  "installed pointer expires_at",
+              )
+              if expires_at <= observed_at:
+                  raise AdmissionError(
+                      "installed pointer expires_at must be after observed_at"
+                  )
+              if observed_at > validation_time:
+                  raise AdmissionError("installed pointer observed_at is in the future")
+              if expires_at <= validation_time:
+                  raise AdmissionError("installed pointer proof has expired")
+
+              live_authority = exact_keys(
+                  pointer["live_authority"],
+                  {
+                      "repository_id",
+                      "repository_full_name",
+                      "workflow_id",
+                      "workflow_path",
+                      "workflow_ref",
+                      "workflow_sha",
+                      "run_id",
+                      "run_attempt",
+                      "provider",
+                      "proof_artifact_id",
+                      "proof_artifact_sha256",
+                  },
+                  "installed pointer live authority",
+              )
+              require_positive_json_integer(
+                  live_authority["repository_id"],
+                  "installed pointer authority repository ID",
+              )
+              if (
+                  live_authority["repository_full_name"]
+                  != EXPECTED_PRIVATE_REPOSITORY
+              ):
+                  raise AdmissionError(
+                      "installed pointer authority repository differs"
+                  )
+              require_positive_json_integer(
+                  live_authority["workflow_id"],
+                  "installed pointer authority workflow ID",
+              )
+              if (
+                  live_authority["workflow_path"]
+                  != EXPECTED_PRIVATE_RELEASE_WORKFLOW_PATH
+                  or live_authority["workflow_ref"]
+                  != EXPECTED_PRIVATE_RELEASE_WORKFLOW_REF
+              ):
+                  raise AdmissionError(
+                      "installed pointer authority workflow identity differs"
+                  )
+              require_sha(
+                  live_authority["workflow_sha"],
+                  SHA1_PATTERN,
+                  "installed pointer authority workflow SHA",
+              )
+              require_positive_json_integer(
+                  live_authority["run_id"],
+                  "installed pointer authority run ID",
+              )
+              require_positive_json_integer(
+                  live_authority["run_attempt"],
+                  "installed pointer authority run attempt",
+              )
+              if not exact_equal(
+                  live_authority["provider"],
+                  EXPECTED_GITHUB_ACTIONS_PROVIDER,
+              ):
+                  raise AdmissionError("installed pointer authority provider differs")
+              require_positive_json_integer(
+                  live_authority["proof_artifact_id"],
+                  "installed pointer authority proof artifact ID",
+              )
+              require_sha(
+                  live_authority["proof_artifact_sha256"],
+                  SHA256_PATTERN,
+                  "installed pointer authority proof artifact SHA-256",
+              )
+
+              merge_lease = exact_keys(
+                  pointer["merge_lease"],
+                  {
+                      "lease_id",
+                      "status",
+                      "target_repository_id",
+                      "pull_request_number",
+                      "pull_request_head_sha",
+                      "installation_scope_id",
+                      "pointer_generation",
+                      "acquired_at",
+                      "expires_at",
+                  },
+                  "installed pointer merge lease",
+              )
+              require_canonical_identifier(
+                  merge_lease["lease_id"],
+                  "installed pointer merge lease ID",
+              )
+              if merge_lease["status"] != "active":
+                  raise AdmissionError("installed pointer merge lease is not active")
+              if merge_lease["target_repository_id"] != EXPECTED_REPOSITORY_ID:
+                  raise AdmissionError(
+                      "installed pointer merge lease repository differs"
+                  )
+              if (
+                  type(merge_lease["pull_request_number"]) is not int
+                  or merge_lease["pull_request_number"]
+                  != expected["pull_request_number"]
+              ):
+                  raise AdmissionError(
+                      "installed pointer merge lease pull-request differs"
+                  )
+              if (
+                  merge_lease["pull_request_head_sha"]
+                  != expected["canonical_commit"]
+              ):
+                  raise AdmissionError(
+                      "installed pointer merge lease head differs"
+                  )
+              if merge_lease["installation_scope_id"] != installation_scope_id:
+                  raise AdmissionError(
+                      "installed pointer merge lease scope differs"
+                  )
+              if (
+                  type(merge_lease["pointer_generation"]) is not int
+                  or merge_lease["pointer_generation"] != generation
+              ):
+                  raise AdmissionError(
+                      "installed pointer merge lease generation differs"
+                  )
+              acquired_at = require_rfc3339_utc(
+                  merge_lease["acquired_at"],
+                  "installed pointer merge lease acquired_at",
+              )
+              lease_expires_at = require_rfc3339_utc(
+                  merge_lease["expires_at"],
+                  "installed pointer merge lease expires_at",
+              )
+              if lease_expires_at <= acquired_at:
+                  raise AdmissionError(
+                      "installed pointer merge lease expires_at must be "
+                      "after acquired_at"
+                  )
+              if acquired_at > observed_at:
+                  raise AdmissionError(
+                      "installed pointer merge lease was acquired after "
+                      "pointer observation"
+                  )
+              if lease_expires_at <= validation_time:
+                  raise AdmissionError("installed pointer merge lease has expired")
+              return pointer
 
 
           try:
@@ -575,6 +878,25 @@ jobs:
                       SHA1_PATTERN,
                       "expected workflow SHA",
                   ),
+                  "installation_scope_id": require_canonical_identifier(
+                      required_environment(
+                          "CISCO_CUTOVER_EXPECTED_INSTALLATION_SCOPE_ID"
+                      ),
+                      "expected installation scope ID",
+                  ),
+                  "pointer_generation": require_positive_integer(
+                      required_environment(
+                          "CISCO_CUTOVER_EXPECTED_POINTER_GENERATION"
+                      ),
+                      "expected pointer generation",
+                  ),
+                  "pointer_state_sha256": require_sha(
+                      required_environment(
+                          "CISCO_CUTOVER_EXPECTED_POINTER_STATE_SHA256"
+                      ),
+                      SHA256_PATTERN,
+                      "expected pointer state SHA-256",
+                  ),
                   "pull_request_number": pull_request_number,
               }
               if (
@@ -592,25 +914,32 @@ jobs:
               actual_receipt_sha256 = hashlib.sha256(payload).hexdigest()
               if actual_receipt_sha256 != expected["receipt_sha256"]:
                   raise AdmissionError("trusted receipt digest differs")
-              release_target = validate_receipt(receipt, expected)
+              pointer = validate_receipt(
+                  receipt,
+                  expected,
+                  datetime.now(timezone.utc),
+              )
           except AdmissionError as error:
               raise SystemExit(blocked(str(error)))
 
-          print(
-              json.dumps(
+          raise SystemExit(
+              blocked(
+                  POINTER_PROOF_UNAVAILABLE_REASON,
                   {
                       "canonical_commit": expected["canonical_commit"],
-                      "classification": "admitted",
-                      "pointer_target": release_target,
+                      "installation_scope_id": pointer["installation_scope_id"],
+                      "pointer_authority_reason": POINTER_AUTHORITY_REASON,
+                      "pointer_authority_status": "unavailable",
+                      "pointer_generation": pointer["generation"],
+                      "pointer_state_sha256": pointer["state_sha256"],
+                      "pointer_target": pointer["target"],
                       "private_release_commit": expected["private_release"],
                       "pull_request_number": expected["pull_request_number"],
                       "receipt_sha256": actual_receipt_sha256,
+                      "static_equivalence": "validated",
                       "workflow_id": expected["workflow_id"],
                       "workflow_sha": expected["workflow_sha"],
                   },
-                  ensure_ascii=True,
-                  separators=(",", ":"),
-                  sort_keys=True,
               )
           )
           ADMISSION_PY
