@@ -70,6 +70,15 @@ root is the fixed system-account path
 `~/.codex/cisco-cutover-doctor`, not an environment-selected temporary
 directory. Every path component is opened without following symlinks and kept
 descriptor-bound; ancestors must not be renameable by another principal.
+On Darwin, the same descriptors are queried through the fixed
+`/usr/lib/libSystem.B.dylib` ACL API with explicit entry and byte ceilings.
+Non-inherited deny entries remain valid, while every extended allow or
+inherited/inheritable entry is rejected; the bounded ACL is rebound to that
+no-expansion predicate around each command, so restrictive deny-only churn is
+benign. Snapshot files are checked before credential bytes are written. On
+Linux, the explicit profile instead binds the POSIX ACL effective mask through
+the group mode bits and repeats that check after each owner-only `fchmod`;
+other platforms fail closed rather than claiming Darwin ACL coverage.
 Only the active `github.com` authentication entry enters the generated
 configuration snapshot, whose global config contains no transport redirect.
 Source and snapshot identities, access policy, and content are revalidated

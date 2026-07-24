@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
+import errno
 import hashlib
 import json
 import os
@@ -14,6 +16,7 @@ import selectors
 import signal
 import stat
 import subprocess
+import sys
 import time
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -45,9 +48,20 @@ MAX_JSON_STRING_CHARS = 128 * 1024
 MAX_GH_EXECUTABLE_BYTES = 256 * 1024 * 1024
 MAX_GH_CONFIG_BYTES = 1024 * 1024
 MAX_GH_CONFIG_LINE_BYTES = 16 * 1024
+MAX_DARWIN_ACL_BYTES = 64 * 1024
+MAX_DARWIN_ACL_ENTRIES = 128
 GH_EXECUTABLE_ENVIRONMENT_PROFILE = "minimal-snapshotted-config-v2"
 GH_EXECUTION_SOURCE = "owner-private-snapshot"
 GH_RUNTIME_COMPONENTS = (".codex", "cisco-cutover-doctor")
+DARWIN_LIBSYSTEM_PATH = "/usr/lib/libSystem.B.dylib"
+DARWIN_ACL_TYPE_EXTENDED = 0x00000100
+DARWIN_ACL_EXTENDED_ALLOW = 1
+DARWIN_ACL_EXTENDED_DENY = 2
+DARWIN_ACL_FIRST_ENTRY = 0
+DARWIN_ACL_NEXT_ENTRY = -1
+DARWIN_ACL_INHERITANCE_FLAGS = (1 << 4, 1 << 5, 1 << 6, 1 << 7, 1 << 8)
+DARWIN_ACL_PROFILE = "darwin-fd-no-extended-grants-v1"
+LINUX_ACL_PROFILE = "linux-posix-mode-mask-v1"
 GH_SNAPSHOT_CONFIG = (
     b"version: 1\n"
     b"git_protocol: https\n"
@@ -819,6 +833,185 @@ def _file_status(status_value: os.stat_result) -> dict[str, int]:
     }
 
 
+class _DarwinAclRuntime:
+    def __init__(self) -> None:
+        self._libc = ctypes.CDLL(DARWIN_LIBSYSTEM_PATH, use_errno=True)
+        self._libc.acl_get_fd_np.argtypes = [ctypes.c_int, ctypes.c_int]
+        self._libc.acl_get_fd_np.restype = ctypes.c_void_p
+        self._libc.acl_get_entry.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_void_p),
+        ]
+        self._libc.acl_get_entry.restype = ctypes.c_int
+        self._libc.acl_get_tag_type.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_int),
+        ]
+        self._libc.acl_get_tag_type.restype = ctypes.c_int
+        self._libc.acl_get_flagset_np.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_void_p),
+        ]
+        self._libc.acl_get_flagset_np.restype = ctypes.c_int
+        self._libc.acl_get_flag_np.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        self._libc.acl_get_flag_np.restype = ctypes.c_int
+        self._libc.acl_size.argtypes = [ctypes.c_void_p]
+        self._libc.acl_size.restype = ctypes.c_ssize_t
+        self._libc.acl_copy_ext.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_ssize_t,
+        ]
+        self._libc.acl_copy_ext.restype = ctypes.c_ssize_t
+        self._libc.acl_free.argtypes = [ctypes.c_void_p]
+        self._libc.acl_free.restype = ctypes.c_int
+
+    @staticmethod
+    def _error(operation: str, *, fallback: int = errno.EIO) -> OSError:
+        error_number = ctypes.get_errno() or fallback
+        return OSError(error_number, f"Darwin ACL {operation} failed")
+
+    def binding(self, fd: int) -> tuple[str, int, str]:
+        ctypes.set_errno(0)
+        acl = self._libc.acl_get_fd_np(fd, DARWIN_ACL_TYPE_EXTENDED)
+        if not acl:
+            error_number = ctypes.get_errno()
+            if error_number == errno.ENOENT:
+                return (
+                    DARWIN_ACL_PROFILE,
+                    0,
+                    "no-extended-grants-or-inheritance",
+                )
+            raise self._error("descriptor query")
+        try:
+            ctypes.set_errno(0)
+            external_size = self._libc.acl_size(acl)
+            if external_size <= 0 or external_size > MAX_DARWIN_ACL_BYTES:
+                raise OSError(
+                    errno.EOVERFLOW,
+                    "Darwin ACL external representation exceeds its byte ceiling",
+                )
+            external = ctypes.create_string_buffer(external_size)
+            ctypes.set_errno(0)
+            copied = self._libc.acl_copy_ext(external, acl, external_size)
+            if copied != external_size:
+                raise self._error("external copy")
+
+            entry = ctypes.c_void_p()
+            entry_id = DARWIN_ACL_FIRST_ENTRY
+            entry_count = 0
+            while True:
+                ctypes.set_errno(0)
+                result = self._libc.acl_get_entry(
+                    acl,
+                    entry_id,
+                    ctypes.byref(entry),
+                )
+                if result != 0:
+                    if ctypes.get_errno() == errno.EINVAL and entry_count > 0:
+                        break
+                    raise self._error("entry enumeration")
+                entry_count += 1
+                if entry_count > MAX_DARWIN_ACL_ENTRIES:
+                    raise OSError(
+                        errno.EOVERFLOW,
+                        "Darwin ACL entry count exceeds its ceiling",
+                    )
+
+                tag = ctypes.c_int()
+                ctypes.set_errno(0)
+                if self._libc.acl_get_tag_type(entry, ctypes.byref(tag)) != 0:
+                    raise self._error("entry tag query")
+                if tag.value == DARWIN_ACL_EXTENDED_ALLOW:
+                    # Owner mode already supplies every required owner right.
+                    # Rejecting every extended allow is the bounded,
+                    # directory-service-free superset of rejecting grants to
+                    # another principal.
+                    raise OSError(
+                        errno.EACCES,
+                        "Darwin extended ACL grants are not allowed",
+                    )
+                if tag.value != DARWIN_ACL_EXTENDED_DENY:
+                    raise OSError(
+                        errno.EINVAL,
+                        "Darwin ACL contains an unsupported entry tag",
+                    )
+
+                flagset = ctypes.c_void_p()
+                ctypes.set_errno(0)
+                if (
+                    self._libc.acl_get_flagset_np(
+                        entry,
+                        ctypes.byref(flagset),
+                    )
+                    != 0
+                ):
+                    raise self._error("entry flag-set query")
+                for flag in DARWIN_ACL_INHERITANCE_FLAGS:
+                    ctypes.set_errno(0)
+                    present = self._libc.acl_get_flag_np(flagset, flag)
+                    if present < 0:
+                        raise self._error("entry inheritance query")
+                    if present:
+                        raise OSError(
+                            errno.EACCES,
+                            "Darwin inherited or inheritable ACL entries "
+                            "are not allowed",
+                        )
+                entry_id = DARWIN_ACL_NEXT_ENTRY
+
+            binding = (
+                DARWIN_ACL_PROFILE,
+                0,
+                "no-extended-grants-or-inheritance",
+            )
+        except BaseException:
+            self._libc.acl_free(acl)
+            raise
+        if self._libc.acl_free(acl) != 0:
+            raise self._error("release")
+        return binding
+
+
+_DARWIN_ACL_RUNTIME: Optional[_DarwinAclRuntime] = None
+
+
+def _fd_access_policy_binding(fd: int) -> tuple[str, int, str]:
+    if sys.platform == "darwin":
+        global _DARWIN_ACL_RUNTIME
+        if _DARWIN_ACL_RUNTIME is None:
+            try:
+                _DARWIN_ACL_RUNTIME = _DarwinAclRuntime()
+            except (AttributeError, OSError) as error:
+                raise OSError(
+                    errno.ENOTSUP,
+                    "fixed Darwin descriptor ACL runtime is unavailable",
+                ) from error
+        return _DARWIN_ACL_RUNTIME.binding(fd)
+    if sys.platform.startswith("linux"):
+        # Linux POSIX access-ACL effective masks are reflected in the group
+        # mode bits that the caller binds. Newly created private objects are
+        # checked again after fchmod, so inherited defaults cannot silently
+        # widen the effective group/other policy.
+        return (LINUX_ACL_PROFILE, 0, "mode-bits-authoritative")
+    raise OSError(
+        errno.ENOTSUP,
+        "descriptor ACL policy is unsupported on this platform",
+    )
+
+
+def _stable_fd_access_policy_binding(fd: int) -> tuple[str, int, str]:
+    first = _fd_access_policy_binding(fd)
+    second = _fd_access_policy_binding(fd)
+    if first != second:
+        raise OSError(
+            errno.EAGAIN,
+            "descriptor access policy changed while it was inspected",
+        )
+    return first
+
+
 def _require_safe_directory_status(
     status_value: os.stat_result,
     *,
@@ -857,6 +1050,7 @@ class _BoundDirectory:
         self.label = label
         self._fds: list[int] = []
         self._bindings: list[dict[str, int]] = []
+        self._access_policy_bindings: list[tuple[str, int, str]] = []
         self._relations: list[tuple[int, str, int]] = []
         self._closed = False
         if (
@@ -895,6 +1089,9 @@ class _BoundDirectory:
                 owner_private=False,
             )
             self._bindings.append(_directory_status(root_status))
+            self._access_policy_bindings.append(
+                _stable_fd_access_policy_binding(root_fd)
+            )
             parent_fd = root_fd
             components = path.parts[1:]
             for index, component in enumerate(components):
@@ -920,6 +1117,7 @@ class _BoundDirectory:
                         "collector-unavailable",
                         f"{label} component identity is unstable",
                     )
+                child_access_policy = _stable_fd_access_policy_binding(child_fd)
                 _require_safe_directory_status(
                     child_descriptor,
                     label=f"{label} component {component!r}",
@@ -954,8 +1152,10 @@ class _BoundDirectory:
                         label=f"{label} created component",
                         owner_private=True,
                     )
+                    child_access_policy = _stable_fd_access_policy_binding(child_fd)
                 binding = _directory_status(child_descriptor)
                 self._bindings.append(binding)
+                self._access_policy_bindings.append(child_access_policy)
                 self._relations.append((parent_fd, component, child_fd))
                 parent_fd = child_fd
             self.fd = self._fds[-1]
@@ -977,11 +1177,16 @@ class _BoundDirectory:
                 f"{self.label} binding is unavailable",
             )
         try:
-            for fd, expected in zip(self._fds, self._bindings):
+            for fd, expected, expected_access_policy in zip(
+                self._fds,
+                self._bindings,
+                self._access_policy_bindings,
+            ):
                 current = os.fstat(fd)
                 if (
                     not stat.S_ISDIR(current.st_mode)
                     or _directory_status(current) != expected
+                    or _stable_fd_access_policy_binding(fd) != expected_access_policy
                 ):
                     raise self._inconclusive()
             for relation, expected in zip(self._relations, self._bindings[1:]):
@@ -1018,6 +1223,7 @@ class _BoundDirectory:
         try:
             os.fchmod(self.fd, mode)
             descriptor = os.fstat(self.fd)
+            access_policy = _stable_fd_access_policy_binding(self.fd)
             if (
                 not stat.S_ISDIR(descriptor.st_mode)
                 or descriptor.st_uid != os.geteuid()
@@ -1025,6 +1231,7 @@ class _BoundDirectory:
             ):
                 raise self._inconclusive()
             self._bindings[-1] = _directory_status(descriptor)
+            self._access_policy_bindings[-1] = access_policy
             self.revalidate()
         except EnforcementDoctorError:
             raise
@@ -1080,6 +1287,7 @@ class _BoundRegularFile:
                 dir_fd=parent.fd,
                 follow_symlinks=False,
             )
+            access_policy_before = _stable_fd_access_policy_binding(self.fd)
             first = _read_fd_payload_bounded(
                 self.fd,
                 label=label,
@@ -1096,6 +1304,7 @@ class _BoundRegularFile:
                 dir_fd=parent.fd,
                 follow_symlinks=False,
             )
+            access_policy_after = _stable_fd_access_policy_binding(self.fd)
         except OSError as error:
             self.close()
             raise _blocked(
@@ -1113,6 +1322,7 @@ class _BoundRegularFile:
             or _file_status(descriptor_before) != _file_status(path_before)
             or _file_status(descriptor_before) != _file_status(descriptor_after)
             or _file_status(descriptor_before) != _file_status(path_after)
+            or access_policy_before != access_policy_after
             or first != second
             or len(first) != descriptor_before.st_size
         ):
@@ -1123,6 +1333,7 @@ class _BoundRegularFile:
             )
         self.payload = first
         self.binding = _file_status(descriptor_before)
+        self.access_policy_binding = access_policy_before
         self.sha256 = hashlib.sha256(first).hexdigest()
         parent.revalidate()
 
@@ -1137,6 +1348,7 @@ class _BoundRegularFile:
                 dir_fd=self.parent.fd,
                 follow_symlinks=False,
             )
+            access_policy_before = _stable_fd_access_policy_binding(self.fd)
             first = _read_fd_payload_bounded(
                 self.fd,
                 label=self.label,
@@ -1153,6 +1365,7 @@ class _BoundRegularFile:
                 dir_fd=self.parent.fd,
                 follow_symlinks=False,
             )
+            access_policy_after = _stable_fd_access_policy_binding(self.fd)
         except EnforcementDoctorError:
             raise self._inconclusive()
         except OSError as error:
@@ -1163,6 +1376,8 @@ class _BoundRegularFile:
             or _file_status(path_before) != self.binding
             or _file_status(descriptor_after) != self.binding
             or _file_status(path_after) != self.binding
+            or access_policy_before != self.access_policy_binding
+            or access_policy_after != self.access_policy_binding
             or first != second
             or hashlib.sha256(first).hexdigest() != self.sha256
         ):
@@ -1443,11 +1658,13 @@ def _create_private_child_directory(
                 dir_fd=parent.fd,
                 follow_symlinks=False,
             )
+            initial_access_policy = _stable_fd_access_policy_binding(child_fd)
             if (
                 not stat.S_ISDIR(descriptor.st_mode)
                 or descriptor.st_uid != os.geteuid()
                 or stat.S_IMODE(descriptor.st_mode) & 0o077
                 or _directory_status(descriptor) != _directory_status(path_status)
+                or initial_access_policy != _stable_fd_access_policy_binding(child_fd)
             ):
                 raise _blocked(
                     "collector-unavailable",
@@ -1460,9 +1677,11 @@ def _create_private_child_directory(
                 dir_fd=parent.fd,
                 follow_symlinks=False,
             )
+            final_access_policy = _stable_fd_access_policy_binding(child_fd)
             if (
                 _directory_status(descriptor) != _directory_status(path_status)
                 or stat.S_IMODE(descriptor.st_mode) != 0o700
+                or final_access_policy != initial_access_policy
             ):
                 raise _blocked(
                     "collector-unavailable",
@@ -1525,6 +1744,7 @@ def _create_private_regular_file(
             dir_fd=parent.fd,
             follow_symlinks=False,
         )
+        initial_access_policy = _stable_fd_access_policy_binding(fd)
         if (
             not stat.S_ISREG(descriptor.st_mode)
             or descriptor.st_uid != os.geteuid()
@@ -1545,10 +1765,12 @@ def _create_private_regular_file(
             dir_fd=parent.fd,
             follow_symlinks=False,
         )
+        final_access_policy = _stable_fd_access_policy_binding(fd)
         if (
             _file_status(descriptor) != _file_status(path_status)
             or descriptor.st_size != len(payload)
             or stat.S_IMODE(descriptor.st_mode) != mode
+            or final_access_policy != initial_access_policy
         ):
             raise _blocked(
                 "collector-unavailable",
@@ -1704,6 +1926,8 @@ class GitHubApiClient:
         self._snapshot_global_config_file: Optional[_BoundRegularFile] = None
         self._source_fd: Optional[int] = None
         self._snapshot_fd: Optional[int] = None
+        self._source_access_policy_binding: Optional[tuple[str, int, str]] = None
+        self._snapshot_access_policy_binding: Optional[tuple[str, int, str]] = None
         self._closed = False
         self._pinned = False
         self._run_name = ""
@@ -1864,7 +2088,7 @@ class GitHubApiClient:
     @staticmethod
     def _initial_source_status(
         gh_executable: pathlib.Path,
-    ) -> tuple[int, os.stat_result]:
+    ) -> tuple[int, os.stat_result, tuple[str, int, str]]:
         if not gh_executable.is_absolute():
             raise _blocked(
                 "collector-unavailable",
@@ -1918,7 +2142,15 @@ class GitHubApiClient:
                 "collector-unavailable",
                 "GitHub CLI executable identity, size, or execute policy is invalid",
             )
-        return source_fd, descriptor_status
+        try:
+            access_policy = _stable_fd_access_policy_binding(source_fd)
+        except OSError as error:
+            os.close(source_fd)
+            raise _blocked(
+                "collector-unavailable",
+                "GitHub CLI executable ACL policy is unsafe",
+            ) from error
+        return source_fd, descriptor_status, access_policy
 
     def _pin_executable(
         self,
@@ -1931,7 +2163,9 @@ class GitHubApiClient:
                 "GitHub CLI private executable snapshot directory is unavailable",
             )
         source_fd: Optional[int]
-        source_fd, source_before = self._initial_source_status(gh_executable)
+        source_fd, source_before, source_access_policy_before = (
+            self._initial_source_status(gh_executable)
+        )
         snapshot_write_fd: Optional[int] = None
         try:
             self._executable_snapshot_directory.revalidate()
@@ -1955,6 +2189,9 @@ class GitHubApiClient:
                 "gh",
                 dir_fd=self._executable_snapshot_directory.fd,
                 follow_symlinks=False,
+            )
+            initial_snapshot_access_policy = _stable_fd_access_policy_binding(
+                snapshot_write_fd
             )
             if (
                 not stat.S_ISREG(initial_snapshot_descriptor.st_mode)
@@ -1987,6 +2224,7 @@ class GitHubApiClient:
                 digest.update(chunk)
                 _write_all(snapshot_write_fd, chunk)
             source_after = os.fstat(source_fd)
+            source_access_policy_after = _stable_fd_access_policy_binding(source_fd)
             source_access_before = (
                 stat.S_IMODE(source_before.st_mode),
                 source_before.st_uid,
@@ -2002,6 +2240,7 @@ class GitHubApiClient:
                 != (source_after.st_dev, source_after.st_ino)
                 or source_before.st_size != source_after.st_size
                 or source_access_before != source_access_after
+                or source_access_policy_before != source_access_policy_after
                 or copied != source_before.st_size
             ):
                 raise _blocked(
@@ -2025,6 +2264,7 @@ class GitHubApiClient:
                 "size": source_after.st_size,
                 "uid": source_after.st_uid,
             }
+            self._source_access_policy_binding = source_access_policy_after
             os.fchmod(snapshot_write_fd, 0o500)
             os.fsync(snapshot_write_fd)
             snapshot_status = os.fstat(snapshot_write_fd)
@@ -2033,6 +2273,7 @@ class GitHubApiClient:
                 dir_fd=self._executable_snapshot_directory.fd,
                 follow_symlinks=False,
             )
+            snapshot_access_policy = _stable_fd_access_policy_binding(snapshot_write_fd)
             if (
                 not stat.S_ISREG(snapshot_status.st_mode)
                 or snapshot_status.st_size != copied
@@ -2040,6 +2281,7 @@ class GitHubApiClient:
                 or snapshot_status.st_nlink != 1
                 or stat.S_IMODE(snapshot_status.st_mode) != 0o500
                 or _file_status(snapshot_status) != _file_status(snapshot_path_status)
+                or snapshot_access_policy != initial_snapshot_access_policy
             ):
                 raise _blocked(
                     "collector-unavailable",
@@ -2056,6 +2298,12 @@ class GitHubApiClient:
                 dir_fd=self._executable_snapshot_directory.fd,
             )
             pinned_status = os.fstat(self._snapshot_fd)
+            pinned_access_policy = _stable_fd_access_policy_binding(self._snapshot_fd)
+            if pinned_access_policy != snapshot_access_policy:
+                raise _blocked(
+                    "collector-unavailable",
+                    "GitHub CLI snapshot ACL policy changed while it was pinned",
+                )
             self._snapshot_path = snapshot_path
             self._snapshot_binding = {
                 "device": pinned_status.st_dev,
@@ -2067,6 +2315,7 @@ class GitHubApiClient:
                 "size": pinned_status.st_size,
                 "uid": pinned_status.st_uid,
             }
+            self._snapshot_access_policy_binding = pinned_access_policy
             self.executable = os.fspath(snapshot_path)
             self._source_fd = source_fd
             source_fd = None
@@ -2101,6 +2350,8 @@ class GitHubApiClient:
             or self._closed
             or self._source_fd is None
             or self._snapshot_fd is None
+            or self._source_access_policy_binding is None
+            or self._snapshot_access_policy_binding is None
             or not self.executable
             or self._runtime_parent is None
             or self._run_directory is None
@@ -2125,14 +2376,26 @@ class GitHubApiClient:
             self._snapshot_global_config_file.revalidate()
             source_descriptor_before = os.fstat(self._source_fd)
             source_path_before = os.lstat(self._source_path)
+            source_access_policy_before = _stable_fd_access_policy_binding(
+                self._source_fd
+            )
             source_digest, source_retained = _sha256_fd_bounded(self._source_fd)
             source_descriptor_after = os.fstat(self._source_fd)
             source_path_after = os.lstat(self._source_path)
+            source_access_policy_after = _stable_fd_access_policy_binding(
+                self._source_fd
+            )
             snapshot_descriptor_before = os.fstat(self._snapshot_fd)
             snapshot_path_before = os.lstat(self._snapshot_path)
+            snapshot_access_policy_before = _stable_fd_access_policy_binding(
+                self._snapshot_fd
+            )
             snapshot_digest, snapshot_retained = _sha256_fd_bounded(self._snapshot_fd)
             snapshot_descriptor_after = os.fstat(self._snapshot_fd)
             snapshot_path_after = os.lstat(self._snapshot_path)
+            snapshot_access_policy_after = _stable_fd_access_policy_binding(
+                self._snapshot_fd
+            )
         except (OSError, ValueError):
             raise self._collector_inconclusive()
 
@@ -2155,6 +2418,8 @@ class GitHubApiClient:
             or _file_status(source_path_after) != source_expected
             or source_retained != self._source_binding["size"]
             or source_digest != self._source_binding["sha256"]
+            or source_access_policy_before != self._source_access_policy_binding
+            or source_access_policy_after != self._source_access_policy_binding
             or not stat.S_ISREG(snapshot_descriptor_before.st_mode)
             or not stat.S_ISREG(snapshot_path_before.st_mode)
             or not stat.S_ISREG(snapshot_descriptor_after.st_mode)
@@ -2165,6 +2430,8 @@ class GitHubApiClient:
             or _file_status(snapshot_path_after) != snapshot_expected
             or snapshot_retained != self._snapshot_binding["size"]
             or snapshot_digest != self._snapshot_binding["sha256"]
+            or snapshot_access_policy_before != self._snapshot_access_policy_binding
+            or snapshot_access_policy_after != self._snapshot_access_policy_binding
         ):
             raise self._collector_inconclusive()
 

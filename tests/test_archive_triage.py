@@ -39,6 +39,8 @@ CUTOVER_TRUSTED_WORKFLOW_PATH = (
 MIGRATION_FIXTURE_PATH = (
     REPO_ROOT / "tests/fixtures/cisco-build-artifacts-migration.json"
 )
+# Helper-owned synthetic-token catalog ID: access-a.
+SYNTHETIC_ACCESS_TOKEN = "codex_synth_v1_access_a"
 SPEC = importlib.util.spec_from_file_location("archive_triage", SCRIPT_PATH)
 MODULE = importlib.util.module_from_spec(SPEC)
 assert SPEC is not None
@@ -4837,6 +4839,26 @@ class BugTriageDocumentationTests(unittest.TestCase):
         return config_dir, resolved_root / "fixed-gh-runtime"
 
     @staticmethod
+    def _set_darwin_acl(path: Path, entry: str) -> None:
+        subprocess.run(
+            ["/bin/chmod", "+a", entry, str(path)],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+
+    @staticmethod
+    def _clear_darwin_acl(path: Path) -> None:
+        subprocess.run(
+            ["/bin/chmod", "-N", str(path)],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+
+    @staticmethod
     def _cutover_variable(
         evidence: dict[str, object],
         name: str,
@@ -6191,6 +6213,152 @@ class BugTriageDocumentationTests(unittest.TestCase):
                         ENFORCEMENT_MODULE.build_parser().parse_args(incomplete)
                 self.assertEqual(raised.exception.code, 2)
 
+    def test_enforcement_acl_contract_is_descriptor_bound_and_platform_explicit(
+        self,
+    ) -> None:
+        source = CUTOVER_ENFORCEMENT_DOCTOR_PATH.read_text(encoding="utf-8")
+        readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+        migration = (REPO_ROOT / "docs/cisco-build-artifacts-migration.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            'DARWIN_LIBSYSTEM_PATH = "/usr/lib/libSystem.B.dylib"',
+            source,
+        )
+        self.assertIn("acl_get_fd_np", source)
+        self.assertIn("acl_copy_ext", source)
+        self.assertIn("DARWIN_ACL_EXTENDED_ALLOW", source)
+        self.assertIn('LINUX_ACL_PROFILE = "linux-posix-mode-mask-v1"', source)
+        self.assertNotIn("ls -lde", source)
+        self.assertIn("/usr/lib/libSystem.B.dylib", readme)
+        self.assertIn("linux-posix-mode-mask-v1", migration)
+        self.assertIn(
+            "checked before any executable or token bytes are written",
+            " ".join(migration.split()),
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "object"
+            path.write_bytes(b"fixture")
+            descriptor = os.open(path, os.O_RDONLY)
+            try:
+                with mock.patch.object(
+                    ENFORCEMENT_MODULE.sys,
+                    "platform",
+                    "linux",
+                ):
+                    with mock.patch.object(
+                        ENFORCEMENT_MODULE,
+                        "_DarwinAclRuntime",
+                        side_effect=AssertionError("Darwin runtime must not load"),
+                    ):
+                        binding = ENFORCEMENT_MODULE._stable_fd_access_policy_binding(
+                            descriptor
+                        )
+            finally:
+                os.close(descriptor)
+        self.assertEqual(
+            binding,
+            ("linux-posix-mode-mask-v1", 0, "mode-bits-authoritative"),
+        )
+
+    @unittest.skipUnless(
+        sys.platform == "darwin",
+        "requires Darwin extended ACLs",
+    )
+    def test_enforcement_gh_acl_allows_only_noninherited_deny_entries(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir).resolve()
+            trusted_gh = temp_root / "trusted-gh"
+            trusted_payload = b"#!/bin/sh\nexit 0\n"
+            trusted_gh.write_bytes(trusted_payload)
+            trusted_gh.chmod(0o700)
+            config_dir, runtime_parent = self._make_private_gh_config(temp_root)
+            self._set_darwin_acl(temp_root, "everyone deny readextattr")
+            try:
+                with ENFORCEMENT_MODULE.GitHubApiClient(
+                    trusted_gh,
+                    hashlib.sha256(trusted_payload).hexdigest(),
+                    config_dir,
+                    runtime_parent=runtime_parent,
+                ):
+                    pass
+            finally:
+                self._clear_darwin_acl(temp_root)
+
+            self._set_darwin_acl(
+                temp_root,
+                "everyone allow list,search,add_file,delete_child",
+            )
+            try:
+                with self.assertRaises(
+                    ENFORCEMENT_MODULE.EnforcementDoctorError
+                ) as raised:
+                    ENFORCEMENT_MODULE.GitHubApiClient(
+                        trusted_gh,
+                        hashlib.sha256(trusted_payload).hexdigest(),
+                        config_dir,
+                        runtime_parent=runtime_parent,
+                    )
+            finally:
+                self._clear_darwin_acl(temp_root)
+        self.assertEqual(raised.exception.reason_code, "collector-unavailable")
+
+    @unittest.skipUnless(
+        sys.platform == "darwin",
+        "requires Darwin extended ACL inheritance",
+    )
+    def test_enforcement_gh_acl_rejects_inherited_source_token_read_grant(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir).resolve()
+            trusted_gh = temp_root / "trusted-gh"
+            trusted_payload = b"#!/bin/sh\nexit 0\n"
+            trusted_gh.write_bytes(trusted_payload)
+            trusted_gh.chmod(0o700)
+            config_dir = temp_root / "gh-config"
+            config_dir.mkdir(mode=0o700)
+            self._set_darwin_acl(
+                config_dir,
+                "everyone allow read,file_inherit,directory_inherit",
+            )
+            hosts_path = config_dir / "hosts.yml"
+            hosts_path.write_text(
+                (
+                    "github.com:\n"
+                    "    git_protocol: https\n"
+                    "    users:\n"
+                    "        fixture-admin:\n"
+                    f"            oauth_token: {SYNTHETIC_ACCESS_TOKEN}\n"
+                    "    user: fixture-admin\n"
+                    f"    oauth_token: {SYNTHETIC_ACCESS_TOKEN}\n"
+                ),
+                encoding="utf-8",
+            )
+            hosts_path.chmod(0o600)
+            config_path = config_dir / "config.yml"
+            config_path.write_text("version: 1\n", encoding="utf-8")
+            config_path.chmod(0o600)
+            self._clear_darwin_acl(config_dir)
+
+            with mock.patch.object(
+                ENFORCEMENT_MODULE,
+                "_bounded_subprocess",
+            ) as spawned:
+                with self.assertRaises(
+                    ENFORCEMENT_MODULE.EnforcementDoctorError
+                ) as raised:
+                    ENFORCEMENT_MODULE.GitHubApiClient(
+                        trusted_gh,
+                        hashlib.sha256(trusted_payload).hexdigest(),
+                        config_dir,
+                        runtime_parent=temp_root / "fixed-gh-runtime",
+                    )
+            spawned.assert_not_called()
+        self.assertEqual(raised.exception.reason_code, "collector-unavailable")
+
     def test_enforcement_gh_pin_uses_exact_digest_and_minimal_environment(
         self,
     ) -> None:
@@ -6455,6 +6623,175 @@ class BugTriageDocumentationTests(unittest.TestCase):
                             raised.exception.reason_code,
                             "collector-inconclusive",
                         )
+
+    @unittest.skipUnless(
+        sys.platform == "darwin",
+        "requires Darwin extended ACLs",
+    )
+    def test_enforcement_gh_acl_drift_discards_command_output(
+        self,
+    ) -> None:
+        mutations = {
+            "runtime-parent": lambda client: self._set_darwin_acl(
+                client._runtime_parent.path,
+                "everyone allow list,search,add_file,delete_child",
+            ),
+            "run-directory": lambda client: self._set_darwin_acl(
+                client._run_directory.path,
+                "everyone allow list,search,add_file,delete_child",
+            ),
+            "executable-snapshot": lambda client: self._set_darwin_acl(
+                client._snapshot_path,
+                "everyone allow read,write,execute",
+            ),
+            "source-config": lambda client: self._set_darwin_acl(
+                client._source_config_directory.path / "hosts.yml",
+                "everyone allow read",
+            ),
+            "config-snapshot-directory": lambda client: self._set_darwin_acl(
+                client._config_snapshot_directory.path,
+                "everyone allow list,search",
+            ),
+            "snapshot-token": lambda client: self._set_darwin_acl(
+                client._config_snapshot_directory.path / "hosts.yml",
+                "everyone allow read",
+            ),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(drift=label):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    temp_root = Path(temp_dir).resolve()
+                    trusted_gh = temp_root / "trusted-gh"
+                    trusted_payload = b"#!/bin/sh\nexit 0\n"
+                    trusted_gh.write_bytes(trusted_payload)
+                    trusted_gh.chmod(0o700)
+                    config_dir, runtime_parent = self._make_private_gh_config(
+                        temp_root,
+                        hosts_payload=(
+                            "github.com:\n"
+                            "    git_protocol: https\n"
+                            "    users:\n"
+                            "        fixture-admin:\n"
+                            f"            oauth_token: {SYNTHETIC_ACCESS_TOKEN}\n"
+                            "    user: fixture-admin\n"
+                            f"    oauth_token: {SYNTHETIC_ACCESS_TOKEN}\n"
+                        ),
+                    )
+                    with ENFORCEMENT_MODULE.GitHubApiClient(
+                        trusted_gh,
+                        hashlib.sha256(trusted_payload).hexdigest(),
+                        config_dir,
+                        runtime_parent=runtime_parent,
+                    ) as client:
+
+                        def drift_after_exec(
+                            command: list[str],
+                            **kwargs: object,
+                        ) -> tuple[int, bytes, bytes]:
+                            mutate(client)
+                            return (
+                                0,
+                                b'{"id":1,"login":"must-not-be-used"}',
+                                b"",
+                            )
+
+                        with mock.patch.object(
+                            ENFORCEMENT_MODULE,
+                            "_bounded_subprocess",
+                            side_effect=drift_after_exec,
+                        ):
+                            with self.assertRaises(
+                                ENFORCEMENT_MODULE.EnforcementDoctorError
+                            ) as raised:
+                                client.get_json("/user")
+
+                        self.assertEqual(
+                            raised.exception.reason_code,
+                            "collector-inconclusive",
+                        )
+
+    @unittest.skipUnless(
+        sys.platform == "darwin",
+        "requires Darwin extended ACLs",
+    )
+    def test_enforcement_gh_acl_restrictive_deny_churn_is_benign(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir).resolve()
+            trusted_gh = temp_root / "trusted-gh"
+            trusted_payload = b"#!/bin/sh\nexit 0\n"
+            trusted_gh.write_bytes(trusted_payload)
+            trusted_gh.chmod(0o700)
+            config_dir, runtime_parent = self._make_private_gh_config(temp_root)
+            with ENFORCEMENT_MODULE.GitHubApiClient(
+                trusted_gh,
+                hashlib.sha256(trusted_payload).hexdigest(),
+                config_dir,
+                runtime_parent=runtime_parent,
+            ) as client:
+
+                def add_restrictive_deny(
+                    command: list[str],
+                    **kwargs: object,
+                ) -> tuple[int, bytes, bytes]:
+                    self._set_darwin_acl(
+                        client._runtime_parent.path,
+                        "everyone deny readextattr",
+                    )
+                    return 0, b'{"id":1,"login":"fixture"}', b""
+
+                with mock.patch.object(
+                    ENFORCEMENT_MODULE,
+                    "_bounded_subprocess",
+                    side_effect=add_restrictive_deny,
+                ):
+                    response = client.get_json("/user")
+
+        self.assertEqual(response["login"], "fixture")
+
+    @unittest.skipUnless(
+        sys.platform == "darwin",
+        "requires Darwin extended ACLs",
+    )
+    def test_enforcement_gh_acl_drift_is_revalidated_after_spawn_failure(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir).resolve()
+            trusted_gh = temp_root / "trusted-gh"
+            trusted_payload = b"#!/bin/sh\nexit 0\n"
+            trusted_gh.write_bytes(trusted_payload)
+            trusted_gh.chmod(0o700)
+            config_dir, runtime_parent = self._make_private_gh_config(temp_root)
+            with ENFORCEMENT_MODULE.GitHubApiClient(
+                trusted_gh,
+                hashlib.sha256(trusted_payload).hexdigest(),
+                config_dir,
+                runtime_parent=runtime_parent,
+            ) as client:
+
+                def fail_after_acl_grant(
+                    command: list[str],
+                    **kwargs: object,
+                ) -> tuple[int, bytes, bytes]:
+                    self._set_darwin_acl(
+                        client._config_snapshot_directory.path / "hosts.yml",
+                        "everyone allow read",
+                    )
+                    raise RuntimeError("fixture subprocess failure")
+
+                with mock.patch.object(
+                    ENFORCEMENT_MODULE,
+                    "_bounded_subprocess",
+                    side_effect=fail_after_acl_grant,
+                ):
+                    with self.assertRaises(
+                        ENFORCEMENT_MODULE.EnforcementDoctorError
+                    ) as raised:
+                        client.get_json("/user")
+
+        self.assertEqual(raised.exception.reason_code, "collector-inconclusive")
 
     def test_enforcement_gh_runtime_rejects_replaceable_ancestor(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

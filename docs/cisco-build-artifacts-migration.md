@@ -321,6 +321,43 @@ component from `/` to the selected directory is opened with no-follow
 semantics, retained by descriptor, and required to have an owner and write
 policy that prevents another principal from renaming its child.
 
+On Darwin, mode bits are not the complete access policy: an extended or
+inherited ACL can grant another principal read, write, traversal, or
+delete-child rights while `0700`, `0500`, or `0400` remains unchanged. The
+doctor therefore queries `ACL_TYPE_EXTENDED` directly on each retained file or
+directory descriptor through fixed `/usr/lib/libSystem.B.dylib`. It neither
+resolves principals through directory services nor parses path-based `ls`
+output. The kernel ACL is capped at 128 entries and its external representation
+at 64 KiB. A non-inherited deny entry is only restrictive and remains valid
+(including the ordinary home-directory `deny delete` ACL); every extended
+allow and every inherited or inheritable entry is rejected. Rejecting all
+extended allow entries is the bounded conservative superset of resolving which
+allow qualifier denotes the owner. The complete external ACL representation is
+size-checked while the retained access-policy binding is the monotone
+no-allow/no-inheritance predicate, queried twice for stability and revalidated
+with the descriptor/path identity chain before and after every `gh` invocation
+and before final admission. Adding or changing a purely restrictive,
+non-inherited deny entry is benign because it cannot weaken the selected
+confidentiality or non-replacement property.
+
+Every runtime child is created only below a parent whose ACL has already
+passed. Its descriptor ACL is checked before any executable or token bytes are
+written and again after the final owner-only `fchmod`, so a parent inheritance
+rule cannot create a readable credential window. ACL query failure, an allow
+grant, inheritance, or initial instability is `collector-unavailable`; drift
+during or after an invocation is `collector-inconclusive`, and the command
+output is discarded. This is a property-scoped access-policy check, not a
+`ctime` proxy. As with the existing namespace binding, a process deliberately
+acting under the same effective UID is the same filesystem principal and is
+outside a separate-principal isolation claim.
+
+On Linux, the explicit `linux-posix-mode-mask-v1` path relies on POSIX access
+ACL effective masks being reflected in the group mode bits already bound by
+the doctor; new private objects are checked again after `fchmod`, preventing an
+inherited default ACL from silently widening effective group/other access.
+This does not claim Darwin/NFSv4 ACL semantics on Linux. Platforms other than
+Darwin and Linux fail closed because no reviewed descriptor ACL profile exists.
+
 The doctor ignores ambient `HOME` and `TMPDIR`. It derives the fixed runtime
 parent `~/.codex/cisco-cutover-doctor` from the effective account database,
 opens and retains every component with the same namespace checks, and creates
