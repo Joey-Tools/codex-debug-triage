@@ -120,6 +120,10 @@ class CentralDirectoryIdentity:
     raw_name: bytes
     decoded_name: str
     flag_bits: int
+    compression_method: int
+    crc: int
+    compress_size: int
+    file_size: int
     local_header_offset: int
 
 
@@ -1176,6 +1180,47 @@ def _resolved_central_directory_local_header_offset(
     return struct.unpack_from("<Q", zip64, cursor - 8)[0]
 
 
+def _resolved_central_directory_sizes(
+    header: bytes,
+    extra: bytes,
+    *,
+    ordinal: int,
+) -> tuple[int, int]:
+    compress_size = struct.unpack_from("<L", header, 20)[0]
+    file_size = struct.unpack_from("<L", header, 24)[0]
+    if compress_size != UINT32_MAX and file_size != UINT32_MAX:
+        return compress_size, file_size
+
+    fields = _parse_extra_fields(
+        extra,
+        record_label="central-directory",
+    )
+    zip64 = fields.get(ZIP64_EXTRA_FIELD_ID)
+    if zip64 is None:
+        raise zipfile.BadZipFile(
+            f"central-directory ZIP64 sizes are missing: ordinal={ordinal}"
+        )
+    cursor = 0
+
+    def take_size(label: str) -> int:
+        nonlocal cursor
+        if len(zip64) - cursor < 8:
+            raise zipfile.BadZipFile(
+                f"truncated central-directory ZIP64 {label}: ordinal={ordinal}"
+            )
+        value = struct.unpack_from("<Q", zip64, cursor)[0]
+        cursor += 8
+        return value
+
+    resolved_file_size = (
+        take_size("file size") if file_size == UINT32_MAX else file_size
+    )
+    resolved_compress_size = (
+        take_size("compressed size") if compress_size == UINT32_MAX else compress_size
+    )
+    return resolved_compress_size, resolved_file_size
+
+
 def _read_central_directory_identities(
     stream: PinnedArchiveReader,
     *,
@@ -1244,6 +1289,11 @@ def _read_central_directory_identities(
             extra,
             ordinal=ordinal,
         )
+        compress_size, file_size = _resolved_central_directory_sizes(
+            header,
+            extra,
+            ordinal=ordinal,
+        )
         decoded_name = _decode_central_directory_name(
             raw_name,
             flag_bits=flag_bits,
@@ -1254,6 +1304,10 @@ def _read_central_directory_identities(
             raw_name=raw_name,
             decoded_name=decoded_name,
             flag_bits=flag_bits,
+            compression_method=struct.unpack_from("<H", header, 10)[0],
+            crc=struct.unpack_from("<L", header, 16)[0],
+            compress_size=compress_size,
+            file_size=file_size,
             local_header_offset=local_header_offset,
         )
         identities.append(identity)
@@ -1261,6 +1315,166 @@ def _read_central_directory_identities(
     if cursor != central_end:
         raise zipfile.BadZipFile("central-directory size mismatch")
     return identities
+
+
+def _validate_data_descriptor_values(
+    stream: PinnedArchiveReader,
+    *,
+    payload_end: int,
+    local_data_end: int,
+    expected: tuple[int, int, int],
+    uses_zip64_descriptor: bool,
+) -> None:
+    value_format = "<LQQ" if uses_zip64_descriptor else "<LLL"
+    value_size = struct.calcsize(value_format)
+    available_size = local_data_end - payload_end
+    if available_size < value_size:
+        raise zipfile.BadZipFile("data descriptor exceeds the local-data region")
+    read_size = min(
+        available_size,
+        value_size + len(DATA_DESCRIPTOR_SIGNATURE),
+    )
+    available = _read_exact_at(
+        stream,
+        payload_end,
+        read_size,
+    )
+    candidates = [struct.unpack_from(value_format, available, 0)]
+    if len(available) >= value_size + len(
+        DATA_DESCRIPTOR_SIGNATURE
+    ) and available.startswith(DATA_DESCRIPTOR_SIGNATURE):
+        candidates.append(
+            struct.unpack_from(
+                value_format,
+                available,
+                len(DATA_DESCRIPTOR_SIGNATURE),
+            )
+        )
+    if expected not in candidates:
+        raise zipfile.BadZipFile(
+            "data descriptor differs from validated member metadata"
+        )
+
+
+def _validate_first_local_record(
+    stream: PinnedArchiveReader,
+    identities: list[CentralDirectoryIdentity],
+    *,
+    central_start: int,
+) -> None:
+    offsets = [identity.local_header_offset for identity in identities]
+    if len(set(offsets)) != len(offsets) or any(
+        offset < 0 or offset >= central_start for offset in offsets
+    ):
+        raise zipfile.BadZipFile("invalid or duplicate local-header offsets")
+    first_identity = next(
+        (identity for identity in identities if identity.local_header_offset == 0),
+        None,
+    )
+    if first_identity is None:
+        raise zipfile.BadZipFile(
+            "concatenated or prefixed ZIP archives are unsupported"
+        )
+    following_offsets = [offset for offset in offsets if offset > 0]
+    local_record_end = min(following_offsets, default=central_start)
+
+    header = _read_exact_at(
+        stream,
+        0,
+        LOCAL_FILE_HEADER_SIZE,
+    )
+    fields = struct.unpack("<4s5H3L2H", header)
+    if fields[0] != LOCAL_FILE_HEADER_SIGNATURE:
+        raise zipfile.BadZipFile(
+            "first local record has an invalid local-file-header signature"
+        )
+    local_flags = fields[2]
+    local_compression = fields[3]
+    local_crc = fields[6]
+    local_compress_size = fields[7]
+    local_file_size = fields[8]
+    name_length = fields[9]
+    extra_length = fields[10]
+    if local_flags != first_identity.flag_bits:
+        raise zipfile.BadZipFile(
+            "first local record flags differ from the central directory"
+        )
+    if local_compression != first_identity.compression_method:
+        raise zipfile.BadZipFile(
+            "first local record compression method differs from the central directory"
+        )
+    if name_length != len(first_identity.raw_name):
+        raise zipfile.BadZipFile(
+            "first local record name length differs from the central directory"
+        )
+
+    variable_start = LOCAL_FILE_HEADER_SIZE
+    data_start = variable_start + name_length + extra_length
+    payload_end = data_start + first_identity.compress_size
+    if (
+        data_start < variable_start
+        or payload_end < data_start
+        or payload_end > local_record_end
+        or local_record_end > central_start
+    ):
+        raise zipfile.BadZipFile("member payload exceeds the local-data region")
+    raw_name = _read_exact_at(stream, variable_start, name_length)
+    if raw_name != first_identity.raw_name:
+        raise zipfile.BadZipFile(
+            "first local record name differs from the central directory"
+        )
+    extra = _read_exact_at(
+        stream,
+        variable_start + name_length,
+        extra_length,
+    )
+    (
+        resolved_file_size,
+        resolved_compress_size,
+        uses_zip64_sizes,
+    ) = _resolved_local_sizes(
+        local_file_size=local_file_size,
+        local_compress_size=local_compress_size,
+        extra=extra,
+    )
+    uses_data_descriptor = bool(local_flags & DATA_DESCRIPTOR_FLAG)
+    if uses_data_descriptor:
+        if local_crc not in (0, first_identity.crc):
+            raise zipfile.BadZipFile(
+                "first local record CRC differs from the central directory"
+            )
+        if resolved_file_size not in (0, first_identity.file_size):
+            raise zipfile.BadZipFile(
+                "first local record file size differs from the central directory"
+            )
+        if resolved_compress_size not in (0, first_identity.compress_size):
+            raise zipfile.BadZipFile(
+                "first local record compressed size differs from the central directory"
+            )
+        _validate_data_descriptor_values(
+            stream,
+            payload_end=payload_end,
+            local_data_end=local_record_end,
+            expected=(
+                first_identity.crc,
+                first_identity.compress_size,
+                first_identity.file_size,
+            ),
+            uses_zip64_descriptor=uses_zip64_sizes,
+        )
+    else:
+        if local_crc != first_identity.crc:
+            raise zipfile.BadZipFile(
+                "first local record CRC differs from the central directory"
+            )
+        if resolved_file_size != first_identity.file_size:
+            raise zipfile.BadZipFile(
+                "first local record file size differs from the central directory"
+            )
+        if resolved_compress_size != first_identity.compress_size:
+            raise zipfile.BadZipFile(
+                "first local record compressed size differs from the central directory"
+            )
 
 
 def _preflight_central_directory(
@@ -1334,13 +1548,11 @@ def _preflight_central_directory(
             "declared and counted central-directory entries differ"
         )
     if identities:
-        first_local_offset = min(
-            identity.local_header_offset for identity in identities
+        _validate_first_local_record(
+            stream,
+            identities,
+            central_start=central_start,
         )
-        if first_local_offset != 0:
-            raise zipfile.BadZipFile(
-                "concatenated or prefixed ZIP archives are unsupported"
-            )
     elif central_start != 0:
         raise zipfile.BadZipFile(
             "concatenated or prefixed empty ZIP archives are unsupported"
@@ -1584,40 +1796,17 @@ def _validate_data_descriptor(
     member: ArchiveMember,
     layout: MemberPayloadLayout,
 ) -> None:
-    value_format = "<LQQ" if layout.uses_zip64_descriptor else "<LLL"
-    value_size = struct.calcsize(value_format)
-    available_size = layout.local_data_end - layout.payload_end
-    if available_size < value_size:
-        raise zipfile.BadZipFile("data descriptor exceeds the local-data region")
-    read_size = min(
-        available_size,
-        value_size + len(DATA_DESCRIPTOR_SIGNATURE),
-    )
-    available = _read_exact_at(
+    _validate_data_descriptor_values(
         archive_stream,
-        layout.payload_end,
-        read_size,
+        payload_end=layout.payload_end,
+        local_data_end=layout.local_data_end,
+        expected=(
+            member.info.CRC,
+            member.info.compress_size,
+            member.info.file_size,
+        ),
+        uses_zip64_descriptor=layout.uses_zip64_descriptor,
     )
-    expected = (
-        member.info.CRC,
-        member.info.compress_size,
-        member.info.file_size,
-    )
-    candidates = [struct.unpack_from(value_format, available, 0)]
-    if len(available) >= value_size + len(
-        DATA_DESCRIPTOR_SIGNATURE
-    ) and available.startswith(DATA_DESCRIPTOR_SIGNATURE):
-        candidates.append(
-            struct.unpack_from(
-                value_format,
-                available,
-                len(DATA_DESCRIPTOR_SIGNATURE),
-            )
-        )
-    if expected not in candidates:
-        raise zipfile.BadZipFile(
-            "data descriptor differs from validated member metadata"
-        )
 
 
 def _find_members(

@@ -60,9 +60,26 @@ class ArchiveTriageTests(unittest.TestCase):
         *,
         classic_eocd: tuple[int, int, int, int, int, int],
     ) -> Path:
+        local_header = struct.pack(
+            "<4s5H3L2H",
+            MODULE.LOCAL_FILE_HEADER_SIGNATURE,
+            20,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
         central_header = bytearray(MODULE.CENTRAL_DIRECTORY_HEADER_SIZE)
         central_header[:4] = MODULE.CENTRAL_DIRECTORY_SIGNATURE
-        zip64_eocd_offset = len(central_header)
+        struct.pack_into("<H", central_header, 4, 20)
+        struct.pack_into("<H", central_header, 6, 20)
+        central_start = len(local_header)
+        zip64_eocd_offset = central_start + len(central_header)
         zip64_eocd = struct.pack(
             "<4sQ2H2L4Q",
             MODULE.ZIP64_EOCD_SIGNATURE,
@@ -74,7 +91,7 @@ class ArchiveTriageTests(unittest.TestCase):
             1,
             1,
             len(central_header),
-            0,
+            central_start,
         )
         locator = struct.pack(
             "<4sLQL",
@@ -90,7 +107,9 @@ class ArchiveTriageTests(unittest.TestCase):
             0,
         )
         archive_path = directory / "zip64-metadata.zip"
-        archive_path.write_bytes(bytes(central_header) + zip64_eocd + locator + eocd)
+        archive_path.write_bytes(
+            local_header + bytes(central_header) + zip64_eocd + locator + eocd
+        )
         return archive_path
 
     def _make_dual_view_archive(self, directory: Path) -> Path:
@@ -110,16 +129,18 @@ class ArchiveTriageTests(unittest.TestCase):
         outer_path.write_bytes(outer + inner)
         return outer_path
 
-    def _prepend_and_rebase_classic_archive(
+    def _prepend_and_rebase_archive(
         self,
         archive_path: Path,
         prefix: bytes,
+        *,
+        forged_zero_ordinal: int | None = None,
     ) -> None:
         data = bytearray(archive_path.read_bytes())
         eocd_offset = data.rfind(MODULE.EOCD_SIGNATURE)
         self.assertGreaterEqual(eocd_offset, 0)
-        central_start = struct.unpack_from("<L", data, eocd_offset + 16)[0]
-        for central_offset, _, _ in self._central_directory_records(data):
+        records = self._central_directory_records(data)
+        for ordinal, (central_offset, _, _) in enumerate(records, start=1):
             local_header_offset = struct.unpack_from(
                 "<L",
                 data,
@@ -130,14 +151,58 @@ class ArchiveTriageTests(unittest.TestCase):
                 "<L",
                 data,
                 central_offset + 42,
-                local_header_offset + len(prefix),
+                (
+                    0
+                    if ordinal == forged_zero_ordinal
+                    else local_header_offset + len(prefix)
+                ),
             )
-        struct.pack_into(
-            "<L",
-            data,
-            eocd_offset + 16,
-            central_start + len(prefix),
-        )
+        central_start = struct.unpack_from("<L", data, eocd_offset + 16)[0]
+        if central_start != MODULE.UINT32_MAX:
+            struct.pack_into(
+                "<L",
+                data,
+                eocd_offset + 16,
+                central_start + len(prefix),
+            )
+
+        locator_offset = eocd_offset - MODULE.ZIP64_LOCATOR_SIZE
+        if (
+            locator_offset >= 0
+            and data[
+                locator_offset : locator_offset + len(MODULE.ZIP64_LOCATOR_SIGNATURE)
+            ]
+            == MODULE.ZIP64_LOCATOR_SIGNATURE
+        ):
+            zip64_eocd_offset = struct.unpack_from(
+                "<Q",
+                data,
+                locator_offset + 8,
+            )[0]
+            self.assertEqual(
+                data[
+                    zip64_eocd_offset : zip64_eocd_offset
+                    + len(MODULE.ZIP64_EOCD_SIGNATURE)
+                ],
+                MODULE.ZIP64_EOCD_SIGNATURE,
+            )
+            zip64_central_start = struct.unpack_from(
+                "<Q",
+                data,
+                zip64_eocd_offset + 48,
+            )[0]
+            struct.pack_into(
+                "<Q",
+                data,
+                zip64_eocd_offset + 48,
+                zip64_central_start + len(prefix),
+            )
+            struct.pack_into(
+                "<Q",
+                data,
+                locator_offset + 8,
+                zip64_eocd_offset + len(prefix),
+            )
         archive_path.write_bytes(prefix + data)
 
     def _corrupt_member_payload_tail(
@@ -199,6 +264,37 @@ class ArchiveTriageTests(unittest.TestCase):
         self.assertGreaterEqual(eocd_offset, 0)
         entry_count = struct.unpack_from("<H", data, eocd_offset + 10)[0]
         cursor = struct.unpack_from("<L", data, eocd_offset + 16)[0]
+        if entry_count == 0xFFFF or cursor == MODULE.UINT32_MAX:
+            locator_offset = eocd_offset - MODULE.ZIP64_LOCATOR_SIZE
+            self.assertEqual(
+                data[
+                    locator_offset : locator_offset
+                    + len(MODULE.ZIP64_LOCATOR_SIGNATURE)
+                ],
+                MODULE.ZIP64_LOCATOR_SIGNATURE,
+            )
+            zip64_eocd_offset = struct.unpack_from(
+                "<Q",
+                data,
+                locator_offset + 8,
+            )[0]
+            self.assertEqual(
+                data[
+                    zip64_eocd_offset : zip64_eocd_offset
+                    + len(MODULE.ZIP64_EOCD_SIGNATURE)
+                ],
+                MODULE.ZIP64_EOCD_SIGNATURE,
+            )
+            entry_count = struct.unpack_from(
+                "<Q",
+                data,
+                zip64_eocd_offset + 32,
+            )[0]
+            cursor = struct.unpack_from(
+                "<Q",
+                data,
+                zip64_eocd_offset + 48,
+            )[0]
         records = []
         for _ in range(entry_count):
             self.assertEqual(
@@ -791,7 +887,7 @@ class ArchiveTriageTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             directory = Path(temp_dir)
             archive_path = self._make_archive(directory)
-            self._prepend_and_rebase_classic_archive(
+            self._prepend_and_rebase_archive(
                 archive_path,
                 b"polyglot-prefix",
             )
@@ -824,6 +920,47 @@ class ArchiveTriageTests(unittest.TestCase):
             stderr.getvalue(),
         )
 
+    def test_prefixed_classic_archive_cannot_forge_unused_offset_zero(
+        self,
+    ) -> None:
+        selected_name = "logs/selected.log"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            archive_path = Path(temp_dir) / "forged-classic.zip"
+            with zipfile.ZipFile(archive_path, "w") as archive:
+                archive.writestr("logs/unused.log", "unused\n")
+                archive.writestr(selected_name, "selected\n")
+            self._prepend_and_rebase_archive(
+                archive_path,
+                b"not-a-local-record",
+                forged_zero_ordinal=1,
+            )
+            with zipfile.ZipFile(archive_path) as archive:
+                self.assertEqual(archive.read(selected_name), b"selected\n")
+
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            real_zipfile = zipfile.ZipFile
+            with mock.patch.object(
+                MODULE.zipfile,
+                "ZipFile",
+                wraps=real_zipfile,
+            ) as constructor:
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    rc = MODULE.cmd_zip_show(
+                        self._show_args(
+                            archive_path,
+                            member=selected_name,
+                        )
+                    )
+
+        self.assertEqual(rc, 1)
+        constructor.assert_not_called()
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn(
+            "first local record has an invalid local-file-header signature",
+            stderr.getvalue(),
+        )
+
     def test_prefixed_empty_archive_with_rebased_offset_is_rejected_before_zipfile(
         self,
     ) -> None:
@@ -831,7 +968,7 @@ class ArchiveTriageTests(unittest.TestCase):
             archive_path = Path(temp_dir) / "empty.zip"
             with zipfile.ZipFile(archive_path, "w"):
                 pass
-            self._prepend_and_rebase_classic_archive(
+            self._prepend_and_rebase_archive(
                 archive_path,
                 b"polyglot-prefix",
             )
@@ -892,7 +1029,7 @@ class ArchiveTriageTests(unittest.TestCase):
                     1,
                     1,
                     MODULE.CENTRAL_DIRECTORY_HEADER_SIZE,
-                    0,
+                    MODULE.LOCAL_FILE_HEADER_SIZE,
                 ),
             )
             with MODULE._open_pinned_archive(
@@ -909,14 +1046,21 @@ class ArchiveTriageTests(unittest.TestCase):
 
     def test_zip64_preflight_rejects_conflicting_classic_eocd_values(self) -> None:
         cases = {
-            "disk-number": (1, 0, 1, 1, MODULE.CENTRAL_DIRECTORY_HEADER_SIZE, 0),
+            "disk-number": (
+                1,
+                0,
+                1,
+                1,
+                MODULE.CENTRAL_DIRECTORY_HEADER_SIZE,
+                MODULE.LOCAL_FILE_HEADER_SIZE,
+            ),
             "central-directory-disk": (
                 0,
                 1,
                 1,
                 1,
                 MODULE.CENTRAL_DIRECTORY_HEADER_SIZE,
-                0,
+                MODULE.LOCAL_FILE_HEADER_SIZE,
             ),
             "entries-on-disk": (
                 0,
@@ -924,7 +1068,7 @@ class ArchiveTriageTests(unittest.TestCase):
                 2,
                 1,
                 MODULE.CENTRAL_DIRECTORY_HEADER_SIZE,
-                0,
+                MODULE.LOCAL_FILE_HEADER_SIZE,
             ),
             "total-entries": (
                 0,
@@ -932,7 +1076,7 @@ class ArchiveTriageTests(unittest.TestCase):
                 1,
                 2,
                 MODULE.CENTRAL_DIRECTORY_HEADER_SIZE,
-                0,
+                MODULE.LOCAL_FILE_HEADER_SIZE,
             ),
             "central-directory-size": (
                 0,
@@ -940,7 +1084,7 @@ class ArchiveTriageTests(unittest.TestCase):
                 1,
                 1,
                 MODULE.CENTRAL_DIRECTORY_HEADER_SIZE - 1,
-                0,
+                MODULE.LOCAL_FILE_HEADER_SIZE,
             ),
             "central-directory-offset": (
                 0,
@@ -948,7 +1092,7 @@ class ArchiveTriageTests(unittest.TestCase):
                 1,
                 1,
                 MODULE.CENTRAL_DIRECTORY_HEADER_SIZE,
-                1,
+                MODULE.LOCAL_FILE_HEADER_SIZE + 1,
             ),
         }
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1025,6 +1169,52 @@ class ArchiveTriageTests(unittest.TestCase):
         self.assertEqual(stdout.getvalue(), "")
         self.assertIn(
             "concatenated or prefixed ZIP64 archives are unsupported",
+            stderr.getvalue(),
+        )
+
+    def test_prefixed_zip64_archive_cannot_forge_unused_offset_zero(
+        self,
+    ) -> None:
+        selected_name = "logs/selected-zip64.log"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            archive_path = Path(temp_dir) / "forged-zip64.zip"
+            with mock.patch.object(zipfile, "ZIP_FILECOUNT_LIMIT", 0):
+                with zipfile.ZipFile(
+                    archive_path,
+                    "w",
+                    allowZip64=True,
+                ) as archive:
+                    archive.writestr("logs/unused-zip64.log", "unused\n")
+                    archive.writestr(selected_name, "selected\n")
+            self._prepend_and_rebase_archive(
+                archive_path,
+                b"not-a-local-record",
+                forged_zero_ordinal=1,
+            )
+            with zipfile.ZipFile(archive_path) as archive:
+                self.assertEqual(archive.read(selected_name), b"selected\n")
+
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            real_zipfile = zipfile.ZipFile
+            with mock.patch.object(
+                MODULE.zipfile,
+                "ZipFile",
+                wraps=real_zipfile,
+            ) as constructor:
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    rc = MODULE.cmd_zip_show(
+                        self._show_args(
+                            archive_path,
+                            member=selected_name,
+                        )
+                    )
+
+        self.assertEqual(rc, 1)
+        constructor.assert_not_called()
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn(
+            "first local record has an invalid local-file-header signature",
             stderr.getvalue(),
         )
 
