@@ -4,6 +4,7 @@ import argparse
 import ast
 import base64
 import binascii
+import ctypes
 import errno
 import hashlib
 import importlib.util
@@ -19,8 +20,9 @@ import tempfile
 import time
 import unittest
 import zipfile
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from pathlib import Path
+from typing import Iterator
 from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -56,6 +58,17 @@ assert ENFORCEMENT_SPEC is not None
 assert ENFORCEMENT_SPEC.loader is not None
 sys.modules[ENFORCEMENT_SPEC.name] = ENFORCEMENT_MODULE
 ENFORCEMENT_SPEC.loader.exec_module(ENFORCEMENT_MODULE)
+
+
+@contextmanager
+def owner_controlled_temp_root() -> Iterator[Path]:
+    with tempfile.TemporaryDirectory(
+        prefix=".codex-cisco-gh-",
+        dir=REPO_ROOT,
+    ) as temp_dir:
+        temp_root = Path(temp_dir).resolve()
+        temp_root.chmod(0o700)
+        yield temp_root
 
 
 class ArchiveTriageTests(unittest.TestCase):
@@ -5165,6 +5178,33 @@ class BugTriageDocumentationTests(unittest.TestCase):
         self.assertIn("tests.test_jenkins_artifact_probe", regular_ci)
         self.assertIn("doctor_cisco_cutover_enforcement.py", regular_ci)
 
+    def test_ci_exercises_linux_transport_and_real_darwin_acl_integration(
+        self,
+    ) -> None:
+        workflow = (REPO_ROOT / ".github/workflows/ci.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('          - "3.9"', workflow)
+        self.assertIn('          - "3.x"', workflow)
+        self.assertIn("runs-on: ubuntu-latest", workflow)
+        self.assertIn(
+            "test_enforcement_gh_linux_owner_controlled_root_reaches_success_path",
+            workflow,
+        )
+        self.assertIn("darwin-acl-integration:", workflow)
+        self.assertIn("runs-on: macos-latest", workflow)
+        self.assertNotIn("continue-on-error:", workflow)
+        for test_name in (
+            "test_enforcement_darwin_acl_ctypes_abi_constants_and_iteration",
+            "test_enforcement_gh_acl_allows_only_noninherited_deny_entries",
+            "test_enforcement_gh_acl_rejects_inherited_source_token_read_grant",
+            "test_enforcement_gh_acl_drift_discards_command_output",
+            "test_enforcement_gh_acl_restrictive_deny_churn_is_benign",
+            "test_enforcement_gh_acl_drift_is_revalidated_after_spawn_failure",
+        ):
+            with self.subTest(test=test_name):
+                self.assertIn(test_name, workflow)
+
     def test_trusted_cutover_selector_routes_target_and_non_target_prs(
         self,
     ) -> None:
@@ -6265,11 +6305,65 @@ class BugTriageDocumentationTests(unittest.TestCase):
         sys.platform == "darwin",
         "requires Darwin extended ACLs",
     )
+    def test_enforcement_darwin_acl_ctypes_abi_constants_and_iteration(
+        self,
+    ) -> None:
+        self.assertEqual(ENFORCEMENT_MODULE.DARWIN_ACL_TYPE_EXTENDED, 0x100)
+        self.assertEqual(ENFORCEMENT_MODULE.DARWIN_ACL_EXTENDED_ALLOW, 1)
+        self.assertEqual(ENFORCEMENT_MODULE.DARWIN_ACL_EXTENDED_DENY, 2)
+        self.assertEqual(ENFORCEMENT_MODULE.DARWIN_ACL_FIRST_ENTRY, 0)
+        self.assertEqual(ENFORCEMENT_MODULE.DARWIN_ACL_NEXT_ENTRY, -1)
+        self.assertEqual(
+            ENFORCEMENT_MODULE.DARWIN_ACL_INHERITANCE_FLAGS,
+            (0x10, 0x20, 0x40, 0x80, 0x100),
+        )
+
+        runtime = ENFORCEMENT_MODULE._DarwinAclRuntime()
+        self.assertEqual(
+            runtime._libc.acl_get_fd_np.argtypes,
+            [ctypes.c_int, ctypes.c_int],
+        )
+        self.assertIs(runtime._libc.acl_get_fd_np.restype, ctypes.c_void_p)
+        self.assertEqual(
+            runtime._libc.acl_get_entry.argtypes,
+            [ctypes.c_void_p, ctypes.c_int, ctypes.POINTER(ctypes.c_void_p)],
+        )
+        self.assertIs(runtime._libc.acl_get_entry.restype, ctypes.c_int)
+        self.assertEqual(
+            runtime._libc.acl_copy_ext.argtypes,
+            [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ssize_t],
+        )
+        self.assertIs(runtime._libc.acl_copy_ext.restype, ctypes.c_ssize_t)
+
+        with owner_controlled_temp_root() as temp_root:
+            acl_path = temp_root / "deny-only"
+            acl_path.write_bytes(b"fixture")
+            acl_path.chmod(0o600)
+            self._set_darwin_acl(acl_path, "everyone deny readextattr")
+            descriptor = os.open(acl_path, os.O_RDONLY)
+            try:
+                binding = runtime.binding(descriptor)
+            finally:
+                os.close(descriptor)
+                self._clear_darwin_acl(acl_path)
+
+        self.assertEqual(
+            binding,
+            (
+                "darwin-fd-no-extended-grants-v1",
+                0,
+                "no-extended-grants-or-inheritance",
+            ),
+        )
+
+    @unittest.skipUnless(
+        sys.platform == "darwin",
+        "requires Darwin extended ACLs",
+    )
     def test_enforcement_gh_acl_allows_only_noninherited_deny_entries(
         self,
     ) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            temp_root = Path(temp_dir).resolve()
+        with owner_controlled_temp_root() as temp_root:
             trusted_gh = temp_root / "trusted-gh"
             trusted_payload = b"#!/bin/sh\nexit 0\n"
             trusted_gh.write_bytes(trusted_payload)
@@ -6312,8 +6406,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
     def test_enforcement_gh_acl_rejects_inherited_source_token_read_grant(
         self,
     ) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            temp_root = Path(temp_dir).resolve()
+        with owner_controlled_temp_root() as temp_root:
             trusted_gh = temp_root / "trusted-gh"
             trusted_payload = b"#!/bin/sh\nexit 0\n"
             trusted_gh.write_bytes(trusted_payload)
@@ -6362,8 +6455,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
     def test_enforcement_gh_pin_uses_exact_digest_and_minimal_environment(
         self,
     ) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            temp_root = Path(temp_dir)
+        with owner_controlled_temp_root() as temp_root:
             trusted_gh = temp_root / "trusted-gh"
             trusted_payload = (
                 b'#!/bin/sh\nprintf \'%s\\n\' \'{"id":1,"login":"fixture"}\'\n'
@@ -6472,9 +6564,47 @@ class BugTriageDocumentationTests(unittest.TestCase):
                     actual_response = client.get_json("/user")
                     self.assertEqual(actual_response["login"], "fixture")
 
+    def test_enforcement_gh_linux_owner_controlled_root_reaches_success_path(
+        self,
+    ) -> None:
+        with owner_controlled_temp_root() as temp_root:
+            trusted_gh = temp_root / "trusted-gh"
+            trusted_payload = b"#!/bin/sh\nexit 0\n"
+            trusted_gh.write_bytes(trusted_payload)
+            trusted_gh.chmod(0o700)
+            config_dir, runtime_parent = self._make_private_gh_config(temp_root)
+            with mock.patch.object(
+                ENFORCEMENT_MODULE.sys,
+                "platform",
+                "linux",
+            ):
+                with mock.patch.object(
+                    ENFORCEMENT_MODULE,
+                    "_DarwinAclRuntime",
+                    side_effect=AssertionError("Darwin runtime must not load"),
+                ):
+                    with ENFORCEMENT_MODULE.GitHubApiClient(
+                        trusted_gh,
+                        hashlib.sha256(trusted_payload).hexdigest(),
+                        config_dir,
+                        runtime_parent=runtime_parent,
+                    ) as client:
+                        with mock.patch.object(
+                            ENFORCEMENT_MODULE,
+                            "_bounded_subprocess",
+                            return_value=(
+                                0,
+                                b'{"id":1,"login":"linux-fixture"}',
+                                b"",
+                            ),
+                        ) as spawned:
+                            response = client.get_json("/user")
+
+        spawned.assert_called_once()
+        self.assertEqual(response["login"], "linux-fixture")
+
     def test_enforcement_gh_pin_rejects_initial_digest_mismatch(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            temp_root = Path(temp_dir)
+        with owner_controlled_temp_root() as temp_root:
             trusted_gh = temp_root / "trusted-gh"
             trusted_gh.write_bytes(b"#!/bin/sh\nexit 0\n")
             trusted_gh.chmod(0o700)
@@ -6496,8 +6626,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
     def test_enforcement_gh_pin_rejects_relative_or_symlink_trust_roots(
         self,
     ) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            temp_root = Path(temp_dir)
+        with owner_controlled_temp_root() as temp_root:
             trusted_gh = temp_root / "trusted-gh"
             trusted_payload = b"#!/bin/sh\nexit 0\n"
             trusted_gh.write_bytes(trusted_payload)
@@ -6530,8 +6659,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
     def test_enforcement_gh_pin_rejects_pre_exec_source_replacement(
         self,
     ) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            temp_root = Path(temp_dir)
+        with owner_controlled_temp_root() as temp_root:
             trusted_gh = temp_root / "trusted-gh"
             trusted_payload = b"#!/bin/sh\nexit 0\n"
             trusted_gh.write_bytes(trusted_payload)
@@ -6588,8 +6716,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
         }
         for label, mutate in mutations.items():
             with self.subTest(drift=label):
-                with tempfile.TemporaryDirectory() as temp_dir:
-                    temp_root = Path(temp_dir)
+                with owner_controlled_temp_root() as temp_root:
                     trusted_gh = temp_root / "trusted-gh"
                     trusted_payload = b"#!/bin/sh\nexit 0\n"
                     trusted_gh.write_bytes(trusted_payload)
@@ -6659,8 +6786,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
         }
         for label, mutate in mutations.items():
             with self.subTest(drift=label):
-                with tempfile.TemporaryDirectory() as temp_dir:
-                    temp_root = Path(temp_dir).resolve()
+                with owner_controlled_temp_root() as temp_root:
                     trusted_gh = temp_root / "trusted-gh"
                     trusted_payload = b"#!/bin/sh\nexit 0\n"
                     trusted_gh.write_bytes(trusted_payload)
@@ -6717,8 +6843,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
     def test_enforcement_gh_acl_restrictive_deny_churn_is_benign(
         self,
     ) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            temp_root = Path(temp_dir).resolve()
+        with owner_controlled_temp_root() as temp_root:
             trusted_gh = temp_root / "trusted-gh"
             trusted_payload = b"#!/bin/sh\nexit 0\n"
             trusted_gh.write_bytes(trusted_payload)
@@ -6757,8 +6882,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
     def test_enforcement_gh_acl_drift_is_revalidated_after_spawn_failure(
         self,
     ) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            temp_root = Path(temp_dir).resolve()
+        with owner_controlled_temp_root() as temp_root:
             trusted_gh = temp_root / "trusted-gh"
             trusted_payload = b"#!/bin/sh\nexit 0\n"
             trusted_gh.write_bytes(trusted_payload)
@@ -6794,8 +6918,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
         self.assertEqual(raised.exception.reason_code, "collector-inconclusive")
 
     def test_enforcement_gh_runtime_rejects_replaceable_ancestor(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            temp_root = Path(temp_dir)
+        with owner_controlled_temp_root() as temp_root:
             trusted_gh = temp_root / "trusted-gh"
             trusted_payload = b"#!/bin/sh\nexit 0\n"
             trusted_gh.write_bytes(trusted_payload)
@@ -6819,8 +6942,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
     def test_enforcement_gh_config_rejects_symlinks_and_open_permissions(
         self,
     ) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            temp_root = Path(temp_dir)
+        with owner_controlled_temp_root() as temp_root:
             resolved_root = temp_root.resolve()
             trusted_gh = temp_root / "trusted-gh"
             trusted_payload = b"#!/bin/sh\nexit 0\n"
@@ -6921,8 +7043,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
         )
         for label, config_payload, hosts_payload in cases:
             with self.subTest(case=label):
-                with tempfile.TemporaryDirectory() as temp_dir:
-                    temp_root = Path(temp_dir)
+                with owner_controlled_temp_root() as temp_root:
                     trusted_gh = temp_root / "trusted-gh"
                     trusted_payload = b"#!/bin/sh\nexit 0\n"
                     trusted_gh.write_bytes(trusted_payload)
@@ -6985,8 +7106,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
         }
         for label, mutate in mutations.items():
             with self.subTest(drift=label):
-                with tempfile.TemporaryDirectory() as temp_dir:
-                    temp_root = Path(temp_dir).resolve()
+                with owner_controlled_temp_root() as temp_root:
                     trusted_gh = temp_root / "trusted-gh"
                     trusted_payload = b"#!/bin/sh\nexit 0\n"
                     trusted_gh.write_bytes(trusted_payload)
@@ -7025,8 +7145,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
     def test_enforcement_gh_snapshot_excludes_non_github_authentication(
         self,
     ) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            temp_root = Path(temp_dir)
+        with owner_controlled_temp_root() as temp_root:
             trusted_gh = temp_root / "trusted-gh"
             trusted_payload = b"#!/bin/sh\nexit 0\n"
             trusted_gh.write_bytes(trusted_payload)

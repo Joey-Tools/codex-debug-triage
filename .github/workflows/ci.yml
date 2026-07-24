@@ -32,8 +32,30 @@ jobs:
             scripts/validate_cisco_cutover_receipt.py \
             tests/test_archive_triage.py \
             tests/test_jenkins_artifact_probe.py
+      - name: Run Linux GitHub transport success path
+        run: |
+          python3 -m unittest \
+            tests.test_archive_triage.BugTriageDocumentationTests.test_enforcement_gh_linux_owner_controlled_root_reaches_success_path
       - name: Run tests
         run: |
           python3 -m unittest \
             tests.test_archive_triage \
             tests.test_jenkins_artifact_probe
+
+  darwin-acl-integration:
+    runs-on: macos-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: Run Darwin ACL integration tests
+        run: |
+          python3 -m unittest \
+            tests.test_archive_triage.BugTriageDocumentationTests.test_enforcement_darwin_acl_ctypes_abi_constants_and_iteration \
+            tests.test_archive_triage.BugTriageDocumentationTests.test_enforcement_gh_acl_allows_only_noninherited_deny_entries \
+            tests.test_archive_triage.BugTriageDocumentationTests.test_enforcement_gh_acl_rejects_inherited_source_token_read_grant \
+            tests.test_archive_triage.BugTriageDocumentationTests.test_enforcement_gh_acl_drift_discards_command_output \
+            tests.test_archive_triage.BugTriageDocumentationTests.test_enforcement_gh_acl_restrictive_deny_churn_is_benign \
+            tests.test_archive_triage.BugTriageDocumentationTests.test_enforcement_gh_acl_drift_is_revalidated_after_spawn_failure
