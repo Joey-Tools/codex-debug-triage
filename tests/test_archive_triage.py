@@ -4,6 +4,7 @@ import argparse
 import ast
 import base64
 import binascii
+import errno
 import hashlib
 import importlib.util
 import io
@@ -11,8 +12,8 @@ import json
 import os
 import shlex
 import signal
-import subprocess
 import struct
+import subprocess
 import sys
 import tempfile
 import time
@@ -21,7 +22,6 @@ import zipfile
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
-
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SKILL_ROOT = REPO_ROOT / "skills/bug-triage-playbook"
@@ -673,6 +673,33 @@ class ArchiveTriageTests(unittest.TestCase):
         }
         values.update(overrides)
         return argparse.Namespace(**values)
+
+    def _full_pipe_writer(
+        self,
+    ) -> tuple[int, int, io.TextIOWrapper, int]:
+        if MODULE.fcntl is None or not hasattr(os, "O_NONBLOCK"):
+            self.skipTest("fcntl O_NONBLOCK support is required")
+        read_fd, write_fd = os.pipe()
+        original_flags = MODULE._fcntl_get_flags(write_fd)
+        MODULE._fcntl_set_flags(write_fd, original_flags | os.O_NONBLOCK)
+        try:
+            while True:
+                os.write(write_fd, b"x" * 4096)
+        except BlockingIOError:
+            try:
+                while True:
+                    os.write(write_fd, b"x")
+            except BlockingIOError:
+                pass
+        finally:
+            MODULE._fcntl_set_flags(write_fd, original_flags)
+        writer = io.TextIOWrapper(
+            io.FileIO(write_fd, mode="w", closefd=False),
+            encoding="utf-8",
+            write_through=True,
+        )
+        user_flags = MODULE._fcntl_get_flags(write_fd)
+        return read_fd, write_fd, writer, user_flags
 
     def test_zip_list_filters_case_insensitively_and_limits_output(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2898,6 +2925,287 @@ class ArchiveTriageTests(unittest.TestCase):
         self.assertIn("refuses to arm while SIGALRM is blocked", stderr.getvalue())
 
     @unittest.skipUnless(
+        hasattr(signal, "pthread_sigmask") and hasattr(signal, "SIGALRM"),
+        "POSIX signal masks are required",
+    )
+    def test_blocked_sigalrm_error_does_not_block_on_full_stderr_pipe(
+        self,
+    ) -> None:
+        read_fd, write_fd, writer, original_flags = self._full_pipe_writer()
+        previous_mask = signal.pthread_sigmask(
+            signal.SIG_BLOCK,
+            {signal.SIGALRM},
+        )
+        started = time.monotonic()
+        try:
+            with redirect_stderr(writer):
+                rc = MODULE.cmd_zip_list(self._list_args(Path("unused.zip")))
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+            writer.close()
+            final_flags = MODULE._fcntl_get_flags(write_fd)
+            os.close(write_fd)
+            os.close(read_fd)
+
+        self.assertEqual(rc, 1)
+        self.assertLess(time.monotonic() - started, 0.5)
+        self.assertEqual(final_flags, original_flags)
+
+    @unittest.skipUnless(
+        all(
+            hasattr(signal, name)
+            for name in (
+                "SIGALRM",
+                "pthread_sigmask",
+                "sigpending",
+                "SIG_BLOCK",
+                "SIG_SETMASK",
+            )
+        ),
+        "POSIX pending-signal controls are required",
+    )
+    def test_pending_sigalrm_error_does_not_block_on_full_stderr_pipe(
+        self,
+    ) -> None:
+        read_fd, write_fd, writer, original_flags = self._full_pipe_writer()
+        started = time.monotonic()
+        try:
+            with (
+                mock.patch.object(
+                    MODULE.signal,
+                    "sigpending",
+                    return_value={signal.SIGALRM},
+                ),
+                redirect_stderr(writer),
+            ):
+                rc = MODULE.cmd_zip_list(self._list_args(Path("unused.zip")))
+        finally:
+            writer.close()
+            final_flags = MODULE._fcntl_get_flags(write_fd)
+            os.close(write_fd)
+            os.close(read_fd)
+
+        self.assertEqual(rc, 1)
+        self.assertLess(time.monotonic() - started, 0.5)
+        self.assertEqual(final_flags, original_flags)
+
+    @unittest.skipUnless(
+        hasattr(signal, "setitimer") and hasattr(signal, "SIGALRM"),
+        "POSIX interval timers are required",
+    )
+    def test_existing_timer_error_does_not_block_on_full_stderr_pipe(
+        self,
+    ) -> None:
+        previous_timer = signal.getitimer(signal.ITIMER_REAL)
+        if previous_timer != (0.0, 0.0):
+            self.skipTest("the test runner already owns ITIMER_REAL")
+        if hasattr(
+            signal, "pthread_sigmask"
+        ) and signal.SIGALRM in signal.pthread_sigmask(signal.SIG_BLOCK, set()):
+            self.skipTest("the test runner already blocks SIGALRM")
+        previous_handler = signal.getsignal(signal.SIGALRM)
+        read_fd, write_fd, writer, original_flags = self._full_pipe_writer()
+        signal.signal(signal.SIGALRM, lambda _signum, _frame: None)
+        signal.setitimer(signal.ITIMER_REAL, 2.0)
+        started = time.monotonic()
+        try:
+            with redirect_stderr(writer):
+                rc = MODULE.cmd_zip_list(self._list_args(Path("unused.zip")))
+            remaining_timer = signal.getitimer(signal.ITIMER_REAL)
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0.0)
+            signal.signal(signal.SIGALRM, previous_handler)
+            writer.close()
+            final_flags = MODULE._fcntl_get_flags(write_fd)
+            os.close(write_fd)
+            os.close(read_fd)
+
+        self.assertEqual(rc, 1)
+        self.assertLess(time.monotonic() - started, 0.5)
+        self.assertGreater(remaining_timer[0], 1.0)
+        self.assertEqual(final_flags, original_flags)
+
+    def test_argparse_error_does_not_block_on_full_stderr_pipe(self) -> None:
+        read_fd, write_fd, writer, original_flags = self._full_pipe_writer()
+        parser = MODULE.build_parser()
+        started = time.monotonic()
+        try:
+            with (
+                redirect_stderr(writer),
+                self.assertRaises(SystemExit) as raised,
+            ):
+                parser.parse_args(["not-a-command"])
+        finally:
+            writer.close()
+            final_flags = MODULE._fcntl_get_flags(write_fd)
+            os.close(write_fd)
+            os.close(read_fd)
+
+        self.assertEqual(raised.exception.code, 2)
+        self.assertLess(time.monotonic() - started, 0.5)
+        self.assertEqual(final_flags, original_flags)
+
+    def test_timerless_publisher_restores_flags_before_selector_close_failure(
+        self,
+    ) -> None:
+        read_fd, write_fd, writer, original_flags = self._full_pipe_writer()
+        selector = mock.Mock()
+        selector.select.return_value = []
+        selector.close.side_effect = OSError(errno.EIO, "injected close failure")
+        try:
+            with (
+                mock.patch.object(
+                    MODULE.selectors,
+                    "DefaultSelector",
+                    return_value=selector,
+                ),
+                self.assertRaisesRegex(OSError, "injected close failure"),
+            ):
+                MODULE._publish_terminal_line_without_timer(
+                    "error=injected\n",
+                    writer,
+                )
+        finally:
+            writer.close()
+            final_flags = MODULE._fcntl_get_flags(write_fd)
+            os.close(write_fd)
+            os.close(read_fd)
+
+        self.assertEqual(final_flags, original_flags)
+        selector.register.assert_called_once()
+        selector.close.assert_called_once()
+
+    def test_timerless_publisher_bounds_fcntl_get_interrupt_retries(self) -> None:
+        read_fd, write_fd, writer, original_flags = self._full_pipe_writer()
+        started = time.monotonic()
+        try:
+            with (
+                mock.patch.object(
+                    MODULE.fcntl,
+                    "fcntl",
+                    side_effect=InterruptedError("injected interruption"),
+                ),
+                self.assertRaises(OSError) as raised,
+            ):
+                MODULE._publish_terminal_line_without_timer(
+                    "error=injected\n",
+                    writer,
+                )
+        finally:
+            writer.close()
+            final_flags = MODULE._fcntl_get_flags(write_fd)
+            os.close(write_fd)
+            os.close(read_fd)
+
+        self.assertEqual(raised.exception.errno, errno.ETIMEDOUT)
+        self.assertLess(time.monotonic() - started, 0.5)
+        self.assertEqual(final_flags, original_flags)
+
+    def test_timerless_publisher_bounds_fcntl_set_interrupt_retries(self) -> None:
+        read_fd, write_fd, writer, original_flags = self._full_pipe_writer()
+        real_fcntl = MODULE.fcntl.fcntl
+
+        def interrupt_nonblocking_set(
+            fd: int,
+            operation: int,
+            argument: int = 0,
+        ) -> int:
+            if operation == MODULE.fcntl.F_SETFL and argument & os.O_NONBLOCK:
+                raise InterruptedError("injected interruption")
+            if operation == MODULE.fcntl.F_GETFL:
+                return int(real_fcntl(fd, operation))
+            return int(real_fcntl(fd, operation, argument))
+
+        started = time.monotonic()
+        try:
+            with (
+                mock.patch.object(
+                    MODULE.fcntl,
+                    "fcntl",
+                    side_effect=interrupt_nonblocking_set,
+                ),
+                self.assertRaises(OSError) as raised,
+            ):
+                MODULE._publish_terminal_line_without_timer(
+                    "error=injected\n",
+                    writer,
+                )
+        finally:
+            writer.close()
+            final_flags = MODULE._fcntl_get_flags(write_fd)
+            os.close(write_fd)
+            os.close(read_fd)
+
+        self.assertEqual(raised.exception.errno, errno.ETIMEDOUT)
+        self.assertLess(time.monotonic() - started, 0.5)
+        self.assertEqual(final_flags, original_flags)
+
+    def test_timerless_publisher_retries_restore_fcntl_interruptions(self) -> None:
+        read_fd, write_fd, writer, original_flags = self._full_pipe_writer()
+        real_fcntl = MODULE.fcntl.fcntl
+        state = {
+            "nonblocking_set": False,
+            "restore_get_interruptions": 3,
+            "restore_set_interruptions": 3,
+        }
+
+        def interrupt_restore(
+            fd: int,
+            operation: int,
+            argument: int = 0,
+        ) -> int:
+            if operation == MODULE.fcntl.F_GETFL:
+                if state["nonblocking_set"] and state["restore_get_interruptions"] > 0:
+                    state["restore_get_interruptions"] -= 1
+                    raise InterruptedError("injected restore get interruption")
+                return int(real_fcntl(fd, operation))
+            if argument & os.O_NONBLOCK:
+                result = int(real_fcntl(fd, operation, argument))
+                state["nonblocking_set"] = True
+                return result
+            if state["nonblocking_set"] and state["restore_set_interruptions"] > 0:
+                state["restore_set_interruptions"] -= 1
+                raise InterruptedError("injected restore set interruption")
+            result = int(real_fcntl(fd, operation, argument))
+            state["nonblocking_set"] = False
+            return result
+
+        try:
+            with mock.patch.object(
+                MODULE.fcntl,
+                "fcntl",
+                side_effect=interrupt_restore,
+            ):
+                published = MODULE._publish_terminal_line_without_timer(
+                    "error=injected\n",
+                    writer,
+                )
+        finally:
+            writer.close()
+            final_flags = MODULE._fcntl_get_flags(write_fd)
+            os.close(write_fd)
+            os.close(read_fd)
+
+        self.assertFalse(published)
+        self.assertEqual(state["restore_get_interruptions"], 0)
+        self.assertEqual(state["restore_set_interruptions"], 0)
+        self.assertFalse(state["nonblocking_set"])
+        self.assertEqual(final_flags, original_flags)
+
+    def test_timerless_publisher_rejects_non_tty_character_device(self) -> None:
+        with (
+            open(os.devnull, "w", encoding="utf-8") as stream,
+            mock.patch.object(MODULE.os, "write") as writer,
+        ):
+            published = MODULE._publish_terminal_line_without_timer(
+                "error=injected\n",
+                stream,
+            )
+
+        self.assertFalse(published)
+        writer.assert_not_called()
+
+    @unittest.skipUnless(
         all(
             hasattr(signal, name)
             for name in (
@@ -3283,6 +3591,10 @@ class BugTriageDocumentationTests(unittest.TestCase):
         self.assertIn("immutable hard ceilings", recipe)
         self.assertIn("30-second process-timer deadline", recipe)
         self.assertIn("validation drain", recipe)
+        self.assertIn("temporarily enables\n`O_NONBLOCK`", recipe)
+        self.assertIn("validated FIFO, socket, or terminal descriptor", recipe)
+        self.assertIn("monotonic 100-millisecond poll\nbudget", recipe)
+        self.assertIn("original descriptor blocking state", recipe)
         self.assertIn("protects archive object identity", recipe)
         self.assertIn("Before constructing Python `ZipInfo` objects", recipe)
         self.assertIn("binds each central record to\none matching local record", recipe)
@@ -3356,6 +3668,11 @@ class BugTriageDocumentationTests(unittest.TestCase):
         self.assertIn("stores no fabricated completion\nreceipt", migration)
         self.assertIn("classification=blocked_until_trusted", migration)
         self.assertIn("exact SHA-256 of the receipt bytes", migration)
+        self.assertIn(
+            "immediately rejects anything other than a regular file", migration
+        )
+        self.assertIn("limits integers to 64 digits", migration)
+        self.assertIn("require exact JSON scalar and container types", migration)
         self.assertIn("does not authenticate where the caller obtained", migration)
 
     def test_private_migration_fixture_binds_atomic_aggregate_cutover(self) -> None:
@@ -3553,7 +3870,159 @@ class BugTriageDocumentationTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1, result.stderr)
         outcome = json.loads(result.stdout)
         self.assertEqual(outcome["classification"], "blocked_until_trusted")
-        self.assertIn("exact aggregate transaction", outcome["reason"])
+        self.assertIn("activation.atomic", outcome["reason"])
+
+    def test_cutover_validator_requires_exact_contract_scalar_types(self) -> None:
+        fixture = json.loads(MIGRATION_FIXTURE_PATH.read_text(encoding="utf-8"))
+        cases = (
+            ("schema-float", ("schema_version",), 2.0),
+            (
+                "routing-integer",
+                ("canonical_merge_changes_installed_routing",),
+                0,
+            ),
+            ("atomic-integer", ("activation", "atomic"), 1),
+            (
+                "nested-string-boolean",
+                ("activation", "provider", "source"),
+                True,
+            ),
+            ("trust-gates-object", ("trust_gates",), {"gate": "passed"}),
+            (
+                "receipt-schema-boolean",
+                ("receipt_admission", "receipt_schema_version"),
+                True,
+            ),
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            for label, path, replacement in cases:
+                with self.subTest(case=label):
+                    contract = json.loads(json.dumps(fixture))
+                    target = contract
+                    for component in path[:-1]:
+                        target = target[component]
+                    target[path[-1]] = replacement
+                    contract_path = Path(temp_dir) / f"{label}.json"
+                    contract_path.write_text(
+                        json.dumps(contract),
+                        encoding="utf-8",
+                    )
+                    result = self._run_cutover_validator(
+                        contract_path=contract_path,
+                    )
+
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    self.assertEqual(result.stderr, "")
+                    outcome = json.loads(result.stdout)
+                    self.assertEqual(
+                        outcome["classification"],
+                        "blocked_until_trusted",
+                    )
+
+    def test_cutover_validator_requires_exact_receipt_scalar_types(self) -> None:
+        fixture = json.loads(MIGRATION_FIXTURE_PATH.read_text(encoding="utf-8"))
+        cases = (
+            ("schema-boolean", ("schema_version",), True),
+            ("atomic-integer", ("activation", "atomic"), 1),
+            ("gate-status-boolean", ("gates", 0, "status"), True),
+            ("digest-boolean", ("release_manifest_sha256",), True),
+            ("pointer-name-boolean", ("installed_pointer", "name"), True),
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            for label, path, replacement in cases:
+                with self.subTest(case=label):
+                    receipt = self._matching_cutover_receipt(
+                        json.loads(json.dumps(fixture))
+                    )
+                    target = receipt
+                    for component in path[:-1]:
+                        target = target[component]
+                    target[path[-1]] = replacement
+                    receipt_path = Path(temp_dir) / f"{label}.json"
+                    receipt_sha256 = self._write_cutover_receipt(
+                        receipt_path,
+                        receipt,
+                    )
+                    result = self._run_cutover_validator(
+                        receipt_path=receipt_path,
+                        receipt_sha256=receipt_sha256,
+                    )
+
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    self.assertEqual(result.stderr, "")
+                    outcome = json.loads(result.stdout)
+                    self.assertEqual(
+                        outcome["classification"],
+                        "blocked_until_trusted",
+                    )
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "requires POSIX FIFO support")
+    def test_cutover_validator_rejects_fifo_inputs_without_waiting(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            for label in ("contract", "receipt"):
+                with self.subTest(input=label):
+                    input_path = Path(temp_dir) / f"{label}.fifo"
+                    os.mkfifo(input_path)
+                    started = time.monotonic()
+                    if label == "contract":
+                        result = self._run_cutover_validator(
+                            contract_path=input_path,
+                        )
+                    else:
+                        result = self._run_cutover_validator(
+                            receipt_path=input_path,
+                            receipt_sha256="4" * 64,
+                        )
+                    elapsed = time.monotonic() - started
+
+                    self.assertLess(elapsed, 1.0)
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    self.assertEqual(result.stderr, "")
+                    self.assertEqual(len(result.stdout.splitlines()), 1)
+                    outcome = json.loads(result.stdout)
+                    self.assertEqual(
+                        outcome["classification"],
+                        "blocked_until_trusted",
+                    )
+                    self.assertIn("regular file", outcome["reason"])
+
+    def test_cutover_validator_caps_deep_json_without_traceback(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            contract_path = Path(temp_dir) / "deep-contract.json"
+            contract_path.write_text(
+                ("[" * 65) + "0" + ("]" * 65),
+                encoding="utf-8",
+            )
+            result = self._run_cutover_validator(
+                contract_path=contract_path,
+            )
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(len(result.stdout.splitlines()), 1)
+        self.assertLessEqual(len(result.stdout), 1_200)
+        outcome = json.loads(result.stdout)
+        self.assertEqual(outcome["classification"], "blocked_until_trusted")
+        self.assertIn("max JSON depth", outcome["reason"])
+
+    def test_cutover_validator_caps_huge_integer_without_traceback(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            contract_path = Path(temp_dir) / "huge-integer-contract.json"
+            contract_path.write_text(
+                '{"schema_version":' + ("9" * 5_000) + "}",
+                encoding="utf-8",
+            )
+            result = self._run_cutover_validator(
+                contract_path=contract_path,
+            )
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(len(result.stdout.splitlines()), 1)
+        self.assertLessEqual(len(result.stdout), 1_200)
+        outcome = json.loads(result.stdout)
+        self.assertEqual(outcome["classification"], "blocked_until_trusted")
+        self.assertIn("integer exceeds max digits", outcome["reason"])
 
 
 if __name__ == "__main__":

@@ -9,12 +9,19 @@ import os
 import pathlib
 import re
 import stat
+import time
 from typing import Any
-
 
 CONTRACT_SCHEMA_VERSION = 2
 RECEIPT_SCHEMA_VERSION = 1
 DEFAULT_MAX_JSON_BYTES = 64 * 1024
+JSON_READ_TIMEOUT_SECONDS = 1.0
+MAX_JSON_DEPTH = 64
+MAX_JSON_CONTAINERS = 1_024
+MAX_JSON_NODES = 4_096
+MAX_JSON_CONTAINER_ITEMS = 1_024
+MAX_JSON_INTEGER_DIGITS = 64
+MAX_JSON_STRING_CHARS = 32 * 1024
 MAX_BLOCKED_REASON_CHARS = 1_024
 SHA1_PATTERN = re.compile(r"[0-9a-f]{40}")
 SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
@@ -70,6 +77,20 @@ def _reject_json_constant(value: str) -> None:
     raise ReceiptAdmissionError(f"non-finite JSON value is forbidden: {value}")
 
 
+def _reject_json_float(value: str) -> None:
+    raise ReceiptAdmissionError(f"JSON floating-point value is forbidden: {value}")
+
+
+def _parse_bounded_json_integer(value: str) -> int:
+    digits = value.removeprefix("-")
+    if len(digits) > MAX_JSON_INTEGER_DIGITS:
+        raise ReceiptAdmissionError(
+            "JSON integer exceeds max digits: "
+            f"{len(digits)} > {MAX_JSON_INTEGER_DIGITS}"
+        )
+    return int(value)
+
+
 def _object_without_duplicates(
     pairs: list[tuple[str, Any]],
 ) -> dict[str, Any]:
@@ -81,15 +102,120 @@ def _object_without_duplicates(
     return result
 
 
+def _check_json_structure(decoded: str, *, label: str) -> None:
+    depth = 0
+    containers = 0
+    in_string = False
+    escaped = False
+    for character in decoded:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+            continue
+        if character == '"':
+            in_string = True
+        elif character in "[{":
+            depth += 1
+            containers += 1
+            if depth > MAX_JSON_DEPTH:
+                raise ReceiptAdmissionError(
+                    f"{label} exceeds max JSON depth: {depth} > {MAX_JSON_DEPTH}"
+                )
+            if containers > MAX_JSON_CONTAINERS:
+                raise ReceiptAdmissionError(
+                    f"{label} exceeds max JSON containers: "
+                    f"{containers} > {MAX_JSON_CONTAINERS}"
+                )
+        elif character in "]}":
+            depth = max(0, depth - 1)
+
+
+def _check_json_resources(parsed: object, *, label: str) -> None:
+    nodes = 0
+    pending: list[tuple[object, int]] = [(parsed, 1)]
+    while pending:
+        value, depth = pending.pop()
+        nodes += 1
+        if nodes > MAX_JSON_NODES:
+            raise ReceiptAdmissionError(
+                f"{label} exceeds max JSON nodes: {nodes} > {MAX_JSON_NODES}"
+            )
+        if type(value) is dict:
+            if depth > MAX_JSON_DEPTH:
+                raise ReceiptAdmissionError(
+                    f"{label} exceeds max JSON depth: {depth} > {MAX_JSON_DEPTH}"
+                )
+            if len(value) > MAX_JSON_CONTAINER_ITEMS:
+                raise ReceiptAdmissionError(
+                    f"{label} object exceeds max items: "
+                    f"{len(value)} > {MAX_JSON_CONTAINER_ITEMS}"
+                )
+            for key, item in value.items():
+                if type(key) is not str:
+                    raise ReceiptAdmissionError(
+                        f"{label} object key must be an exact string"
+                    )
+                if len(key) > MAX_JSON_STRING_CHARS:
+                    raise ReceiptAdmissionError(
+                        f"{label} object key exceeds max characters"
+                    )
+                nodes += 1
+                if nodes > MAX_JSON_NODES:
+                    raise ReceiptAdmissionError(
+                        f"{label} exceeds max JSON nodes: {nodes} > {MAX_JSON_NODES}"
+                    )
+                pending.append((item, depth + 1))
+        elif type(value) is list:
+            if depth > MAX_JSON_DEPTH:
+                raise ReceiptAdmissionError(
+                    f"{label} exceeds max JSON depth: {depth} > {MAX_JSON_DEPTH}"
+                )
+            if len(value) > MAX_JSON_CONTAINER_ITEMS:
+                raise ReceiptAdmissionError(
+                    f"{label} array exceeds max items: "
+                    f"{len(value)} > {MAX_JSON_CONTAINER_ITEMS}"
+                )
+            pending.extend((item, depth + 1) for item in value)
+        elif type(value) is str:
+            if len(value) > MAX_JSON_STRING_CHARS:
+                raise ReceiptAdmissionError(
+                    f"{label} string exceeds max characters: "
+                    f"{len(value)} > {MAX_JSON_STRING_CHARS}"
+                )
+        elif type(value) not in (int, bool, type(None)):
+            raise ReceiptAdmissionError(
+                f"{label} contains an unsupported JSON scalar type"
+            )
+
+
+def _check_read_deadline(deadline: float, *, label: str, operation: str) -> None:
+    if time.monotonic() >= deadline:
+        raise ReceiptAdmissionError(
+            f"{label} exceeded read deadline during {operation}"
+        )
+
+
 def _read_exact_json(
     path: pathlib.Path,
     *,
     label: str,
     max_bytes: int,
 ) -> tuple[dict[str, Any], str]:
-    flags = os.O_RDONLY
+    deadline = time.monotonic() + JSON_READ_TIMEOUT_SECONDS
+    missing_flags = [
+        name for name in ("O_NOFOLLOW", "O_NONBLOCK") if not hasattr(os, name)
+    ]
+    if missing_flags:
+        raise ReceiptAdmissionError(
+            f"{label} safe open flags are unavailable: {','.join(missing_flags)}"
+        )
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
     flags |= getattr(os, "O_CLOEXEC", 0)
-    flags |= getattr(os, "O_NOFOLLOW", 0)
+    _check_read_deadline(deadline, label=label, operation="open")
     try:
         fd = os.open(path, flags)
     except OSError as error:
@@ -97,7 +223,9 @@ def _read_exact_json(
             f"{label} could not be opened safely: {error.strerror or error}"
         ) from error
     try:
+        _check_read_deadline(deadline, label=label, operation="open")
         metadata = os.fstat(fd)
+        _check_read_deadline(deadline, label=label, operation="initial metadata")
         if not stat.S_ISREG(metadata.st_mode):
             raise ReceiptAdmissionError(f"{label} must be a regular file")
         if metadata.st_size > max_bytes:
@@ -107,7 +235,14 @@ def _read_exact_json(
         chunks: list[bytes] = []
         total = 0
         while True:
-            chunk = os.read(fd, min(16 * 1024, max_bytes + 1 - total))
+            _check_read_deadline(deadline, label=label, operation="read")
+            try:
+                chunk = os.read(fd, min(16 * 1024, max_bytes + 1 - total))
+            except BlockingIOError as error:
+                raise ReceiptAdmissionError(
+                    f"{label} could not be read without blocking"
+                ) from error
+            _check_read_deadline(deadline, label=label, operation="read")
             if not chunk:
                 break
             chunks.append(chunk)
@@ -115,6 +250,7 @@ def _read_exact_json(
             if total > max_bytes:
                 raise ReceiptAdmissionError(f"{label} exceeds max bytes while reading")
         final_metadata = os.fstat(fd)
+        _check_read_deadline(deadline, label=label, operation="final metadata")
         if (
             final_metadata.st_dev != metadata.st_dev
             or final_metadata.st_ino != metadata.st_ino
@@ -129,14 +265,26 @@ def _read_exact_json(
     digest = hashlib.sha256(raw).hexdigest()
     try:
         decoded = raw.decode("utf-8")
+        _check_json_structure(decoded, label=label)
         parsed = json.loads(
             decoded,
             object_pairs_hook=_object_without_duplicates,
             parse_constant=_reject_json_constant,
+            parse_float=_reject_json_float,
+            parse_int=_parse_bounded_json_integer,
         )
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+    except ReceiptAdmissionError:
+        raise
+    except (
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        RecursionError,
+        ValueError,
+        OverflowError,
+    ) as error:
         raise ReceiptAdmissionError(f"{label} is not strict UTF-8 JSON") from error
-    if not isinstance(parsed, dict):
+    _check_json_resources(parsed, label=label)
+    if type(parsed) is not dict:
         raise ReceiptAdmissionError(f"{label} root must be an object")
     return parsed, digest
 
@@ -147,7 +295,7 @@ def _require_exact_keys(
     *,
     label: str,
 ) -> dict[str, Any]:
-    if not isinstance(value, dict):
+    if type(value) is not dict:
         raise ReceiptAdmissionError(f"{label} must be an object")
     actual = set(value)
     if actual != expected:
@@ -160,9 +308,39 @@ def _require_exact_keys(
 
 
 def _require_string(value: object, *, label: str) -> str:
-    if not isinstance(value, str) or not value:
+    if type(value) is not str or not value:
         raise ReceiptAdmissionError(f"{label} must be a non-empty string")
     return value
+
+
+def _require_exact_json(value: object, expected: object, *, label: str) -> None:
+    if type(value) is not type(expected):
+        raise ReceiptAdmissionError(f"{label} has the wrong exact JSON type")
+    if type(expected) is dict:
+        actual_object = _require_exact_keys(
+            value,
+            set(expected),
+            label=label,
+        )
+        for key, expected_item in expected.items():
+            _require_exact_json(
+                actual_object[key],
+                expected_item,
+                label=f"{label}.{key}",
+            )
+        return
+    if type(expected) is list:
+        if len(value) != len(expected):
+            raise ReceiptAdmissionError(f"{label} has the wrong array length")
+        for index, (actual_item, expected_item) in enumerate(zip(value, expected)):
+            _require_exact_json(
+                actual_item,
+                expected_item,
+                label=f"{label}[{index}]",
+            )
+        return
+    if value != expected:
+        raise ReceiptAdmissionError(f"{label} differs from the exact expected value")
 
 
 def _require_sha1(value: object, *, label: str) -> str:
@@ -195,70 +373,48 @@ def _validate_contract(contract: dict[str, Any]) -> dict[str, Any]:
         },
         label="contract",
     )
-    if contract["schema_version"] != CONTRACT_SCHEMA_VERSION:
-        raise ReceiptAdmissionError("contract schema_version is not supported")
-    if contract["canonical_merge_changes_installed_routing"] is not False:
-        raise ReceiptAdmissionError(
-            "contract must keep canonical merge routing inactive"
-        )
-    if contract["canonical_repository"] != EXPECTED_CANONICAL_REPOSITORY:
-        raise ReceiptAdmissionError(
-            "contract canonical repository is not the exact expected repository"
-        )
-    if (
-        contract["private_aggregate_repository"]
-        != EXPECTED_PRIVATE_AGGREGATE_REPOSITORY
-    ):
-        raise ReceiptAdmissionError(
-            "contract private repository is not the exact expected repository"
-        )
-    _require_exact_keys(
+    _require_exact_json(
+        contract["schema_version"],
+        CONTRACT_SCHEMA_VERSION,
+        label="contract schema_version",
+    )
+    _require_exact_json(
+        contract["canonical_merge_changes_installed_routing"],
+        False,
+        label="contract canonical_merge_changes_installed_routing",
+    )
+    _require_exact_json(
+        contract["canonical_repository"],
+        EXPECTED_CANONICAL_REPOSITORY,
+        label="contract canonical_repository",
+    )
+    _require_exact_json(
+        contract["private_aggregate_repository"],
+        EXPECTED_PRIVATE_AGGREGATE_REPOSITORY,
+        label="contract private_aggregate_repository",
+    )
+    _require_exact_json(
         contract["activation"],
-        {
-            "release_kind",
-            "atomic",
-            "provider",
-            "routing_policy",
-            "catalog",
-            "removed_link",
-        },
+        EXPECTED_ACTIVATION,
         label="contract activation",
     )
-    if contract["activation"] != EXPECTED_ACTIVATION:
-        raise ReceiptAdmissionError(
-            "contract activation is not the exact aggregate transaction"
-        )
     gates = contract["trust_gates"]
-    if (
-        not isinstance(gates, list)
-        or not gates
-        or any(not isinstance(gate, str) or not gate for gate in gates)
-        or len(set(gates)) != len(gates)
-    ):
-        raise ReceiptAdmissionError(
-            "contract trust_gates must be unique non-empty strings"
-        )
-    if gates != EXPECTED_TRUST_GATES:
-        raise ReceiptAdmissionError(
-            "contract trust_gates differ from the exact required gates"
-        )
+    _require_exact_json(
+        gates,
+        EXPECTED_TRUST_GATES,
+        label="contract trust_gates",
+    )
     blocked = contract["blocked_until_trusted"]
-    if (
-        not isinstance(blocked, list)
-        or not blocked
-        or any(not isinstance(item, str) or not item for item in blocked)
-    ):
-        raise ReceiptAdmissionError(
-            "contract blocked_until_trusted must be non-empty strings"
-        )
-    if blocked != EXPECTED_BLOCKED_TARGETS:
-        raise ReceiptAdmissionError(
-            "contract blocked targets differ from the exact cutover targets"
-        )
-    if contract["unproved_atomicity_fallback"] != "retain-bug-triage-compat":
-        raise ReceiptAdmissionError(
-            "contract fallback must retain bug-triage compatibility"
-        )
+    _require_exact_json(
+        blocked,
+        EXPECTED_BLOCKED_TARGETS,
+        label="contract blocked_until_trusted",
+    )
+    _require_exact_json(
+        contract["unproved_atomicity_fallback"],
+        "retain-bug-triage-compat",
+        label="contract unproved_atomicity_fallback",
+    )
     admission = _require_exact_keys(
         contract["receipt_admission"],
         {
@@ -283,10 +439,11 @@ def _validate_contract(contract: dict[str, Any]) -> dict[str, Any]:
         "pointer_target_template": "releases/{private_release_commit}",
         "required_exact_inputs": REQUIRED_EXACT_INPUTS,
     }
-    if admission != expected_admission:
-        raise ReceiptAdmissionError(
-            "contract receipt_admission does not match the validator contract"
-        )
+    _require_exact_json(
+        admission,
+        expected_admission,
+        label="contract receipt_admission",
+    )
     return contract
 
 
@@ -314,15 +471,21 @@ def _validate_receipt(
         },
         label="receipt",
     )
-    if receipt["schema_version"] != RECEIPT_SCHEMA_VERSION:
-        raise ReceiptAdmissionError("receipt schema_version is not supported")
-    if receipt["canonical_repository"] != contract["canonical_repository"]:
-        raise ReceiptAdmissionError("receipt canonical repository differs")
-    if (
-        receipt["private_aggregate_repository"]
-        != contract["private_aggregate_repository"]
-    ):
-        raise ReceiptAdmissionError("receipt private repository differs")
+    _require_exact_json(
+        receipt["schema_version"],
+        RECEIPT_SCHEMA_VERSION,
+        label="receipt schema_version",
+    )
+    _require_exact_json(
+        receipt["canonical_repository"],
+        contract["canonical_repository"],
+        label="receipt canonical_repository",
+    )
+    _require_exact_json(
+        receipt["private_aggregate_repository"],
+        contract["private_aggregate_repository"],
+        label="receipt private_aggregate_repository",
+    )
     if (
         _require_sha1(
             receipt["canonical_commit"],
@@ -348,16 +511,20 @@ def _validate_receipt(
     ):
         raise ReceiptAdmissionError("receipt release manifest digest differs")
     expected_target = f"releases/{expected_private_release_commit}"
-    if receipt["release_target"] != expected_target:
-        raise ReceiptAdmissionError("receipt immutable release target differs")
-    if receipt["activation"] != contract["activation"]:
-        raise ReceiptAdmissionError(
-            "receipt activation aggregate differs from the contract"
-        )
+    _require_exact_json(
+        receipt["release_target"],
+        expected_target,
+        label="receipt release_target",
+    )
+    _require_exact_json(
+        receipt["activation"],
+        contract["activation"],
+        label="receipt activation",
+    )
 
     gate_names = contract["trust_gates"]
     gates = receipt["gates"]
-    if not isinstance(gates, list) or len(gates) != len(gate_names):
+    if type(gates) is not list or len(gates) != len(gate_names):
         raise ReceiptAdmissionError("receipt gates do not cover the exact gate set")
     for expected_name, gate_value in zip(gate_names, gates):
         gate = _require_exact_keys(
@@ -370,15 +537,16 @@ def _validate_receipt(
             },
             label=f"receipt gate {expected_name}",
         )
-        if gate != {
-            "name": expected_name,
-            "status": "passed",
-            "private_release_commit": expected_private_release_commit,
-            "release_manifest_sha256": expected_release_manifest_sha256,
-        }:
-            raise ReceiptAdmissionError(
-                f"receipt gate is not exact and passed: {expected_name}"
-            )
+        _require_exact_json(
+            gate,
+            {
+                "name": expected_name,
+                "status": "passed",
+                "private_release_commit": expected_private_release_commit,
+                "release_manifest_sha256": expected_release_manifest_sha256,
+            },
+            label=f"receipt gate {expected_name}",
+        )
 
     pointer = _require_exact_keys(
         receipt["installed_pointer"],
@@ -388,17 +556,18 @@ def _validate_receipt(
             "resolved_release_commit",
             "release_manifest_sha256",
         },
-        label="receipt installed_pointer",
+        label="receipt installed pointer",
     )
-    if pointer != {
-        "name": "current",
-        "target": expected_target,
-        "resolved_release_commit": expected_private_release_commit,
-        "release_manifest_sha256": expected_release_manifest_sha256,
-    }:
-        raise ReceiptAdmissionError(
-            "receipt installed pointer does not resolve to the exact release"
-        )
+    _require_exact_json(
+        pointer,
+        {
+            "name": "current",
+            "target": expected_target,
+            "resolved_release_commit": expected_private_release_commit,
+            "release_manifest_sha256": expected_release_manifest_sha256,
+        },
+        label="receipt installed pointer",
+    )
     return expected_target
 
 

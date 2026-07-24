@@ -123,9 +123,17 @@ alarm, restores the prior handler, and only then restores the caller's signal
 mask. Runtime and argument errors use one terminal-safe line capped at 8,192
 characters. After the deadline first expires, the same process timer repeats at
 a short fixed interval until cleanup so a blocked diagnostic write is
-interrupted rather than retried after timer shutdown. `--encoding` accepts at
-most 64 ASCII letters, digits, dots, underscores, plus signs, or hyphens and
-must resolve through Python's codec registry.
+interrupted rather than retried after timer shutdown. If the timer cannot be
+armed because `SIGALRM` is blocked or pending or another timer is active, the
+error path avoids ordinary stream writes and flushes. It temporarily enables
+`O_NONBLOCK` only on a validated FIFO, socket, or terminal descriptor,
+publishes at most one bounded line under a monotonic 100-millisecond poll
+budget, and restores the caller's original descriptor blocking state under a
+separate bounded cleanup budget. Interrupted `fcntl` setup and restoration
+cannot retry indefinitely; when no safe descriptor is available it returns
+without risking a blocking diagnostic. `--encoding` accepts at most 64 ASCII
+letters, digits, dots, underscores, plus signs, or hyphens and must resolve
+through Python's codec registry.
 
 The helper opens the archive once, records the initially accepted file size,
 and holds that file descriptor through member selection and reading. Its

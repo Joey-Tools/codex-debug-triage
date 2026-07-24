@@ -8,6 +8,7 @@ import binascii
 import codecs
 import collections
 import contextlib
+import errno
 import io
 import json
 import os
@@ -25,6 +26,11 @@ import unicodedata
 import zipfile
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
+
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
 
 try:
     import zlib
@@ -74,6 +80,10 @@ AMBIGUITY_NOTICE_RESERVE_CHARS = 128
 TRUNCATION_MARKER = "... [truncated]"
 ARCHIVE_DEADLINE_RETRY_SECONDS = 0.1
 MAX_PENDING_ALARM_DRAINS = 8
+FALLBACK_DIAGNOSTIC_TIMEOUT_SECONDS = 0.1
+FALLBACK_DIAGNOSTIC_RESTORE_TIMEOUT_SECONDS = 0.1
+FALLBACK_DIAGNOSTIC_MAX_BYTES = 4 * 1024
+FALLBACK_DIAGNOSTIC_MIN_BYTES = 512
 EOCD_SIGNATURE = b"PK\x05\x06"
 EOCD_MIN_SIZE = 22
 EOCD_MAX_COMMENT = 65_535
@@ -739,6 +749,171 @@ def _bounded_terminal_escape(value: str, max_chars: int) -> str:
     return "".join(escaped)
 
 
+def _fcntl_retry_timeout(
+    deadline: float | None,
+    *,
+    operation: str,
+    error: InterruptedError,
+) -> None:
+    if deadline is not None and time.monotonic() >= deadline:
+        raise OSError(
+            errno.ETIMEDOUT,
+            f"diagnostic publisher timed out during {operation}",
+        ) from error
+
+
+def _fcntl_get_flags(fd: int, *, deadline: float | None = None) -> int:
+    if fcntl is None:
+        raise OSError(errno.ENOSYS, "fcntl is unavailable")
+    while True:
+        try:
+            return int(fcntl.fcntl(fd, fcntl.F_GETFL))
+        except InterruptedError as error:
+            _fcntl_retry_timeout(
+                deadline,
+                operation="F_GETFL",
+                error=error,
+            )
+            continue
+
+
+def _fcntl_set_flags(
+    fd: int,
+    flags: int,
+    *,
+    deadline: float | None = None,
+) -> None:
+    if fcntl is None:
+        raise OSError(errno.ENOSYS, "fcntl is unavailable")
+    while True:
+        try:
+            fcntl.fcntl(fd, fcntl.F_SETFL, flags)
+            return
+        except InterruptedError as error:
+            _fcntl_retry_timeout(
+                deadline,
+                operation="F_SETFL",
+                error=error,
+            )
+            continue
+
+
+def _restore_fd_nonblocking_state(
+    fd: int,
+    *,
+    originally_nonblocking: bool,
+    deadline: float | None = None,
+) -> None:
+    current_flags = _fcntl_get_flags(fd, deadline=deadline)
+    if originally_nonblocking:
+        restored_flags = current_flags | os.O_NONBLOCK
+    else:
+        restored_flags = current_flags & ~os.O_NONBLOCK
+    if restored_flags != current_flags:
+        _fcntl_set_flags(fd, restored_flags, deadline=deadline)
+    verified_flags = _fcntl_get_flags(fd, deadline=deadline)
+    if bool(verified_flags & os.O_NONBLOCK) != originally_nonblocking:
+        raise OSError(
+            errno.EIO,
+            "diagnostic publisher could not restore O_NONBLOCK",
+        )
+
+
+def _bounded_diagnostic_payload(payload: str, fd: int) -> bytes:
+    encoded = payload.encode("ascii", errors="backslashreplace")
+    try:
+        pipe_buf = int(os.fpathconf(fd, "PC_PIPE_BUF"))
+    except (OSError, ValueError):
+        pipe_buf = FALLBACK_DIAGNOSTIC_MAX_BYTES
+    byte_limit = min(
+        FALLBACK_DIAGNOSTIC_MAX_BYTES,
+        max(FALLBACK_DIAGNOSTIC_MIN_BYTES, pipe_buf),
+    )
+    if len(encoded) <= byte_limit:
+        return encoded
+    marker = f"{TRUNCATION_MARKER}\n".encode("ascii")
+    return encoded[: byte_limit - len(marker)] + marker
+
+
+def _publish_terminal_line_without_timer(
+    payload: str,
+    stream: io.TextIOBase,
+) -> bool:
+    """Best-effort one-line publication without a signal or blocking write."""
+
+    if type(stream) is io.StringIO:
+        stream.write(payload)
+        stream.flush()
+        return True
+    if fcntl is None or not hasattr(os, "O_NONBLOCK"):
+        return False
+    try:
+        fd = stream.fileno()
+    except (AttributeError, io.UnsupportedOperation, OSError, ValueError):
+        return False
+    if type(fd) is not int or fd < 0:
+        return False
+    try:
+        mode = os.fstat(fd).st_mode
+    except OSError:
+        return False
+    if not (
+        stat.S_ISFIFO(mode)
+        or stat.S_ISSOCK(mode)
+        or (stat.S_ISCHR(mode) and os.isatty(fd))
+    ):
+        return False
+
+    deadline = time.monotonic() + FALLBACK_DIAGNOSTIC_TIMEOUT_SECONDS
+    original_flags = _fcntl_get_flags(fd, deadline=deadline)
+    originally_nonblocking = bool(original_flags & os.O_NONBLOCK)
+    selector: selectors.BaseSelector | None = None
+    try:
+        if not originally_nonblocking:
+            _fcntl_set_flags(
+                fd,
+                original_flags | os.O_NONBLOCK,
+                deadline=deadline,
+            )
+        bounded_payload = _bounded_diagnostic_payload(payload, fd)
+        view = memoryview(bounded_payload)
+        while view:
+            if time.monotonic() >= deadline:
+                return False
+            try:
+                written = os.write(fd, view)
+            except InterruptedError:
+                continue
+            except BlockingIOError:
+                if selector is None:
+                    selector = selectors.DefaultSelector()
+                    try:
+                        selector.register(fd, selectors.EVENT_WRITE)
+                    except (KeyError, OSError, ValueError):
+                        return False
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not selector.select(remaining):
+                    return False
+                continue
+            if written <= 0:
+                return False
+            view = view[written:]
+        return True
+    finally:
+        restore_deadline = (
+            time.monotonic() + FALLBACK_DIAGNOSTIC_RESTORE_TIMEOUT_SECONDS
+        )
+        try:
+            _restore_fd_nonblocking_state(
+                fd,
+                originally_nonblocking=originally_nonblocking,
+                deadline=restore_deadline,
+            )
+        finally:
+            if selector is not None:
+                selector.close()
+
+
 def _write_terminal_line(
     prefix: str,
     value: object,
@@ -749,6 +924,9 @@ def _write_terminal_line(
     max_value_chars = HARD_MAX_ERROR_CHARS - len(prefix) - 1
     rendered = _bounded_terminal_escape(str(value), max_value_chars)
     payload = f"{prefix}{rendered}\n"
+    if deadline is None:
+        _publish_terminal_line_without_timer(payload, stream)
+        return
     written = stream.write(payload)
     if written is not None and written != len(payload):
         raise OSError("diagnostic stream accepted only part of the bounded payload")

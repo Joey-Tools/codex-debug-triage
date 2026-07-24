@@ -111,8 +111,17 @@ python3 scripts/validate_cisco_cutover_receipt.py \
   --expected-receipt-sha256 <64-lowercase-hex>
 ```
 
-The strict UTF-8 JSON receipt is capped at 65,536 bytes, rejects duplicate keys,
-and must bind all of the following without extra or missing fields:
+The validator opens both the contract and receipt with `O_NOFOLLOW` and
+`O_NONBLOCK`, immediately rejects anything other than a regular file, and
+checks a one-second monotonic budget before and after open, metadata, and each
+bounded read. A FIFO without a writer therefore fails closed instead of
+waiting. Each strict UTF-8 JSON document is capped at 65,536 bytes, rejects
+duplicate keys and floating-point values, limits integers to 64 digits, nesting
+to 64 containers, total containers to 1,024, and parsed structure to 4,096
+nodes. Schema comparisons require exact JSON scalar and container types, so a
+Boolean never substitutes for an integer and an integer never substitutes for
+a Boolean. The receipt must bind all of the following without extra or missing
+fields:
 
 1. schema version 1, the exact canonical/private repositories and commits, and
    the exact release-manifest digest
