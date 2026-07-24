@@ -1865,8 +1865,7 @@ class ArchiveTriageTests(unittest.TestCase):
             for termination_signal in (signal.SIGTERM, signal.SIGKILL):
                 with self.subTest(signal=termination_signal.name):
                     metadata_path = (
-                        Path(temp_dir)
-                        / f"worker-{termination_signal.name.lower()}.txt"
+                        Path(temp_dir) / f"worker-{termination_signal.name.lower()}.txt"
                     )
                     process = subprocess.Popen(
                         [
@@ -3834,6 +3833,7 @@ class ArchiveTriageTests(unittest.TestCase):
 
 
 class BugTriageDocumentationTests(unittest.TestCase):
+    _pull_request_number = 7
     _canonical_commit = "1" * 40
     _private_release_commit = "2" * 40
     _release_manifest_sha256 = "3" * 64
@@ -3845,11 +3845,26 @@ class BugTriageDocumentationTests(unittest.TestCase):
         "PR_BASE_REF",
         "PR_HEAD_REPOSITORY",
         "PR_HEAD_SHA",
+        "PR_NUMBER",
+        "SELECTED_TARGET_HEAD_SHA",
+        "SELECTED_TARGET_PR_NUMBER",
         "CISCO_CUTOVER_RECEIPT_BASE64",
         "CISCO_CUTOVER_EXPECTED_CANONICAL_COMMIT",
         "CISCO_CUTOVER_EXPECTED_PRIVATE_RELEASE_COMMIT",
         "CISCO_CUTOVER_EXPECTED_RELEASE_MANIFEST_SHA256",
         "CISCO_CUTOVER_EXPECTED_RECEIPT_SHA256",
+        "CISCO_CUTOVER_EXPECTED_WORKFLOW_ID",
+        "CISCO_CUTOVER_EXPECTED_WORKFLOW_SHA",
+    )
+    _selector_environment_names = (
+        "EVENT_REPOSITORY",
+        "PR_BASE_REF",
+        "PR_HEAD_REPOSITORY",
+        "PR_HEAD_SHA",
+        "PR_NUMBER",
+        "CISCO_CUTOVER_TARGET_HEAD_SHA",
+        "CISCO_CUTOVER_TARGET_PR_NUMBER",
+        "GITHUB_OUTPUT",
     )
 
     def _matching_cutover_receipt(
@@ -3858,13 +3873,35 @@ class BugTriageDocumentationTests(unittest.TestCase):
     ) -> dict[str, object]:
         release_target = f"releases/{self._private_release_commit}"
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "canonical_repository": fixture["canonical_repository"],
             "canonical_commit": self._canonical_commit,
             "private_aggregate_repository": fixture["private_aggregate_repository"],
             "private_release_commit": self._private_release_commit,
             "release_manifest_sha256": self._release_manifest_sha256,
             "release_target": release_target,
+            "cutover": {
+                "target_repository": {
+                    "id": 1242512092,
+                    "full_name": fixture["canonical_repository"],
+                    "default_branch": "master",
+                },
+                "pull_request": {
+                    "number": self._pull_request_number,
+                    "head_sha": self._canonical_commit,
+                    "base_ref": "master",
+                },
+                "required_workflow": {
+                    "id": self._workflow_id,
+                    "repository_id": 1242512092,
+                    "repository_full_name": fixture["canonical_repository"],
+                    "path": ".github/workflows/cisco-cutover-admission.yml",
+                    "ref": "refs/heads/master",
+                    "sha": self._workflow_source_commit,
+                    "event": "pull_request_target",
+                    "check_name": "cisco-cutover-admission",
+                },
+            },
             "activation": fixture["activation"],
             "gates": [
                 {
@@ -3920,12 +3957,18 @@ class BugTriageDocumentationTests(unittest.TestCase):
                     str(receipt_path),
                     "--expected-canonical-commit",
                     self._canonical_commit,
+                    "--expected-pull-request-number",
+                    str(self._pull_request_number),
                     "--expected-private-release-commit",
                     self._private_release_commit,
                     "--expected-release-manifest-sha256",
                     self._release_manifest_sha256,
                     "--expected-receipt-sha256",
                     receipt_sha256 or ("0" * 64),
+                    "--expected-workflow-id",
+                    str(self._workflow_id),
+                    "--expected-workflow-sha",
+                    self._workflow_source_commit,
                 ]
             )
         return subprocess.run(
@@ -3938,8 +3981,8 @@ class BugTriageDocumentationTests(unittest.TestCase):
 
     def _trusted_workflow_program(self) -> str:
         workflow = CUTOVER_TRUSTED_WORKFLOW_PATH.read_text(encoding="utf-8")
-        start_marker = "          python3 - <<'PY'\n"
-        end_marker = "\n          PY\n"
+        start_marker = "          python3 - <<'ADMISSION_PY'\n"
+        end_marker = "\n          ADMISSION_PY\n"
         self.assertEqual(workflow.count(start_marker), 1)
         self.assertEqual(workflow.count(end_marker), 1)
         embedded = workflow.split(start_marker, 1)[1].split(end_marker, 1)[0]
@@ -3948,10 +3991,21 @@ class BugTriageDocumentationTests(unittest.TestCase):
         self.assertTrue(
             all(not line or line.startswith("          ") for line in lines)
         )
-        return "\n".join(
-            line[10:] if line else ""
-            for line in lines
+        return "\n".join(line[10:] if line else "" for line in lines)
+
+    def _selector_workflow_program(self) -> str:
+        workflow = CUTOVER_TRUSTED_WORKFLOW_PATH.read_text(encoding="utf-8")
+        start_marker = "          python3 - <<'SELECTOR_PY'\n"
+        end_marker = "\n          SELECTOR_PY\n"
+        self.assertEqual(workflow.count(start_marker), 1)
+        self.assertEqual(workflow.count(end_marker), 1)
+        embedded = workflow.split(start_marker, 1)[1].split(end_marker, 1)[0]
+        lines = embedded.splitlines()
+        self.assertTrue(lines)
+        self.assertTrue(
+            all(not line or line.startswith("          ") for line in lines)
         )
+        return "\n".join(line[10:] if line else "" for line in lines)
 
     def _trusted_workflow_environment(
         self,
@@ -3970,6 +4024,9 @@ class BugTriageDocumentationTests(unittest.TestCase):
                 "PR_BASE_REF": "master",
                 "PR_HEAD_REPOSITORY": "Joey-Tools/codex-debug-triage",
                 "PR_HEAD_SHA": self._canonical_commit,
+                "PR_NUMBER": str(self._pull_request_number),
+                "SELECTED_TARGET_HEAD_SHA": self._canonical_commit,
+                "SELECTED_TARGET_PR_NUMBER": str(self._pull_request_number),
                 "CISCO_CUTOVER_RECEIPT_BASE64": base64.b64encode(
                     receipt_payload
                 ).decode("ascii"),
@@ -3983,6 +4040,42 @@ class BugTriageDocumentationTests(unittest.TestCase):
                 "CISCO_CUTOVER_EXPECTED_RECEIPT_SHA256": (
                     receipt_sha256 or hashlib.sha256(receipt_payload).hexdigest()
                 ),
+                "CISCO_CUTOVER_EXPECTED_WORKFLOW_ID": str(self._workflow_id),
+                "CISCO_CUTOVER_EXPECTED_WORKFLOW_SHA": (self._workflow_source_commit),
+            }
+        )
+        if overrides:
+            environment.update(overrides)
+        return environment
+
+    def _selector_workflow_environment(
+        self,
+        *,
+        output_path: Path,
+        current_pr_number: int | None = None,
+        current_head_sha: str | None = None,
+        target_pr_number: int | None = None,
+        target_head_sha: str | None = None,
+        overrides: dict[str, str] | None = None,
+    ) -> dict[str, str]:
+        environment = os.environ.copy()
+        for name in self._selector_environment_names:
+            environment.pop(name, None)
+        environment.update(
+            {
+                "GITHUB_REPOSITORY": "Joey-Tools/codex-debug-triage",
+                "EVENT_REPOSITORY": "Joey-Tools/codex-debug-triage",
+                "PR_BASE_REF": "master",
+                "PR_HEAD_REPOSITORY": "Joey-Tools/codex-debug-triage",
+                "PR_HEAD_SHA": current_head_sha or self._canonical_commit,
+                "PR_NUMBER": str(current_pr_number or self._pull_request_number),
+                "CISCO_CUTOVER_TARGET_HEAD_SHA": (
+                    target_head_sha or self._canonical_commit
+                ),
+                "CISCO_CUTOVER_TARGET_PR_NUMBER": str(
+                    target_pr_number or self._pull_request_number
+                ),
+                "GITHUB_OUTPUT": str(output_path),
             }
         )
         if overrides:
@@ -4005,6 +4098,22 @@ class BugTriageDocumentationTests(unittest.TestCase):
             cwd=cwd,
         )
 
+    def _run_selector_workflow_program(
+        self,
+        *,
+        environment: dict[str, str],
+        cwd: Path,
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, "-c", self._selector_workflow_program()],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            env=environment,
+            cwd=cwd,
+        )
+
     def _matching_enforcement_evidence(self) -> dict[str, object]:
         contract = json.loads(
             CUTOVER_ENFORCEMENT_CONTRACT_PATH.read_text(encoding="utf-8")
@@ -4012,9 +4121,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
         organization = contract["source_organization"]
         repository = contract["target_repository"]
         workflow = contract["required_workflow"]
-        repository_api = (
-            f"https://api.github.com/repos/{repository['full_name']}"
-        )
+        repository_api = f"https://api.github.com/repos/{repository['full_name']}"
         pull_request = {
             "base": {
                 "ref": repository["default_branch"],
@@ -4031,9 +4138,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
                 },
                 "sha": self._canonical_commit,
             },
-            "html_url": (
-                f"https://github.com/{repository['full_name']}/pull/7"
-            ),
+            "html_url": (f"https://github.com/{repository['full_name']}/pull/7"),
             "id": 7007,
             "merged": False,
             "number": 7,
@@ -4098,8 +4203,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
             },
             "head_sha": base_sha,
             "html_url": (
-                f"https://github.com/{repository['full_name']}"
-                "/actions/runs/10101"
+                f"https://github.com/{repository['full_name']}/actions/runs/10101"
             ),
             "id": 10101,
             "jobs_url": f"{run_url}/jobs",
@@ -4164,6 +4268,14 @@ class BugTriageDocumentationTests(unittest.TestCase):
                 },
             },
             "pull_request": pull_request,
+            "selector_target_pr_number": {
+                "name": "CISCO_CUTOVER_TARGET_PR_NUMBER",
+                "value": str(self._pull_request_number),
+            },
+            "selector_target_head_sha": {
+                "name": "CISCO_CUTOVER_TARGET_HEAD_SHA",
+                "value": self._canonical_commit,
+            },
             "effective_rulesets": [self._copy_json(ruleset)],
             "selected_ruleset": ruleset,
             "workflow_source_repository": {
@@ -4321,19 +4433,23 @@ class BugTriageDocumentationTests(unittest.TestCase):
             f"/repos/{target_name}": evidence["repository"],
             f"/repos/{target_name}/pulls/7": pull_request,
             (
+                f"/repos/{target_name}/actions/variables/"
+                f"{contract['applicability_selector']['target_pr_number_variable']}"
+            ): evidence["selector_target_pr_number"],
+            (
+                f"/repos/{target_name}/actions/variables/"
+                f"{contract['applicability_selector']['target_head_sha_variable']}"
+            ): evidence["selector_target_head_sha"],
+            (
                 f"/orgs/{contract['source_organization']['login']}/rulesets/"
                 f"{self._ruleset_id}"
             ): evidence["selected_ruleset"],
-            f"/repos/{workflow_name}": evidence[
-                "workflow_source_repository"
+            f"/repos/{workflow_name}": evidence["workflow_source_repository"],
+            (f"/repos/{workflow_name}/actions/workflows/{self._workflow_id}"): evidence[
+                "workflow"
             ],
             (
-                f"/repos/{workflow_name}/actions/workflows/"
-                f"{self._workflow_id}"
-            ): evidence["workflow"],
-            (
-                f"/repos/{workflow_name}/commits/"
-                f"{self._workflow_source_commit}"
+                f"/repos/{workflow_name}/commits/{self._workflow_source_commit}"
             ): evidence["workflow_source_commit"],
         }
         collections = {
@@ -4353,10 +4469,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
                 "item_key": "check_runs",
                 "pages": [[]],
             },
-            (
-                f"/repos/{target_name}/actions/runs/10101"
-                "/attempts/1/jobs"
-            ): {
+            (f"/repos/{target_name}/actions/runs/10101/attempts/1/jobs"): {
                 "item_key": "jobs",
                 "pages": [[job]],
             },
@@ -4421,9 +4534,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
                 "id": workflow_id,
                 "path": contract["required_workflow"]["path"],
                 "ref": contract["required_workflow"]["ref"],
-                "repository_id": contract["required_workflow"][
-                    "repository_id"
-                ],
+                "repository_id": contract["required_workflow"]["repository_id"],
                 "sha": workflow_sha,
             },
             "trusted_workflow_run_id": admission["trusted_run"]["id"],
@@ -4449,9 +4560,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
         self.assertTrue(
             (SKILL_ROOT / "references/jenkins-artifact-recipes.md").is_file()
         )
-        self.assertTrue(
-            (SKILL_ROOT / "scripts/jenkins_artifact_probe.py").is_file()
-        )
+        self.assertTrue((SKILL_ROOT / "scripts/jenkins_artifact_probe.py").is_file())
         self.assertTrue((REPO_ROOT / "tests/test_jenkins_artifact_probe.py").is_file())
         self.assertIn("retains the existing Jenkins", readme)
 
@@ -4460,9 +4569,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
             SKILL_ROOT / "references/local-artifact-recipes.md",
             SKILL_ROOT / "scripts/archive_triage.py",
         ]
-        local_text = "\n".join(
-            path.read_text(encoding="utf-8") for path in local_files
-        )
+        local_text = "\n".join(path.read_text(encoding="utf-8") for path in local_files)
 
         self.assertNotIn("JENKINS_ARTIFACT_USER", local_text)
         self.assertNotIn("JENKINS_ARTIFACT_TOKEN", local_text)
@@ -4478,7 +4585,8 @@ class BugTriageDocumentationTests(unittest.TestCase):
 
         for forbidden in (
             "urllib",
-            "requests",
+            "import requests",
+            "from requests",
             "http.client",
             "socket",
             "JENKINS_ARTIFACT_USER",
@@ -4603,7 +4711,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
             "cannot protect the pull request that first introduces it",
             migration,
         )
-        self.assertIn("minimum\nordinary PR-merge sequence", migration)
+        self.assertIn("minimum\nordinary PR-merge state machine", migration)
         self.assertIn("restores the Jenkins entrypoint", migration)
         self.assertIn("is not an enforcement identity", migration)
         self.assertIn(
@@ -4621,6 +4729,39 @@ class BugTriageDocumentationTests(unittest.TestCase):
         self.assertIn("no OAuth scope or\nlive ruleset was changed", migration)
         self.assertIn("cannot install a base-owned workflow", migration)
         self.assertIn("doctor_cisco_cutover_enforcement.py", migration)
+        self.assertIn("cisco-cutover-selector", migration)
+        self.assertIn("classification=not_applicable", migration)
+        self.assertIn("Post-Cutover Decommission Transaction", migration)
+        self.assertIn("create-if-absent repository-variable lease", migration)
+        self.assertIn("does not document conditional `If-Match`", migration)
+        self.assertIn("blocked-permission", migration)
+        self.assertIn("http_status=403", migration)
+
+    def test_documented_retirement_state_machine_has_satisfiable_order(
+        self,
+    ) -> None:
+        migration = (REPO_ROOT / "docs/cisco-build-artifacts-migration.md").read_text(
+            encoding="utf-8"
+        )
+        checkpoints = (
+            "Separately review and merge a compatibility/bootstrap PR",
+            "create the separate\n   retirement PR",
+            "producer-authored schema-2 receipt",
+            "configures both selector variables",
+            "creates or updates the active,\n   bypass-free organization",
+            "trigger a new target evaluation",
+            "Run the live read-only doctor against that exact retirement PR/head",
+            "Immediately before merge, revalidate",
+            "may an authorized maintainer merge the retirement PR",
+        )
+        positions = [migration.index(checkpoint) for checkpoint in checkpoints]
+
+        self.assertEqual(positions, sorted(positions))
+        self.assertIn(
+            "No merge, rerun, variable write, ruleset\n"
+            "   write, or release publication is an automatic action",
+            migration,
+        )
 
     def test_trusted_cutover_workflow_has_no_candidate_execution_path(
         self,
@@ -4633,6 +4774,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
         compile(program, str(CUTOVER_TRUSTED_WORKFLOW_PATH), "exec")
 
         self.assertIn("pull_request_target:", workflow)
+        self.assertIn("branches:\n      - master", workflow)
         self.assertIn("name: cisco-cutover-admission", workflow)
         self.assertIn("permissions:\n  contents: read", workflow)
         self.assertIn(
@@ -4643,6 +4785,21 @@ class BugTriageDocumentationTests(unittest.TestCase):
             "PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}",
             workflow,
         )
+        self.assertIn("name: cisco-cutover-selector", workflow)
+        self.assertIn("name: cisco-cutover-neutral", workflow)
+        self.assertIn(
+            "if: needs.cisco-cutover-selector.outputs.applicable == 'true'",
+            workflow,
+        )
+        self.assertIn(
+            "if: needs.cisco-cutover-selector.outputs.applicable == 'false'",
+            workflow,
+        )
+        self.assertIn('"target_evidence_consumed":false', workflow)
+        neutral_job = workflow.split("\n  cisco-cutover-neutral:\n", 1)[1]
+        self.assertNotIn("env:", neutral_job)
+        self.assertNotIn("${{ vars.", neutral_job)
+        self.assertNotIn("CISCO_CUTOVER_RECEIPT", neutral_job)
         for forbidden in (
             "actions/checkout",
             "uses:",
@@ -4664,12 +4821,110 @@ class BugTriageDocumentationTests(unittest.TestCase):
         self.assertIn("tests.test_jenkins_artifact_probe", regular_ci)
         self.assertIn("doctor_cisco_cutover_enforcement.py", regular_ci)
 
+    def test_trusted_cutover_selector_routes_target_and_non_target_prs(
+        self,
+    ) -> None:
+        scenarios = (
+            (
+                "target",
+                self._pull_request_number,
+                self._canonical_commit,
+                "target",
+                "true",
+            ),
+            (
+                "concurrent-pr",
+                self._pull_request_number + 1,
+                "8" * 40,
+                "not_applicable",
+                "false",
+            ),
+            (
+                "future-pr-after-merge",
+                self._pull_request_number + 2,
+                "7" * 40,
+                "not_applicable",
+                "false",
+            ),
+            (
+                "concurrent-fork-pr",
+                self._pull_request_number + 3,
+                "6" * 40,
+                "not_applicable",
+                "false",
+            ),
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            for (
+                label,
+                current_pr,
+                current_head,
+                classification,
+                applicable,
+            ) in scenarios:
+                with self.subTest(route=label):
+                    output_path = temp_root / f"{label}.output"
+                    environment = self._selector_workflow_environment(
+                        output_path=output_path,
+                        current_pr_number=current_pr,
+                        current_head_sha=current_head,
+                    )
+                    if label == "concurrent-fork-pr":
+                        environment["PR_HEAD_REPOSITORY"] = "contributor/fork"
+                    result = self._run_selector_workflow_program(
+                        environment=environment,
+                        cwd=temp_root,
+                    )
+
+                    self.assertEqual(
+                        result.returncode, 0, result.stdout + result.stderr
+                    )
+                    outcome = json.loads(result.stdout)
+                    self.assertEqual(outcome["classification"], classification)
+                    output = output_path.read_text(encoding="utf-8")
+                    self.assertIn(f"applicable={applicable}\n", output)
+
+    def test_trusted_cutover_selector_blocks_target_head_change(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            environment = self._selector_workflow_environment(
+                output_path=temp_root / "selector.output",
+                current_head_sha="8" * 40,
+            )
+            result = self._run_selector_workflow_program(
+                environment=environment,
+                cwd=temp_root,
+            )
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        outcome = json.loads(result.stdout)
+        self.assertEqual(outcome["classification"], "blocked_until_trusted")
+        self.assertIn("head changed", outcome["reason"])
+
+    def test_trusted_cutover_selector_blocks_target_fork(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            environment = self._selector_workflow_environment(
+                output_path=temp_root / "selector.output",
+            )
+            environment["PR_HEAD_REPOSITORY"] = "contributor/fork"
+            result = self._run_selector_workflow_program(
+                environment=environment,
+                cwd=temp_root,
+            )
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        outcome = json.loads(result.stdout)
+        self.assertEqual(outcome["classification"], "blocked_until_trusted")
+        self.assertIn("head repository differs", outcome["reason"])
+
     def test_enforcement_contract_binds_required_workflow_identity(self) -> None:
         contract = json.loads(
             CUTOVER_ENFORCEMENT_CONTRACT_PATH.read_text(encoding="utf-8")
         )
 
-        self.assertEqual(contract["schema_version"], 2)
+        self.assertEqual(contract["schema_version"], 3)
         self.assertEqual(
             contract["source_organization"],
             {
@@ -4698,7 +4953,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
                 "ref_name": {
                     "include": ["~DEFAULT_BRANCH"],
                     "exclude": [],
-                }
+                },
             },
         )
         workflow = contract["required_workflow"]
@@ -4721,15 +4976,24 @@ class BugTriageDocumentationTests(unittest.TestCase):
             contract["disallowed_status_contexts"],
             ["cisco-cutover-admission"],
         )
+        self.assertEqual(
+            contract["applicability_selector"],
+            {
+                "target_pr_number_variable": "CISCO_CUTOVER_TARGET_PR_NUMBER",
+                "target_head_sha_variable": "CISCO_CUTOVER_TARGET_HEAD_SHA",
+                "selector_job_name": "cisco-cutover-selector",
+                "target_job_name": "cisco-cutover-admission",
+                "neutral_job_name": "cisco-cutover-neutral",
+                "non_target_classification": "not_applicable",
+            },
+        )
 
     def test_trusted_cutover_workflow_cannot_green_without_inputs(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             environment = os.environ.copy()
             for name in self._trusted_gate_environment_names:
                 environment.pop(name, None)
-            environment["GITHUB_REPOSITORY"] = (
-                "Joey-Tools/codex-debug-triage"
-            )
+            environment["GITHUB_REPOSITORY"] = "Joey-Tools/codex-debug-triage"
             result = self._run_trusted_workflow_program(
                 environment=environment,
                 cwd=Path(temp_dir),
@@ -4771,11 +5035,26 @@ class BugTriageDocumentationTests(unittest.TestCase):
             "head-sha": {
                 "PR_HEAD_SHA": "4" * 40,
             },
+            "pull-request-number": {
+                "PR_NUMBER": str(self._pull_request_number + 1),
+            },
+            "selector-head": {
+                "SELECTED_TARGET_HEAD_SHA": "4" * 40,
+            },
+            "selector-pr": {
+                "SELECTED_TARGET_PR_NUMBER": str(self._pull_request_number + 1),
+            },
             "expected-canonical": {
                 "CISCO_CUTOVER_EXPECTED_CANONICAL_COMMIT": "4" * 40,
             },
             "receipt-digest": {
                 "CISCO_CUTOVER_EXPECTED_RECEIPT_SHA256": "4" * 64,
+            },
+            "workflow-id": {
+                "CISCO_CUTOVER_EXPECTED_WORKFLOW_ID": str(self._workflow_id + 1),
+            },
+            "workflow-sha": {
+                "CISCO_CUTOVER_EXPECTED_WORKFLOW_SHA": "5" * 40,
             },
         }
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -4825,15 +5104,13 @@ class BugTriageDocumentationTests(unittest.TestCase):
                 f"Path({str(marker)!r}).write_text('executed')\n"
                 "raise SystemExit(0)\n"
             )
-            (
-                candidate / ".github/workflows/cisco-cutover-admission.yml"
-            ).write_text(
+            (candidate / ".github/workflows/cisco-cutover-admission.yml").write_text(
                 "name: attacker\non: pull_request_target\njobs: {}\n",
                 encoding="utf-8",
             )
-            (
-                candidate / "scripts/validate_cisco_cutover_receipt.py"
-            ).write_text(malicious, encoding="utf-8")
+            (candidate / "scripts/validate_cisco_cutover_receipt.py").write_text(
+                malicious, encoding="utf-8"
+            )
             (candidate / "tests/test_archive_triage.py").write_text(
                 malicious,
                 encoding="utf-8",
@@ -4865,9 +5142,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
             with self.subTest(placeholder=placeholder):
                 environment = self._trusted_workflow_environment(
                     receipt_payload=b"{}\n",
-                    overrides={
-                        "CISCO_CUTOVER_EXPECTED_CANONICAL_COMMIT": placeholder
-                    },
+                    overrides={"CISCO_CUTOVER_EXPECTED_CANONICAL_COMMIT": placeholder},
                 )
                 with tempfile.TemporaryDirectory() as temp_dir:
                     result = self._run_trusted_workflow_program(
@@ -4886,9 +5161,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
     def test_enforcement_doctor_admits_exact_required_workflow_identity(
         self,
     ) -> None:
-        result = self._run_enforcement_doctor(
-            self._matching_enforcement_evidence()
-        )
+        result = self._run_enforcement_doctor(self._matching_enforcement_evidence())
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(result.stderr, "")
@@ -4949,9 +5222,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
         self.assertTrue(
             all(bound["terminal_empty_page"] == 2 for bound in ruleset_bounds)
         )
-        self.assertTrue(
-            all(bound["item_count"] == 1 for bound in ruleset_bounds)
-        )
+        self.assertTrue(all(bound["item_count"] == 1 for bound in ruleset_bounds))
         check_bounds = [
             bound
             for bound in receipt["collector"]["page_bounds"]
@@ -4960,19 +5231,13 @@ class BugTriageDocumentationTests(unittest.TestCase):
         ]
         self.assertEqual(len(check_bounds), 4)
         self.assertEqual(
-            {
-                bound["endpoint"]
-                for bound in check_bounds
-            },
+            {bound["endpoint"] for bound in check_bounds},
             {
                 (
                     "/repos/Joey-Tools/codex-debug-triage/commits/"
                     f"{self._canonical_commit}/check-runs"
                 ),
-                (
-                    "/repos/Joey-Tools/codex-debug-triage/commits/"
-                    f"{'9' * 40}/check-runs"
-                ),
+                (f"/repos/Joey-Tools/codex-debug-triage/commits/{'9' * 40}/check-runs"),
             },
         )
 
@@ -5041,9 +5306,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
             CUTOVER_ENFORCEMENT_CONTRACT_PATH.read_text(encoding="utf-8")
         )
         client = self._matching_live_api_client()
-        pull_endpoint = (
-            "/repos/Joey-Tools/codex-debug-triage/pulls/7"
-        )
+        pull_endpoint = "/repos/Joey-Tools/codex-debug-triage/pulls/7"
         original_get_json = client.get_json
         pull_reads = 0
 
@@ -5061,9 +5324,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
 
         client.get_json = raced_get_json
 
-        with self.assertRaises(
-            ENFORCEMENT_MODULE.EnforcementDoctorError
-        ) as raised:
+        with self.assertRaises(ENFORCEMENT_MODULE.EnforcementDoctorError) as raised:
             ENFORCEMENT_MODULE.collect_and_validate(
                 client,
                 contract,
@@ -5098,9 +5359,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
             read_count += 1
             result = original_get_json(endpoint, parameters)
             if type(result) is dict:
-                result["updated_at"] = (
-                    f"2026-07-24T00:00:{read_count % 60:02d}Z"
-                )
+                result["updated_at"] = f"2026-07-24T00:00:{read_count % 60:02d}Z"
             return result
 
         client.get_json = timestamped_get_json
@@ -5143,6 +5402,161 @@ class BugTriageDocumentationTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.code, 2)
 
+    def test_enforcement_api_failures_are_sanitized_and_actionable(
+        self,
+    ) -> None:
+        cases = (
+            ("authentication", 401, "blocked-authentication", "authentication"),
+            ("permission", 403, "blocked-permission", "permission"),
+            ("rate-limit-403", 403, "rate-limited", "rate-limit"),
+            ("not-found", 404, "not-found", "not-found"),
+            ("rate-limit-429", 429, "rate-limited", "rate-limit"),
+            ("server-500", 500, "api-unavailable", "server-error"),
+            ("server-503", 503, "api-unavailable", "server-error"),
+        )
+        endpoint = "/orgs/Joey-Tools/rulesets/97531"
+        for label, status, reason_code, failure_kind in cases:
+            with self.subTest(failure=label):
+                client = object.__new__(ENFORCEMENT_MODULE.GitHubApiClient)
+                client.executable = "/fixed/gh"
+                client.calls = 0
+                client.total_bytes = 0
+                client.deadline = time.monotonic() + 30
+                detail = (
+                    "rate limit exceeded"
+                    if label == "rate-limit-403"
+                    else "sanitized fixture failure"
+                )
+                stderr = (
+                    f"gh: {detail} (HTTP {status}) Authorization: token super-secret"
+                ).encode("utf-8")
+                with mock.patch.object(
+                    ENFORCEMENT_MODULE,
+                    "_bounded_subprocess",
+                    return_value=(1, b'{"secret":"response-body"}', stderr),
+                ):
+                    with self.assertRaises(
+                        ENFORCEMENT_MODULE.EnforcementDoctorError
+                    ) as raised:
+                        client.get_json(endpoint)
+
+                error = raised.exception
+                self.assertEqual(error.reason_code, reason_code)
+                self.assertEqual(
+                    error.api_failure,
+                    {
+                        "endpoint_class": "organization-ruleset",
+                        "failure_kind": failure_kind,
+                        "http_status": status,
+                    },
+                )
+                rendered = json.dumps(
+                    {
+                        "reason": str(error),
+                        "api_failure": error.api_failure,
+                    },
+                    sort_keys=True,
+                )
+                self.assertNotIn("super-secret", rendered)
+                self.assertNotIn("response-body", rendered)
+                self.assertNotIn("Authorization", rendered)
+
+    def test_enforcement_api_malformed_and_timeout_failures_are_sanitized(
+        self,
+    ) -> None:
+        endpoint = "/orgs/Joey-Tools/rulesets/97531"
+        client = object.__new__(ENFORCEMENT_MODULE.GitHubApiClient)
+        client.executable = "/fixed/gh"
+        client.calls = 0
+        client.total_bytes = 0
+        client.deadline = time.monotonic() + 30
+        with mock.patch.object(
+            ENFORCEMENT_MODULE,
+            "_bounded_subprocess",
+            return_value=(0, b"{malformed", b"token super-secret"),
+        ):
+            with self.assertRaises(
+                ENFORCEMENT_MODULE.EnforcementDoctorError
+            ) as malformed:
+                client.get_json(endpoint)
+
+        self.assertEqual(malformed.exception.reason_code, "api-unavailable")
+        self.assertEqual(
+            malformed.exception.api_failure,
+            {
+                "endpoint_class": "organization-ruleset",
+                "failure_kind": "malformed-json",
+                "http_status": 200,
+            },
+        )
+        self.assertNotIn("super-secret", str(malformed.exception))
+
+        client.deadline = time.monotonic() - 1
+        with self.assertRaises(ENFORCEMENT_MODULE.EnforcementDoctorError) as timed_out:
+            client.get_json(endpoint)
+
+        self.assertEqual(timed_out.exception.reason_code, "api-timeout")
+        self.assertEqual(
+            timed_out.exception.api_failure,
+            {
+                "endpoint_class": "organization-ruleset",
+                "failure_kind": "timeout",
+                "http_status": None,
+            },
+        )
+
+    def test_enforcement_doctor_serializes_only_sanitized_api_failure(
+        self,
+    ) -> None:
+        arguments = [
+            str(CUTOVER_ENFORCEMENT_DOCTOR_PATH),
+            "--contract",
+            str(CUTOVER_ENFORCEMENT_CONTRACT_PATH),
+            "--pull-request-number",
+            str(self._pull_request_number),
+            "--expected-ruleset-id",
+            str(self._ruleset_id),
+            "--expected-workflow-id",
+            str(self._workflow_id),
+            "--expected-workflow-sha",
+            self._workflow_source_commit,
+            "--candidate-head-sha",
+            self._canonical_commit,
+        ]
+        failure = ENFORCEMENT_MODULE.EnforcementDoctorError(
+            "blocked-permission",
+            "GitHub API permission blocked the read",
+            api_failure={
+                "endpoint_class": "organization-ruleset",
+                "failure_kind": "permission",
+                "http_status": 403,
+            },
+        )
+        output = io.StringIO()
+        with mock.patch.object(
+            ENFORCEMENT_MODULE,
+            "GitHubApiClient",
+            side_effect=failure,
+        ):
+            with mock.patch.object(sys, "argv", arguments):
+                with redirect_stdout(output):
+                    return_code = ENFORCEMENT_MODULE.main()
+
+        self.assertEqual(return_code, 1)
+        outcome = json.loads(output.getvalue())
+        self.assertEqual(outcome["reason_code"], "blocked-permission")
+        self.assertEqual(
+            outcome["api_failure"],
+            {
+                "endpoint_class": "organization-ruleset",
+                "failure_kind": "permission",
+                "http_status": 403,
+            },
+        )
+        self.assertNotIn("command", outcome)
+        self.assertNotIn("headers", outcome)
+        self.assertNotIn("token", output.getvalue().lower())
+
     def test_enforcement_doctor_cli_receipt_binds_native_objects(
         self,
     ) -> None:
@@ -5175,6 +5589,20 @@ class BugTriageDocumentationTests(unittest.TestCase):
         self.assertEqual(return_code, 0)
         outcome = json.loads(output.getvalue())
         self.assertEqual(outcome["classification"], "admitted")
+        self.assertEqual(outcome["schema_version"], 3)
+        self.assertEqual(
+            outcome["applicability_selector"],
+            {
+                "target_head_sha": {
+                    "name": "CISCO_CUTOVER_TARGET_HEAD_SHA",
+                    "value": self._canonical_commit,
+                },
+                "target_pr_number": {
+                    "name": "CISCO_CUTOVER_TARGET_PR_NUMBER",
+                    "value": str(self._pull_request_number),
+                },
+            },
+        )
         candidate = outcome["candidate"]
         self.assertEqual(candidate["head_repository_id"], 1242512092)
         self.assertEqual(
@@ -5186,8 +5614,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
         self.assertEqual(candidate["pull_request_number"], 7)
         self.assertEqual(
             candidate["pull_request_url"],
-            "https://api.github.com/repos/"
-            "Joey-Tools/codex-debug-triage/pulls/7",
+            "https://api.github.com/repos/Joey-Tools/codex-debug-triage/pulls/7",
         )
         execution = outcome["trusted_execution"]
         self.assertEqual(execution["run"]["id"], 10101)
@@ -5233,16 +5660,14 @@ class BugTriageDocumentationTests(unittest.TestCase):
             f"https://api.github.com/repos/{source_name}/commits/"
             f"{self._workflow_source_commit}"
         )
-        evidence["workflow_runs"][0]["workflow_url"] = evidence["workflow"][
-            "url"
-        ]
+        evidence["workflow_runs"][0]["workflow_url"] = evidence["workflow"]["url"]
         for ruleset in (
             evidence["effective_rulesets"][0],
             evidence["selected_ruleset"],
         ):
-            ruleset["rules"][2]["parameters"]["workflows"][0][
-                "repository_id"
-            ] = source_id
+            ruleset["rules"][2]["parameters"]["workflows"][0]["repository_id"] = (
+                source_id
+            )
 
         admission = ENFORCEMENT_MODULE.validate_enforcement(
             contract,
@@ -5277,9 +5702,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
             tuple[object, str],
         ] = {
             "wrong-organization": (
-                lambda evidence: evidence["organization"].update(
-                    {"id": 999999}
-                ),
+                lambda evidence: evidence["organization"].update({"id": 999999}),
                 "organization-identity-mismatch",
             ),
             "wrong-target-default-branch": (
@@ -5295,9 +5718,9 @@ class BugTriageDocumentationTests(unittest.TestCase):
                 "candidate-duplicate-context",
             ),
             "wrong-source-workflow-repository": (
-                lambda evidence: evidence[
-                    "workflow_source_repository"
-                ].update({"id": 999999}),
+                lambda evidence: evidence["workflow_source_repository"].update(
+                    {"id": 999999}
+                ),
                 "workflow-source-repository-mismatch",
             ),
             "wrong-target-scope": (
@@ -5305,22 +5728,30 @@ class BugTriageDocumentationTests(unittest.TestCase):
                     evidence["effective_rulesets"][0]["conditions"][
                         "repository_id"
                     ].update({"repository_ids": [999999]}),
-                    evidence["selected_ruleset"]["conditions"][
-                        "repository_id"
-                    ].update({"repository_ids": [999999]}),
+                    evidence["selected_ruleset"]["conditions"]["repository_id"].update(
+                        {"repository_ids": [999999]}
+                    ),
                 ),
                 "ruleset-scope-mismatch",
             ),
             "wrong-org-source": (
                 lambda evidence: (
-                    evidence["effective_rulesets"][0].update(
-                        {"source": "Other-Org"}
-                    ),
-                    evidence["selected_ruleset"].update(
-                        {"source": "Other-Org"}
-                    ),
+                    evidence["effective_rulesets"][0].update({"source": "Other-Org"}),
+                    evidence["selected_ruleset"].update({"source": "Other-Org"}),
                 ),
                 "ruleset-identity-mismatch",
+            ),
+            "selector-pr-tamper": (
+                lambda evidence: evidence["selector_target_pr_number"].update(
+                    {"value": "8"}
+                ),
+                "selector-mismatch",
+            ),
+            "selector-head-tamper": (
+                lambda evidence: evidence["selector_target_head_sha"].update(
+                    {"value": "8" * 40}
+                ),
+                "selector-mismatch",
             ),
         }
         for label, (mutate, reason_code) in cases.items():
@@ -5338,15 +5769,15 @@ class BugTriageDocumentationTests(unittest.TestCase):
     ) -> None:
         cases = {
             "run-cross-pr": (
-                lambda evidence: evidence["workflow_runs"][0][
-                    "pull_requests"
-                ][0].update({"number": 8}),
+                lambda evidence: evidence["workflow_runs"][0]["pull_requests"][
+                    0
+                ].update({"number": 8}),
                 "workflow-run-linkage-mismatch",
             ),
             "check-cross-pr": (
-                lambda evidence: evidence["check_runs"][0][
-                    "pull_requests"
-                ][0].update({"number": 8}),
+                lambda evidence: evidence["check_runs"][0]["pull_requests"][0].update(
+                    {"number": 8}
+                ),
                 "candidate-pr-mismatch",
             ),
             "check-cross-head": (
@@ -5556,9 +5987,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
                     evidence["effective_rulesets"][0],
                     evidence["selected_ruleset"],
                 ):
-                    binding = ruleset["rules"][2]["parameters"][
-                        "workflows"
-                    ][0]
+                    binding = ruleset["rules"][2]["parameters"]["workflows"][0]
                     if value is None:
                         del binding[field]
                     else:
@@ -5593,9 +6022,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
                     evidence["effective_rulesets"][0].update(
                         {"enforcement": "disabled"}
                     ),
-                    evidence["selected_ruleset"].update(
-                        {"enforcement": "disabled"}
-                    ),
+                    evidence["selected_ruleset"].update({"enforcement": "disabled"}),
                 ),
                 "ruleset-not-active",
             ),
@@ -5604,9 +6031,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
                     evidence["effective_rulesets"][0].update(
                         {"enforcement": "evaluate"}
                     ),
-                    evidence["selected_ruleset"].update(
-                        {"enforcement": "evaluate"}
-                    ),
+                    evidence["selected_ruleset"].update({"enforcement": "evaluate"}),
                 ),
                 "ruleset-not-active",
             ),
@@ -5670,7 +6095,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
     def test_private_migration_fixture_binds_atomic_aggregate_cutover(self) -> None:
         fixture = json.loads(MIGRATION_FIXTURE_PATH.read_text(encoding="utf-8"))
 
-        self.assertEqual(fixture["schema_version"], 2)
+        self.assertEqual(fixture["schema_version"], 3)
         self.assertEqual(
             fixture["canonical_repository"],
             "Joey-Tools/codex-debug-triage",
@@ -5734,24 +6159,84 @@ class BugTriageDocumentationTests(unittest.TestCase):
                 "installed-current-pointer-verified",
             ],
         )
+        state_machine = fixture["retirement_state_machine"]
+        self.assertEqual(
+            state_machine["phases"],
+            [
+                "bootstrap-workflow-merged",
+                "retirement-pr-head-frozen",
+                "private-release-receipt-published",
+                "repository-variables-configured",
+                "organization-ruleset-activated",
+                "target-workflow-observed",
+                "doctor-admitted",
+                "merge-readiness-revalidated",
+                "retirement-pr-merged",
+            ],
+        )
+        self.assertFalse(state_machine["automatic_mutation"])
+        decommission = fixture["post_cutover_decommission"]
+        self.assertEqual(
+            decommission["lease_variable"],
+            "CISCO_CUTOVER_DECOMMISSION_LEASE",
+        )
+        self.assertFalse(
+            decommission["compare_and_swap"]["unsafe-conditional-requests-supported"]
+        )
+        self.assertTrue(
+            decommission["compare_and_swap"]["revalidate-before-each-mutation"]
+        )
+        decommission_steps = decommission["ordered_steps"]
+        self.assertLess(
+            decommission_steps.index("prove-ruleset-is-not-effective"),
+            decommission_steps.index("remove-workflow-in-separate-reviewed-pr"),
+        )
+        self.assertLess(
+            decommission_steps.index(
+                "prove-workflow-absent-and-ruleset-still-inactive"
+            ),
+            decommission_steps.index(
+                "delete-exact-cutover-variables-after-value-digest-and-updated-at-compare"
+            ),
+        )
+        self.assertLess(
+            decommission_steps.index(
+                "delete-exact-cutover-variables-after-value-digest-and-updated-at-compare"
+            ),
+            decommission_steps.index(
+                "delete-exact-inactive-ruleset-after-content-compare"
+            ),
+        )
+        self.assertEqual(decommission_steps[-1], "delete-lease-last")
+        self.assertFalse(decommission["automatic_mutation"])
         self.assertEqual(
             fixture["receipt_admission"],
             {
                 "status_without_receipt": "blocked_until_trusted",
                 "validator": ("scripts/validate_cisco_cutover_receipt.py"),
-                "receipt_schema_version": 1,
-                "receipt_max_bytes": 65536,
+                "receipt_schema_version": 2,
+                "receipt_max_bytes": 35840,
                 "producer_workflow": ".github/workflows/release.yml",
                 "pointer_name": "current",
                 "pointer_target_template": ("releases/{private_release_commit}"),
                 "required_exact_inputs": [
                     "expected_canonical_commit",
+                    "expected_pull_request_number",
                     "expected_private_release_commit",
                     "expected_release_manifest_sha256",
                     "expected_receipt_sha256",
+                    "expected_workflow_id",
+                    "expected_workflow_sha",
                 ],
             },
         )
+        receipt_max_bytes = fixture["receipt_admission"]["receipt_max_bytes"]
+        self.assertLessEqual(
+            4 * ((receipt_max_bytes + 2) // 3),
+            48_000,
+        )
+        trusted_workflow = CUTOVER_TRUSTED_WORKFLOW_PATH.read_text(encoding="utf-8")
+        self.assertIn("MAX_RECEIPT_BYTES = 35 * 1024", trusted_workflow)
 
     def test_cutover_validator_without_receipt_remains_blocked(self) -> None:
         result = self._run_cutover_validator()
@@ -5846,6 +6331,56 @@ class BugTriageDocumentationTests(unittest.TestCase):
         self.assertEqual(outcome["classification"], "blocked_until_trusted")
         self.assertIn("installed pointer", outcome["reason"])
 
+    def test_cutover_validator_rejects_repo_pr_head_or_workflow_drift(
+        self,
+    ) -> None:
+        fixture = json.loads(MIGRATION_FIXTURE_PATH.read_text(encoding="utf-8"))
+        cases = {
+            "repository": (
+                lambda receipt: receipt["cutover"]["target_repository"].update(
+                    {"id": 999999}
+                )
+            ),
+            "pull-request": (
+                lambda receipt: receipt["cutover"]["pull_request"].update(
+                    {"number": self._pull_request_number + 1}
+                )
+            ),
+            "head": (
+                lambda receipt: receipt["cutover"]["pull_request"].update(
+                    {"head_sha": "8" * 40}
+                )
+            ),
+            "workflow": (
+                lambda receipt: receipt["cutover"]["required_workflow"].update(
+                    {"sha": "8" * 40}
+                )
+            ),
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            for label, mutate in cases.items():
+                with self.subTest(binding=label):
+                    receipt = self._matching_cutover_receipt(fixture)
+                    mutate(receipt)
+                    receipt_path = temp_root / f"{label}.json"
+                    receipt_sha256 = self._write_cutover_receipt(
+                        receipt_path,
+                        receipt,
+                    )
+                    result = self._run_cutover_validator(
+                        receipt_path=receipt_path,
+                        receipt_sha256=receipt_sha256,
+                    )
+
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    outcome = json.loads(result.stdout)
+                    self.assertEqual(
+                        outcome["classification"],
+                        "blocked_until_trusted",
+                    )
+                    self.assertIn("receipt cutover", outcome["reason"])
+
     def test_cutover_validator_rejects_weakened_atomic_contract(self) -> None:
         contract = json.loads(MIGRATION_FIXTURE_PATH.read_text(encoding="utf-8"))
         contract["activation"]["atomic"] = False
@@ -5867,7 +6402,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
     def test_cutover_validator_requires_exact_contract_scalar_types(self) -> None:
         fixture = json.loads(MIGRATION_FIXTURE_PATH.read_text(encoding="utf-8"))
         cases = (
-            ("schema-float", ("schema_version",), 2.0),
+            ("schema-float", ("schema_version",), 3.0),
             (
                 "routing-integer",
                 ("canonical_merge_changes_installed_routing",),

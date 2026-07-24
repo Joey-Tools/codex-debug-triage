@@ -2,6 +2,8 @@ name: Cisco Cutover Admission
 
 on:
   pull_request_target:
+    branches:
+      - master
     types:
       - opened
       - reopened
@@ -12,8 +14,138 @@ permissions:
   contents: read
 
 jobs:
+  cisco-cutover-selector:
+    name: cisco-cutover-selector
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    outputs:
+      applicable: ${{ steps.select.outputs.applicable }}
+      target-head-sha: ${{ steps.select.outputs.target-head-sha }}
+      target-pr-number: ${{ steps.select.outputs.target-pr-number }}
+    steps:
+      - name: Select the exact retirement pull request
+        id: select
+        shell: bash --noprofile --norc -euo pipefail {0}
+        env:
+          EVENT_REPOSITORY: ${{ github.event.repository.full_name }}
+          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          PR_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          CISCO_CUTOVER_TARGET_HEAD_SHA: ${{ vars.CISCO_CUTOVER_TARGET_HEAD_SHA }}
+          CISCO_CUTOVER_TARGET_PR_NUMBER: ${{ vars.CISCO_CUTOVER_TARGET_PR_NUMBER }}
+        run: |
+          python3 - <<'SELECTOR_PY'
+          import json
+          import os
+          import re
+
+          EXPECTED_REPOSITORY = "Joey-Tools/codex-debug-triage"
+          EXPECTED_BASE_REF = "master"
+          SHA1_PATTERN = re.compile(r"[0-9a-f]{40}")
+          PR_NUMBER_PATTERN = re.compile(r"[1-9][0-9]*")
+
+
+          class SelectorError(ValueError):
+              pass
+
+
+          def required_environment(name):
+              value = os.environ.get(name)
+              if value is None or not value.strip():
+                  raise SelectorError(f"required selector input {name} is missing")
+              return value.strip()
+
+
+          def require_sha(value, label):
+              if SHA1_PATTERN.fullmatch(value) is None or set(value) == {"0"}:
+                  raise SelectorError(f"{label} must be exact nonzero lowercase SHA-1")
+              return value
+
+
+          def require_pr_number(value, label):
+              if PR_NUMBER_PATTERN.fullmatch(value) is None:
+                  raise SelectorError(f"{label} must be canonical positive decimal")
+              return int(value, 10)
+
+
+          def emit(classification, *, applicable, current_pr, target_pr, target_head):
+              output_path = required_environment("GITHUB_OUTPUT")
+              with open(output_path, "a", encoding="utf-8") as output:
+                  output.write(f"applicable={'true' if applicable else 'false'}\n")
+                  output.write(f"target-head-sha={target_head}\n")
+                  output.write(f"target-pr-number={target_pr}\n")
+              print(
+                  json.dumps(
+                      {
+                          "classification": classification,
+                          "current_pr_number": current_pr,
+                          "target_head_sha": target_head,
+                          "target_pr_number": target_pr,
+                      },
+                      ensure_ascii=True,
+                      separators=(",", ":"),
+                      sort_keys=True,
+                  )
+              )
+
+
+          try:
+              if os.environ.get("GITHUB_REPOSITORY") != EXPECTED_REPOSITORY:
+                  raise SelectorError("runner repository differs")
+              if required_environment("EVENT_REPOSITORY") != EXPECTED_REPOSITORY:
+                  raise SelectorError("event repository differs")
+              if required_environment("PR_BASE_REF") != EXPECTED_BASE_REF:
+                  raise SelectorError("pull-request base branch differs")
+              current_head_repository = required_environment("PR_HEAD_REPOSITORY")
+              current_pr = require_pr_number(
+                  required_environment("PR_NUMBER"),
+                  "pull-request number",
+              )
+              current_head = require_sha(
+                  required_environment("PR_HEAD_SHA"),
+                  "pull-request head",
+              )
+              target_pr = require_pr_number(
+                  required_environment("CISCO_CUTOVER_TARGET_PR_NUMBER"),
+                  "target pull-request number",
+              )
+              target_head = require_sha(
+                  required_environment("CISCO_CUTOVER_TARGET_HEAD_SHA"),
+                  "target pull-request head",
+              )
+              if current_pr == target_pr:
+                  if current_head_repository != EXPECTED_REPOSITORY:
+                      raise SelectorError("target pull-request head repository differs")
+                  if current_head != target_head:
+                      raise SelectorError("target pull-request head changed")
+          except SelectorError as error:
+              print(
+                  json.dumps(
+                      {
+                          "classification": "blocked_until_trusted",
+                          "reason": str(error),
+                      },
+                      ensure_ascii=True,
+                      separators=(",", ":"),
+                      sort_keys=True,
+                  )
+              )
+              raise SystemExit(1)
+
+          emit(
+              "target" if current_pr == target_pr else "not_applicable",
+              applicable=current_pr == target_pr,
+              current_pr=current_pr,
+              target_pr=target_pr,
+              target_head=target_head,
+          )
+          SELECTOR_PY
+
   cisco-cutover-admission:
     name: cisco-cutover-admission
+    needs: cisco-cutover-selector
+    if: needs.cisco-cutover-selector.outputs.applicable == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 2
     steps:
@@ -24,13 +156,18 @@ jobs:
           PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
           PR_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          SELECTED_TARGET_HEAD_SHA: ${{ needs.cisco-cutover-selector.outputs.target-head-sha }}
+          SELECTED_TARGET_PR_NUMBER: ${{ needs.cisco-cutover-selector.outputs.target-pr-number }}
           CISCO_CUTOVER_RECEIPT_BASE64: ${{ vars.CISCO_CUTOVER_RECEIPT_BASE64 }}
           CISCO_CUTOVER_EXPECTED_CANONICAL_COMMIT: ${{ vars.CISCO_CUTOVER_EXPECTED_CANONICAL_COMMIT }}
           CISCO_CUTOVER_EXPECTED_PRIVATE_RELEASE_COMMIT: ${{ vars.CISCO_CUTOVER_EXPECTED_PRIVATE_RELEASE_COMMIT }}
           CISCO_CUTOVER_EXPECTED_RELEASE_MANIFEST_SHA256: ${{ vars.CISCO_CUTOVER_EXPECTED_RELEASE_MANIFEST_SHA256 }}
           CISCO_CUTOVER_EXPECTED_RECEIPT_SHA256: ${{ vars.CISCO_CUTOVER_EXPECTED_RECEIPT_SHA256 }}
+          CISCO_CUTOVER_EXPECTED_WORKFLOW_ID: ${{ vars.CISCO_CUTOVER_EXPECTED_WORKFLOW_ID }}
+          CISCO_CUTOVER_EXPECTED_WORKFLOW_SHA: ${{ vars.CISCO_CUTOVER_EXPECTED_WORKFLOW_SHA }}
         run: |
-          python3 - <<'PY'
+          python3 - <<'ADMISSION_PY'
           import base64
           import binascii
           import hashlib
@@ -40,9 +177,14 @@ jobs:
           import sys
 
           EXPECTED_REPOSITORY = "Joey-Tools/codex-debug-triage"
+          EXPECTED_REPOSITORY_ID = 1242512092
           EXPECTED_PRIVATE_REPOSITORY = "Joey-Tools/codex-private-workflows"
           EXPECTED_BASE_REF = "master"
-          MAX_RECEIPT_BYTES = 64 * 1024
+          EXPECTED_WORKFLOW_PATH = ".github/workflows/cisco-cutover-admission.yml"
+          EXPECTED_WORKFLOW_REF = "refs/heads/master"
+          EXPECTED_WORKFLOW_EVENT = "pull_request_target"
+          EXPECTED_CHECK_NAME = "cisco-cutover-admission"
+          MAX_RECEIPT_BYTES = 35 * 1024
           MAX_RECEIPT_BASE64_CHARS = 4 * ((MAX_RECEIPT_BYTES + 2) // 3)
           MAX_JSON_DEPTH = 64
           MAX_JSON_NODES = 4_096
@@ -51,6 +193,7 @@ jobs:
           MAX_JSON_STRING_CHARS = 32 * 1024
           SHA1_PATTERN = re.compile(r"[0-9a-f]{40}")
           SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
+          POSITIVE_INTEGER_PATTERN = re.compile(r"[1-9][0-9]*")
           PLACEHOLDERS = frozenset(
               {
                   "change-me",
@@ -135,6 +278,15 @@ jobs:
               if set(value) == {"0"}:
                   raise AdmissionError(f"{label} must not be all-zero")
               return value
+
+
+          def require_positive_integer(value, label):
+              if (
+                  type(value) is not str
+                  or POSITIVE_INTEGER_PATTERN.fullmatch(value) is None
+              ):
+                  raise AdmissionError(f"{label} must be canonical positive decimal")
+              return int(value, 10)
 
 
           def reject_float(_value):
@@ -259,6 +411,7 @@ jobs:
                       "private_release_commit",
                       "release_manifest_sha256",
                       "release_target",
+                      "cutover",
                       "activation",
                       "gates",
                       "installed_pointer",
@@ -267,7 +420,7 @@ jobs:
               )
               if type(receipt["schema_version"]) is not int:
                   raise AdmissionError("receipt schema_version must be an integer")
-              if receipt["schema_version"] != 1:
+              if receipt["schema_version"] != 2:
                   raise AdmissionError("receipt schema_version differs")
               if receipt["canonical_repository"] != EXPECTED_REPOSITORY:
                   raise AdmissionError("receipt canonical repository differs")
@@ -282,6 +435,30 @@ jobs:
               release_target = f"releases/{expected['private_release']}"
               if receipt["release_target"] != release_target:
                   raise AdmissionError("receipt release target differs")
+              expected_cutover = {
+                  "target_repository": {
+                      "id": EXPECTED_REPOSITORY_ID,
+                      "full_name": EXPECTED_REPOSITORY,
+                      "default_branch": EXPECTED_BASE_REF,
+                  },
+                  "pull_request": {
+                      "number": expected["pull_request_number"],
+                      "head_sha": expected["canonical_commit"],
+                      "base_ref": EXPECTED_BASE_REF,
+                  },
+                  "required_workflow": {
+                      "id": expected["workflow_id"],
+                      "repository_id": EXPECTED_REPOSITORY_ID,
+                      "repository_full_name": EXPECTED_REPOSITORY,
+                      "path": EXPECTED_WORKFLOW_PATH,
+                      "ref": EXPECTED_WORKFLOW_REF,
+                      "sha": expected["workflow_sha"],
+                      "event": EXPECTED_WORKFLOW_EVENT,
+                      "check_name": EXPECTED_CHECK_NAME,
+                  },
+              }
+              if not exact_equal(receipt["cutover"], expected_cutover):
+                  raise AdmissionError("receipt cutover contract differs")
               if not exact_equal(receipt["activation"], EXPECTED_ACTIVATION):
                   raise AdmissionError("receipt activation differs")
               gates = receipt["gates"]
@@ -340,6 +517,19 @@ jobs:
                   SHA1_PATTERN,
                   "pull-request head SHA",
               )
+              pull_request_number = require_positive_integer(
+                  required_environment("PR_NUMBER"),
+                  "pull-request number",
+              )
+              selected_target_head = require_sha(
+                  required_environment("SELECTED_TARGET_HEAD_SHA"),
+                  SHA1_PATTERN,
+                  "selected target head",
+              )
+              selected_target_pr = require_positive_integer(
+                  required_environment("SELECTED_TARGET_PR_NUMBER"),
+                  "selected target pull-request number",
+              )
               expected = {
                   "canonical_commit": require_sha(
                       required_environment(
@@ -369,7 +559,22 @@ jobs:
                       SHA256_PATTERN,
                       "expected receipt SHA-256",
                   ),
+                  "workflow_id": require_positive_integer(
+                      required_environment("CISCO_CUTOVER_EXPECTED_WORKFLOW_ID"),
+                      "expected workflow ID",
+                  ),
+                  "workflow_sha": require_sha(
+                      required_environment("CISCO_CUTOVER_EXPECTED_WORKFLOW_SHA"),
+                      SHA1_PATTERN,
+                      "expected workflow SHA",
+                  ),
+                  "pull_request_number": pull_request_number,
               }
+              if (
+                  selected_target_pr != pull_request_number
+                  or selected_target_head != head_sha
+              ):
+                  raise AdmissionError("selector output differs from target event")
               if expected["canonical_commit"] != head_sha:
                   raise AdmissionError(
                       "trusted canonical expectation differs from PR head"
@@ -391,11 +596,26 @@ jobs:
                       "classification": "admitted",
                       "pointer_target": release_target,
                       "private_release_commit": expected["private_release"],
+                      "pull_request_number": expected["pull_request_number"],
                       "receipt_sha256": actual_receipt_sha256,
+                      "workflow_id": expected["workflow_id"],
+                      "workflow_sha": expected["workflow_sha"],
                   },
                   ensure_ascii=True,
                   separators=(",", ":"),
                   sort_keys=True,
               )
           )
-          PY
+          ADMISSION_PY
+
+  cisco-cutover-neutral:
+    name: cisco-cutover-neutral
+    needs: cisco-cutover-selector
+    if: needs.cisco-cutover-selector.outputs.applicable == 'false'
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    steps:
+      - name: Record non-target applicability
+        shell: bash --noprofile --norc -euo pipefail {0}
+        run: |
+          printf '%s\n' '{"classification":"not_applicable","target_evidence_consumed":false}'

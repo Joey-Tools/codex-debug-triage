@@ -1,5 +1,5 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "source_organization": {
     "id": 283943935,
     "login": "Joey-Tools"
@@ -43,6 +43,14 @@
     },
     "do_not_enforce_on_create": false,
     "require_exact_sha": true
+  },
+  "applicability_selector": {
+    "target_pr_number_variable": "CISCO_CUTOVER_TARGET_PR_NUMBER",
+    "target_head_sha_variable": "CISCO_CUTOVER_TARGET_HEAD_SHA",
+    "selector_job_name": "cisco-cutover-selector",
+    "target_job_name": "cisco-cutover-admission",
+    "neutral_job_name": "cisco-cutover-neutral",
+    "non_target_classification": "not_applicable"
   },
   "disallowed_status_contexts": [
     "cisco-cutover-admission"

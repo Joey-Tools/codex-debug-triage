@@ -12,9 +12,10 @@ import stat
 import time
 from typing import Any
 
-CONTRACT_SCHEMA_VERSION = 2
-RECEIPT_SCHEMA_VERSION = 1
+CONTRACT_SCHEMA_VERSION = 3
+RECEIPT_SCHEMA_VERSION = 2
 DEFAULT_MAX_JSON_BYTES = 64 * 1024
+MAX_RECEIPT_BYTES = 35 * 1024
 JSON_READ_TIMEOUT_SECONDS = 1.0
 MAX_JSON_DEPTH = 64
 MAX_JSON_CONTAINERS = 1_024
@@ -25,15 +26,25 @@ MAX_JSON_STRING_CHARS = 32 * 1024
 MAX_BLOCKED_REASON_CHARS = 1_024
 SHA1_PATTERN = re.compile(r"[0-9a-f]{40}")
 SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
+POSITIVE_DECIMAL_PATTERN = re.compile(r"[1-9][0-9]*")
 VALIDATOR_PATH = "scripts/validate_cisco_cutover_receipt.py"
 REQUIRED_EXACT_INPUTS = [
     "expected_canonical_commit",
+    "expected_pull_request_number",
     "expected_private_release_commit",
     "expected_release_manifest_sha256",
     "expected_receipt_sha256",
+    "expected_workflow_id",
+    "expected_workflow_sha",
 ]
 EXPECTED_CANONICAL_REPOSITORY = "Joey-Tools/codex-debug-triage"
+EXPECTED_CANONICAL_REPOSITORY_ID = 1242512092
+EXPECTED_DEFAULT_BRANCH = "master"
 EXPECTED_PRIVATE_AGGREGATE_REPOSITORY = "Joey-Tools/codex-private-workflows"
+EXPECTED_WORKFLOW_PATH = ".github/workflows/cisco-cutover-admission.yml"
+EXPECTED_WORKFLOW_REF = "refs/heads/master"
+EXPECTED_WORKFLOW_EVENT = "pull_request_target"
+EXPECTED_WORKFLOW_CHECK_NAME = "cisco-cutover-admission"
 EXPECTED_ACTIVATION = {
     "release_kind": "immutable-private-overlay",
     "atomic": True,
@@ -67,6 +78,54 @@ EXPECTED_BLOCKED_TARGETS = [
     "canonical-bug-triage-retirement-pr",
     "private-consumer-source-sync",
 ]
+EXPECTED_RETIREMENT_STATE_MACHINE = {
+    "phases": [
+        "bootstrap-workflow-merged",
+        "retirement-pr-head-frozen",
+        "private-release-receipt-published",
+        "repository-variables-configured",
+        "organization-ruleset-activated",
+        "target-workflow-observed",
+        "doctor-admitted",
+        "merge-readiness-revalidated",
+        "retirement-pr-merged",
+    ],
+    "head_change_transition": "retirement-pr-head-frozen",
+    "mutation_authority": "explicit-repository-admin-or-organization-owner",
+    "automatic_mutation": False,
+}
+EXPECTED_POST_CUTOVER_DECOMMISSION = {
+    "trigger": "retirement-pr-merged-at-frozen-head",
+    "lease_variable": "CISCO_CUTOVER_DECOMMISSION_LEASE",
+    "compare_and_swap": {
+        "coordination": "create-if-absent-repository-variable-lease",
+        "observations": [
+            "ruleset-id-and-canonical-sha256",
+            "variable-name-value-sha256-and-updated-at",
+            "workflow-path-and-blob-sha",
+        ],
+        "unsafe-conditional-requests-supported": False,
+        "revalidate-before-each-mutation": True,
+    },
+    "ordered_steps": [
+        "acquire-and-read-back-exclusive-lease",
+        "revalidate-merged-pr-head-and-doctor-receipt",
+        "disable-exact-ruleset-after-content-compare",
+        "prove-ruleset-is-not-effective",
+        "remove-workflow-in-separate-reviewed-pr",
+        "prove-workflow-absent-and-ruleset-still-inactive",
+        "delete-exact-cutover-variables-after-value-digest-and-updated-at-compare",
+        "delete-exact-inactive-ruleset-after-content-compare",
+        "prove-rule-variables-and-workflow-are-absent",
+        "delete-lease-last",
+    ],
+    "failure_policy": {
+        "before-ruleset-inactive": "leave-workflow-and-all-variables-intact",
+        "after-ruleset-inactive": "keep-ruleset-inactive-and-resume-cleanup",
+        "concurrent-drift": "abort-before-next-mutation",
+    },
+    "automatic_mutation": False,
+}
 
 
 class ReceiptAdmissionError(ValueError):
@@ -357,6 +416,13 @@ def _require_sha256(value: object, *, label: str) -> str:
     return rendered
 
 
+def _require_positive_decimal(value: object, *, label: str) -> int:
+    rendered = _require_string(value, label=label)
+    if POSITIVE_DECIMAL_PATTERN.fullmatch(rendered) is None:
+        raise ReceiptAdmissionError(f"{label} must be canonical positive decimal")
+    return int(rendered, 10)
+
+
 def _validate_contract(contract: dict[str, Any]) -> dict[str, Any]:
     contract = _require_exact_keys(
         contract,
@@ -369,6 +435,8 @@ def _validate_contract(contract: dict[str, Any]) -> dict[str, Any]:
             "trust_gates",
             "blocked_until_trusted",
             "unproved_atomicity_fallback",
+            "retirement_state_machine",
+            "post_cutover_decommission",
             "receipt_admission",
         },
         label="contract",
@@ -415,6 +483,16 @@ def _validate_contract(contract: dict[str, Any]) -> dict[str, Any]:
         "retain-bug-triage-compat",
         label="contract unproved_atomicity_fallback",
     )
+    _require_exact_json(
+        contract["retirement_state_machine"],
+        EXPECTED_RETIREMENT_STATE_MACHINE,
+        label="contract retirement_state_machine",
+    )
+    _require_exact_json(
+        contract["post_cutover_decommission"],
+        EXPECTED_POST_CUTOVER_DECOMMISSION,
+        label="contract post_cutover_decommission",
+    )
     admission = _require_exact_keys(
         contract["receipt_admission"],
         {
@@ -433,7 +511,7 @@ def _validate_contract(contract: dict[str, Any]) -> dict[str, Any]:
         "status_without_receipt": "blocked_until_trusted",
         "validator": VALIDATOR_PATH,
         "receipt_schema_version": RECEIPT_SCHEMA_VERSION,
-        "receipt_max_bytes": DEFAULT_MAX_JSON_BYTES,
+        "receipt_max_bytes": MAX_RECEIPT_BYTES,
         "producer_workflow": ".github/workflows/release.yml",
         "pointer_name": "current",
         "pointer_target_template": "releases/{private_release_commit}",
@@ -454,6 +532,9 @@ def _validate_receipt(
     expected_canonical_commit: str,
     expected_private_release_commit: str,
     expected_release_manifest_sha256: str,
+    expected_pull_request_number: int,
+    expected_workflow_id: int,
+    expected_workflow_sha: str,
 ) -> str:
     receipt = _require_exact_keys(
         receipt,
@@ -465,6 +546,7 @@ def _validate_receipt(
             "private_release_commit",
             "release_manifest_sha256",
             "release_target",
+            "cutover",
             "activation",
             "gates",
             "installed_pointer",
@@ -515,6 +597,33 @@ def _validate_receipt(
         receipt["release_target"],
         expected_target,
         label="receipt release_target",
+    )
+    expected_cutover = {
+        "target_repository": {
+            "id": EXPECTED_CANONICAL_REPOSITORY_ID,
+            "full_name": EXPECTED_CANONICAL_REPOSITORY,
+            "default_branch": EXPECTED_DEFAULT_BRANCH,
+        },
+        "pull_request": {
+            "number": expected_pull_request_number,
+            "head_sha": expected_canonical_commit,
+            "base_ref": EXPECTED_DEFAULT_BRANCH,
+        },
+        "required_workflow": {
+            "id": expected_workflow_id,
+            "repository_id": EXPECTED_CANONICAL_REPOSITORY_ID,
+            "repository_full_name": EXPECTED_CANONICAL_REPOSITORY,
+            "path": EXPECTED_WORKFLOW_PATH,
+            "ref": EXPECTED_WORKFLOW_REF,
+            "sha": expected_workflow_sha,
+            "event": EXPECTED_WORKFLOW_EVENT,
+            "check_name": EXPECTED_WORKFLOW_CHECK_NAME,
+        },
+    }
+    _require_exact_json(
+        receipt["cutover"],
+        expected_cutover,
+        label="receipt cutover",
     )
     _require_exact_json(
         receipt["activation"],
@@ -601,9 +710,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--contract", required=True)
     parser.add_argument("--receipt")
     parser.add_argument("--expected-canonical-commit")
+    parser.add_argument("--expected-pull-request-number")
     parser.add_argument("--expected-private-release-commit")
     parser.add_argument("--expected-release-manifest-sha256")
     parser.add_argument("--expected-receipt-sha256")
+    parser.add_argument("--expected-workflow-id")
+    parser.add_argument("--expected-workflow-sha")
     return parser
 
 
@@ -621,9 +733,12 @@ def main(argv: list[str] | None = None) -> int:
 
         expectations = {
             "expected_canonical_commit": args.expected_canonical_commit,
+            "expected_pull_request_number": args.expected_pull_request_number,
             "expected_private_release_commit": (args.expected_private_release_commit),
             "expected_release_manifest_sha256": (args.expected_release_manifest_sha256),
             "expected_receipt_sha256": args.expected_receipt_sha256,
+            "expected_workflow_id": args.expected_workflow_id,
+            "expected_workflow_sha": args.expected_workflow_sha,
         }
         missing = [name for name in REQUIRED_EXACT_INPUTS if not expectations[name]]
         if missing:
@@ -647,6 +762,18 @@ def main(argv: list[str] | None = None) -> int:
             args.expected_receipt_sha256,
             label="expected receipt sha256",
         )
+        expected_pull_request_number = _require_positive_decimal(
+            args.expected_pull_request_number,
+            label="expected pull-request number",
+        )
+        expected_workflow_id = _require_positive_decimal(
+            args.expected_workflow_id,
+            label="expected workflow ID",
+        )
+        expected_workflow_sha = _require_sha1(
+            args.expected_workflow_sha,
+            label="expected workflow SHA",
+        )
         receipt, receipt_sha256 = _read_exact_json(
             pathlib.Path(args.receipt),
             label="receipt",
@@ -662,6 +789,9 @@ def main(argv: list[str] | None = None) -> int:
             expected_canonical_commit=expected_canonical_commit,
             expected_private_release_commit=expected_private_release_commit,
             expected_release_manifest_sha256=(expected_release_manifest_sha256),
+            expected_pull_request_number=expected_pull_request_number,
+            expected_workflow_id=expected_workflow_id,
+            expected_workflow_sha=expected_workflow_sha,
         )
     except (OSError, ReceiptAdmissionError) as error:
         return _blocked(str(error))
@@ -673,8 +803,11 @@ def main(argv: list[str] | None = None) -> int:
                 "classification": "admitted",
                 "pointer_target": pointer_target,
                 "private_release_commit": expected_private_release_commit,
+                "pull_request_number": expected_pull_request_number,
                 "receipt_sha256": receipt_sha256,
                 "release_manifest_sha256": expected_release_manifest_sha256,
+                "workflow_id": expected_workflow_id,
+                "workflow_sha": expected_workflow_sha,
             },
             ensure_ascii=True,
             separators=(",", ":"),

@@ -17,7 +17,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-CONTRACT_SCHEMA_VERSION = 2
+CONTRACT_SCHEMA_VERSION = 3
 COLLECTOR_SCHEMA_VERSION = 2
 API_HOST = "github.com"
 API_ROOT = "https://api.github.com"
@@ -41,16 +41,33 @@ MAX_JSON_CONTAINER_ITEMS = 16_384
 MAX_JSON_INTEGER_DIGITS = 64
 MAX_JSON_STRING_CHARS = 128 * 1024
 SHA1_PATTERN = re.compile(r"[0-9a-f]{40}")
+HTTP_STATUS_PATTERN = re.compile(rb"\(HTTP ([1-5][0-9]{2})\)")
 
 
 class EnforcementDoctorError(ValueError):
-    def __init__(self, reason_code: str, reason: str) -> None:
+    def __init__(
+        self,
+        reason_code: str,
+        reason: str,
+        *,
+        api_failure: Optional[dict[str, Any]] = None,
+    ) -> None:
         super().__init__(reason)
         self.reason_code = reason_code
+        self.api_failure = api_failure
 
 
-def _blocked(reason_code: str, reason: str) -> EnforcementDoctorError:
-    return EnforcementDoctorError(reason_code, reason)
+def _blocked(
+    reason_code: str,
+    reason: str,
+    *,
+    api_failure: Optional[dict[str, Any]] = None,
+) -> EnforcementDoctorError:
+    return EnforcementDoctorError(
+        reason_code,
+        reason,
+        api_failure=api_failure,
+    )
 
 
 def _reject_json_float(value: str) -> None:
@@ -303,6 +320,7 @@ def _load_contract(contract: dict[str, Any]) -> dict[str, Any]:
             "target_repository",
             "ruleset",
             "required_workflow",
+            "applicability_selector",
             "disallowed_status_contexts",
         },
         label="contract",
@@ -425,6 +443,23 @@ def _load_contract(contract: dict[str, Any]) -> dict[str, Any]:
         raise _blocked(
             "invalid-contract", "contract permits enforcement bypass on create"
         )
+    applicability = _exact_dict(
+        contract["applicability_selector"],
+        label="contract applicability selector",
+    )
+    expected_applicability = {
+        "target_pr_number_variable": "CISCO_CUTOVER_TARGET_PR_NUMBER",
+        "target_head_sha_variable": "CISCO_CUTOVER_TARGET_HEAD_SHA",
+        "selector_job_name": "cisco-cutover-selector",
+        "target_job_name": workflow["check_name"],
+        "neutral_job_name": "cisco-cutover-neutral",
+        "non_target_classification": "not_applicable",
+    }
+    if applicability != expected_applicability:
+        raise _blocked(
+            "invalid-contract",
+            "contract applicability selector differs",
+        )
     disallowed = _exact_list(
         contract["disallowed_status_contexts"],
         label="contract disallowed status contexts",
@@ -444,9 +479,128 @@ def _kill_process(process: subprocess.Popen[bytes]) -> None:
         pass
 
 
+def _api_failure(
+    endpoint_class: str,
+    *,
+    http_status: Optional[int],
+    failure_kind: str,
+) -> dict[str, Any]:
+    return {
+        "endpoint_class": endpoint_class,
+        "failure_kind": failure_kind,
+        "http_status": http_status,
+    }
+
+
+def _api_endpoint_class(endpoint: str) -> str:
+    components = endpoint.strip("/").split("/")
+    if endpoint == "/user":
+        return "authenticated-user"
+    if len(components) == 2 and components[0] == "orgs":
+        return "organization"
+    if (
+        len(components) == 4
+        and components[:1] == ["orgs"]
+        and components[2] == "rulesets"
+    ):
+        return "organization-ruleset"
+    if (
+        len(components) == 4
+        and components[:1] == ["enterprises"]
+        and components[2] == "rulesets"
+    ):
+        return "enterprise-ruleset"
+    if len(components) >= 3 and components[0] == "repos":
+        suffix = components[3:]
+        if not suffix:
+            return "repository"
+        if suffix[:1] == ["pulls"]:
+            return "pull-request"
+        if suffix[:1] == ["rulesets"]:
+            return "effective-rulesets" if len(suffix) == 1 else "repository-ruleset"
+        if suffix[:2] == ["actions", "variables"]:
+            return "actions-variable"
+        if suffix[:2] == ["actions", "workflows"]:
+            return "workflow-metadata"
+        if suffix[:2] == ["actions", "runs"]:
+            return (
+                "workflow-jobs"
+                if "attempts" in suffix and suffix[-1:] == ["jobs"]
+                else "workflow-runs"
+            )
+        if suffix[:1] == ["commits"]:
+            return "check-runs" if suffix[-1:] == ["check-runs"] else "commit"
+    return "github-api"
+
+
+def _http_status_from_stderr(stderr: bytes) -> Optional[int]:
+    matches = HTTP_STATUS_PATTERN.findall(stderr)
+    if not matches:
+        return None
+    return int(matches[-1], 10)
+
+
+def _api_request_error(
+    *,
+    endpoint_class: str,
+    stderr: bytes,
+    authentication_preflight: bool,
+) -> EnforcementDoctorError:
+    status = _http_status_from_stderr(stderr)
+    if authentication_preflight:
+        return _blocked(
+            "blocked-authentication",
+            "GitHub authentication preflight failed",
+            api_failure=_api_failure(
+                endpoint_class,
+                http_status=status,
+                failure_kind="authentication",
+            ),
+        )
+    lowered = stderr.lower()
+    if status == 401:
+        reason_code = "blocked-authentication"
+        reason = "GitHub API authentication was rejected"
+        failure_kind = "authentication"
+    elif status == 403 and b"rate limit" in lowered:
+        reason_code = "rate-limited"
+        reason = "GitHub API rate limit blocked the read"
+        failure_kind = "rate-limit"
+    elif status == 403:
+        reason_code = "blocked-permission"
+        reason = "GitHub API permission blocked the read"
+        failure_kind = "permission"
+    elif status == 404:
+        reason_code = "not-found"
+        reason = "GitHub API object was not found or is not visible"
+        failure_kind = "not-found"
+    elif status == 429:
+        reason_code = "rate-limited"
+        reason = "GitHub API rate limit blocked the read"
+        failure_kind = "rate-limit"
+    elif status is not None and 500 <= status <= 599:
+        reason_code = "api-unavailable"
+        reason = "GitHub API service failed the read"
+        failure_kind = "server-error"
+    else:
+        reason_code = "api-unavailable"
+        reason = "GitHub API read failed without a recognized HTTP status"
+        failure_kind = "unclassified"
+    return _blocked(
+        reason_code,
+        reason,
+        api_failure=_api_failure(
+            endpoint_class,
+            http_status=status,
+            failure_kind=failure_kind,
+        ),
+    )
+
+
 def _bounded_subprocess(
     command: list[str],
     *,
+    endpoint_class: str,
     timeout_seconds: int,
     stdout_limit: int,
     stderr_limit: int,
@@ -463,6 +617,11 @@ def _bounded_subprocess(
         raise _blocked(
             "collector-unavailable",
             "cannot start the fixed GitHub CLI collector",
+            api_failure=_api_failure(
+                endpoint_class,
+                http_status=None,
+                failure_kind="process-start",
+            ),
         ) from error
     assert process.stdout is not None
     assert process.stderr is not None
@@ -481,6 +640,11 @@ def _bounded_subprocess(
                 raise _blocked(
                     "api-timeout",
                     "GitHub API collector command exceeded its deadline",
+                    api_failure=_api_failure(
+                        endpoint_class,
+                        http_status=None,
+                        failure_kind="timeout",
+                    ),
                 )
             events = selector.select(timeout=min(0.25, remaining))
             if not events:
@@ -498,6 +662,11 @@ def _bounded_subprocess(
                     raise _blocked(
                         "api-response-too-large",
                         f"GitHub collector {stream_name} exceeded its byte ceiling",
+                        api_failure=_api_failure(
+                            endpoint_class,
+                            http_status=None,
+                            failure_kind="response-too-large",
+                        ),
                     )
                 chunks[stream_name].append(chunk)
         return_code = process.wait(
@@ -509,6 +678,11 @@ def _bounded_subprocess(
         raise _blocked(
             "api-timeout",
             "GitHub API collector command exceeded its deadline",
+            api_failure=_api_failure(
+                endpoint_class,
+                http_status=None,
+                failure_kind="timeout",
+            ),
         ) from error
     finally:
         selector.close()
@@ -536,35 +710,59 @@ class GitHubApiClient:
         self.total_bytes = 0
         self.deadline = time.monotonic() + MAX_COLLECTION_SECONDS
 
-    def _run(self, command: list[str], *, stdout_limit: int) -> bytes:
+    def _run(
+        self,
+        command: list[str],
+        *,
+        endpoint_class: str,
+        stdout_limit: int,
+        authentication_preflight: bool = False,
+    ) -> bytes:
         if self.calls >= MAX_API_CALLS:
             raise _blocked(
                 "api-call-limit",
                 "GitHub collector exceeded its API call ceiling",
+                api_failure=_api_failure(
+                    endpoint_class,
+                    http_status=None,
+                    failure_kind="call-limit",
+                ),
             )
         remaining = self.deadline - time.monotonic()
         if remaining <= 0:
             raise _blocked(
                 "api-timeout",
                 "GitHub evidence collection exceeded its total deadline",
+                api_failure=_api_failure(
+                    endpoint_class,
+                    http_status=None,
+                    failure_kind="timeout",
+                ),
             )
         self.calls += 1
         return_code, stdout, stderr = _bounded_subprocess(
             command,
+            endpoint_class=endpoint_class,
             timeout_seconds=max(1, min(MAX_API_SECONDS, int(remaining))),
             stdout_limit=stdout_limit,
             stderr_limit=MAX_API_STDERR_BYTES,
         )
         if return_code != 0:
-            raise _blocked(
-                "api-request-failed",
-                "authenticated GitHub read failed without exposing command output",
+            raise _api_request_error(
+                endpoint_class=endpoint_class,
+                stderr=stderr,
+                authentication_preflight=authentication_preflight,
             )
         self.total_bytes += len(stdout) + len(stderr)
         if self.total_bytes > MAX_API_TOTAL_BYTES:
             raise _blocked(
                 "api-response-too-large",
                 "GitHub collector exceeded its aggregate response ceiling",
+                api_failure=_api_failure(
+                    endpoint_class,
+                    http_status=None,
+                    failure_kind="response-too-large",
+                ),
             )
         return stdout
 
@@ -577,7 +775,9 @@ class GitHubApiClient:
                 "--hostname",
                 API_HOST,
             ],
+            endpoint_class="authentication-preflight",
             stdout_limit=MAX_API_STDERR_BYTES,
+            authentication_preflight=True,
         )
         user = self.get_json("/user")
         user_object = _exact_dict(user, label="authenticated GitHub user")
@@ -625,8 +825,26 @@ class GitHubApiClient:
                 )
             rendered = str(value).lower() if type(value) is bool else str(value)
             command.extend(["-f", f"{key}={rendered}"])
-        payload = self._run(command, stdout_limit=MAX_API_RESPONSE_BYTES)
-        return _parse_json_bytes(payload, label=f"GitHub API {endpoint}")
+        endpoint_class = _api_endpoint_class(endpoint)
+        payload = self._run(
+            command,
+            endpoint_class=endpoint_class,
+            stdout_limit=MAX_API_RESPONSE_BYTES,
+        )
+        try:
+            return _parse_json_bytes(payload, label=f"GitHub API {endpoint_class}")
+        except EnforcementDoctorError as error:
+            if error.reason_code != "invalid-json":
+                raise
+            raise _blocked(
+                "api-unavailable",
+                "GitHub API returned malformed JSON",
+                api_failure=_api_failure(
+                    endpoint_class,
+                    http_status=200,
+                    failure_kind="malformed-json",
+                ),
+            ) from error
 
 
 def _record_object_read(
@@ -961,6 +1179,19 @@ def _normalize_commit(value: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _normalize_actions_variable(value: dict[str, Any]) -> dict[str, str]:
+    return {
+        "name": _exact_string(
+            value.get("name"),
+            label="Actions variable name",
+        ),
+        "value": _exact_string(
+            value.get("value"),
+            label="Actions variable value",
+        ),
+    }
+
+
 def _normalize_pr_link(value: object, *, label: str) -> dict[str, Any]:
     link = _exact_dict(value, label=label)
     base = _exact_dict(link.get("base"), label=f"{label} base")
@@ -1217,6 +1448,23 @@ def _assert_static_identity(
             "pull-request-identity-mismatch",
             "pull request API URL differs",
         )
+    selector = contract["applicability_selector"]
+    expected_selector_variables = {
+        "selector_target_pr_number": {
+            "name": selector["target_pr_number_variable"],
+            "value": str(pull_request_number),
+        },
+        "selector_target_head_sha": {
+            "name": selector["target_head_sha_variable"],
+            "value": candidate_head_sha,
+        },
+    }
+    for field, expected_variable in expected_selector_variables.items():
+        if snapshot[field] != expected_variable:
+            raise _blocked(
+                "selector-mismatch",
+                "administrator applicability selector differs from the target PR",
+            )
     ruleset = snapshot["selected_ruleset"]
     if ruleset["id"] != expected_ruleset_id:
         raise _blocked(
@@ -1320,6 +1568,31 @@ def _collect_snapshot(
             endpoint=f"/repos/{target_name}/pulls/{pull_request_number}",
         )
     )
+    selector_contract = contract["applicability_selector"]
+    selector_target_pr_number = _normalize_actions_variable(
+        _get_object(
+            client,
+            trace,
+            phase=phase,
+            label="selector target pull-request number",
+            endpoint=(
+                f"/repos/{target_name}/actions/variables/"
+                f"{selector_contract['target_pr_number_variable']}"
+            ),
+        )
+    )
+    selector_target_head_sha = _normalize_actions_variable(
+        _get_object(
+            client,
+            trace,
+            phase=phase,
+            label="selector target head SHA",
+            endpoint=(
+                f"/repos/{target_name}/actions/variables/"
+                f"{selector_contract['target_head_sha_variable']}"
+            ),
+        )
+    )
     effective_ruleset_values = _collect_pages(
         client,
         trace,
@@ -1400,6 +1673,8 @@ def _collect_snapshot(
         "organization": organization,
         "pull_request": pull_request,
         "repository": repository,
+        "selector_target_head_sha": selector_target_head_sha,
+        "selector_target_pr_number": selector_target_pr_number,
         "selected_ruleset": selected_ruleset,
         "workflow": workflow,
         "workflow_source_commit": workflow_source_commit,
@@ -1915,6 +2190,8 @@ def validate_enforcement(
             "organization",
             "repository",
             "pull_request",
+            "selector_target_head_sha",
+            "selector_target_pr_number",
             "effective_rulesets",
             "selected_ruleset",
             "workflow_source_repository",
@@ -1951,6 +2228,8 @@ def validate_enforcement(
         "organization": snapshot["organization"],
         "repository": snapshot["repository"],
         "pull_request": snapshot["pull_request"],
+        "selector_target_head_sha": snapshot["selector_target_head_sha"],
+        "selector_target_pr_number": snapshot["selector_target_pr_number"],
         "selected_ruleset": _ruleset_protected_fields(snapshot["selected_ruleset"]),
         "workflow_source_repository": snapshot["workflow_source_repository"],
         "workflow": snapshot["workflow"],
@@ -2118,17 +2397,20 @@ def main() -> int:
         )
         evidence_sha256 = hashlib.sha256(_canonical_json_bytes(evidence)).hexdigest()
     except EnforcementDoctorError as error:
+        blocked_receipt = {
+            "classification": "blocked_until_trusted",
+            "contract_sha256": contract_sha256,
+            "evidence_sha256": evidence_sha256,
+            "operation": "cisco-cutover-enforcement-doctor",
+            "reason": str(error),
+            "reason_code": error.reason_code,
+            "schema_version": 3,
+        }
+        if error.api_failure is not None:
+            blocked_receipt["api_failure"] = error.api_failure
         print(
             json.dumps(
-                {
-                    "classification": "blocked_until_trusted",
-                    "contract_sha256": contract_sha256,
-                    "evidence_sha256": evidence_sha256,
-                    "operation": "cisco-cutover-enforcement-doctor",
-                    "reason": str(error),
-                    "reason_code": error.reason_code,
-                    "schema_version": 2,
-                },
+                blocked_receipt,
                 ensure_ascii=True,
                 separators=(",", ":"),
                 sort_keys=True,
@@ -2146,6 +2428,12 @@ def main() -> int:
     print(
         json.dumps(
             {
+                "applicability_selector": {
+                    "target_head_sha": revalidated_snapshot["selector_target_head_sha"],
+                    "target_pr_number": revalidated_snapshot[
+                        "selector_target_pr_number"
+                    ],
+                },
                 "candidate": {
                     "base_ref": pull_request["base"]["ref"],
                     "base_repository_id": pull_request["base"]["repository"]["id"],
@@ -2175,7 +2463,7 @@ def main() -> int:
                     "source_type": contract["ruleset"]["source_type"],
                     "target": selected_ruleset["target"],
                 },
-                "schema_version": 2,
+                "schema_version": 3,
                 "trusted_execution": {
                     "check_run": {
                         "app": trusted_check["app"],
