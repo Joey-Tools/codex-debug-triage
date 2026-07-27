@@ -180,8 +180,12 @@ start a new session. A caller that needs a hard external return bound should
 start the helper in one dedicated process group and apply TERM/KILL to that
 whole group, which then contains both the helper and any catastrophic-regex
 worker. Internal timeout cleanup still terminates and reaps the individual
-worker. Decoded member text escapes terminal control and non-printing
-characters before output character accounting and publication.
+worker. Worker teardown masks `SIGALRM` across TERM/KILL/reap and pipe closure,
+then restores the command deadline classification only after terminal reap is
+confirmed. If terminal reap cannot be proven, cleanup retains the authoritative
+process handle plus the observed PID/process-group recovery identity instead of
+discarding the handle. Decoded member text escapes terminal control and
+non-printing characters before output character accounting and publication.
 
 ## 5. Report Decisive Evidence
 

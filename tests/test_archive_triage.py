@@ -1896,6 +1896,154 @@ class ArchiveTriageTests(unittest.TestCase):
         self.assertIsNotNone(process.poll())
 
     @unittest.skipUnless(
+        os.name == "posix"
+        and hasattr(os, "killpg")
+        and all(
+            hasattr(signal, name)
+            for name in (
+                "SIGALRM",
+                "ITIMER_REAL",
+                "setitimer",
+                "pthread_sigmask",
+                "sigpending",
+                "SIG_BLOCK",
+                "SIG_SETMASK",
+            )
+        ),
+        "deadline teardown transaction requires POSIX signal timers",
+    )
+    def test_command_deadline_during_regex_teardown_reaps_worker_group(
+        self,
+    ) -> None:
+        real_popen = subprocess.Popen
+        matcher = MODULE.IsolatedRegexMatcher(
+            "safe",
+            ignore_case=False,
+            budget=MODULE.RegexMatchBudget(),
+        )
+        deadline = MODULE.ArchiveCommandDeadline()
+        process = None
+        worker_pgid = None
+        initial_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+
+        def isolated_worker_popen(
+            *args: object,
+            **kwargs: object,
+        ) -> subprocess.Popen[bytes]:
+            isolated_kwargs = dict(kwargs)
+            isolated_kwargs["start_new_session"] = True
+            return real_popen(*args, **isolated_kwargs)
+
+        try:
+            with mock.patch.object(
+                MODULE.subprocess,
+                "Popen",
+                side_effect=isolated_worker_popen,
+            ):
+                matcher.__enter__()
+            process = matcher._process
+            self.assertIsNotNone(process)
+            assert process is not None
+            worker_pgid = os.getpgid(process.pid)
+            self.assertEqual(worker_pgid, process.pid)
+
+            deadline.arm()
+            self.assertTrue(matcher.search("safe"))
+            real_terminate = process.terminate
+
+            def terminate_after_alarm_is_pending() -> None:
+                current_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+                self.assertIn(signal.SIGALRM, current_mask)
+                deadline.deadline = time.monotonic() + 0.01
+                signal.setitimer(
+                    signal.ITIMER_REAL,
+                    0.01,
+                    MODULE.ARCHIVE_DEADLINE_RETRY_SECONDS,
+                )
+                pending_deadline = time.monotonic() + 1.0
+                while (
+                    signal.SIGALRM not in signal.sigpending()
+                    and time.monotonic() < pending_deadline
+                ):
+                    time.sleep(0.005)
+                self.assertIn(signal.SIGALRM, signal.sigpending())
+                real_terminate()
+
+            with mock.patch.object(
+                process,
+                "terminate",
+                side_effect=terminate_after_alarm_is_pending,
+            ):
+                with self.assertRaises(MODULE.ArtifactLimitError) as deadline_error:
+                    matcher.close()
+            self.assertIs(
+                type(deadline_error.exception),
+                MODULE.ArtifactLimitError,
+            )
+            self.assertEqual(
+                str(deadline_error.exception),
+                "archive command deadline exceeded",
+            )
+            self.assertIsNone(matcher._process)
+            self.assertIsNotNone(process.poll())
+        finally:
+            try:
+                signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGALRM})
+                deadline.close()
+            finally:
+                signal.pthread_sigmask(signal.SIG_SETMASK, initial_mask)
+                if process is not None and process.poll() is None:
+                    process.kill()
+                    process.wait(timeout=2)
+
+        assert worker_pgid is not None
+        with self.assertRaises(ProcessLookupError):
+            os.killpg(worker_pgid, 0)
+
+    def test_regex_cleanup_failure_retains_authoritative_process_handle(
+        self,
+    ) -> None:
+        matcher = MODULE.IsolatedRegexMatcher(
+            "safe",
+            ignore_case=False,
+            budget=MODULE.RegexMatchBudget(),
+        )
+        process = mock.Mock()
+        process.pid = 4242
+        process.poll.return_value = None
+        process.wait.side_effect = (
+            subprocess.TimeoutExpired("regex-worker", 0.5),
+            subprocess.TimeoutExpired("regex-worker", 0.5),
+        )
+        process.stdin = mock.Mock()
+        process.stdout = mock.Mock()
+        matcher._process = process
+
+        with mock.patch.object(
+            MODULE.os,
+            "getpgid",
+            return_value=4343,
+            create=True,
+        ):
+            with self.assertRaises(MODULE.RegexWorkerCleanupError) as cleanup_error:
+                matcher.close()
+
+        error = cleanup_error.exception
+        self.assertIs(matcher._process, process)
+        self.assertIs(error.process, process)
+        self.assertEqual(error.pid, 4242)
+        self.assertEqual(error.process_group_id, 4343)
+        self.assertEqual(error.cleanup_stage, "final-poll")
+        self.assertEqual(error.recovery["reap_status"], "unproven")
+        self.assertEqual(error.recovery["process_handle"], "retained")
+        self.assertEqual(matcher._cleanup_recovery, error.recovery)
+        process.terminate.assert_called_once_with()
+        process.kill.assert_called_once_with()
+        self.assertEqual(process.wait.call_count, 2)
+        process.stdin.close.assert_called_once_with()
+        process.stdout.close.assert_called_once_with()
+
+    @unittest.skipUnless(
         os.name == "posix" and hasattr(os, "killpg"),
         "process-group containment requires POSIX",
     )
@@ -5009,6 +5157,8 @@ class BugTriageDocumentationTests(unittest.TestCase):
         self.assertIn("inherits the helper's process group", recipe)
         self.assertIn("must never call `setsid`", recipe)
         self.assertIn("apply TERM/KILL to that", recipe)
+        self.assertIn("masks `SIGALRM` across TERM/KILL/reap", recipe)
+        self.assertIn("retains the authoritative\nprocess handle", recipe)
         self.assertIn("validation drain", recipe)
         self.assertIn("temporarily enables `O_NONBLOCK`", recipe)
         self.assertIn("FIFO, socket, or terminal descriptor", recipe)
