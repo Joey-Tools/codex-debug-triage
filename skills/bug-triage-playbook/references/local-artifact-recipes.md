@@ -182,9 +182,16 @@ whole group, which then contains both the helper and any catastrophic-regex
 worker. Internal timeout cleanup still terminates and reaps the individual
 worker. Worker teardown masks `SIGALRM` across TERM/KILL/reap and pipe closure,
 then restores the command deadline classification only after terminal reap is
-confirmed. If terminal reap cannot be proven, cleanup retains the authoritative
-process handle plus the observed PID/process-group recovery identity instead of
-discarding the handle. Decoded member text escapes terminal control and
+confirmed. A retryable cleanup-state handshake starts before signal-support
+inspection, so alarms at that boundary are recorded instead of escaping.
+Cleanup performs exactly one blocking mask call, preserves that call's true
+original mask, and restores only that exact mask after reap and pipe closure;
+it never treats a retry's already-blocked state as the original. The timer
+remains armed, and any command expiration recorded during the deferred cleanup
+is rethrown after mask restoration instead of extending or erasing the
+deadline. If terminal reap cannot be proven, cleanup retains the authoritative
+process handle plus the observed PID/process-group recovery identity instead
+of discarding the handle. Decoded member text escapes terminal control and
 non-printing characters before output character accounting and publication.
 
 ## 5. Report Decisive Evidence

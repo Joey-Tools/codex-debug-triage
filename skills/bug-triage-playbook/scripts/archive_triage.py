@@ -113,6 +113,10 @@ REGEX_WORKER_RESPONSE_BYTES = 4 * 1024
 REGEX_WORKER_MAX_REQUEST_BYTES = (12 * DEFAULT_MAX_INPUT_LINE_CHARS) + 4 * 1024
 REGEX_WORKER_STOP_TIMEOUT_SECONDS = 0.5
 REGEX_WORKER_ARG = "--archive-triage-regex-worker"
+REGEX_CLEANUP_IDLE = "idle"
+REGEX_CLEANUP_DEFERRING = "deferring"
+REGEX_CLEANUP_MASKED = "masked"
+REGEX_CLEANUP_RESTORING = "restoring"
 
 
 def _member_identity_character_limit(max_raw_name_bytes: int) -> int:
@@ -204,6 +208,8 @@ class ArchiveCommandDeadline:
         self._closing = False
         self._diagnostic_timer_safe = False
         self._previous_handler: object | None = None
+        self._regex_cleanup_state = REGEX_CLEANUP_IDLE
+        self._regex_cleanup_deadline_error: ArtifactLimitError | None = None
 
     @staticmethod
     def _require_signal_support() -> None:
@@ -333,10 +339,92 @@ class ArchiveCommandDeadline:
 
         return self._diagnostic_timer_safe and self._armed and not self._closing
 
+    def _transition_regex_cleanup(
+        self,
+        expected_state: str,
+        next_state: str,
+    ) -> None:
+        if self._regex_cleanup_state != expected_state:
+            raise RuntimeError(
+                "archive command regex cleanup state transition failed: "
+                f"{self._regex_cleanup_state} != {expected_state}"
+            )
+        self._regex_cleanup_state = next_state
+
+    def _begin_regex_cleanup(self) -> ArtifactLimitError | None:
+        interrupted_error = None
+        while True:
+            try:
+                self._transition_regex_cleanup(
+                    REGEX_CLEANUP_IDLE,
+                    REGEX_CLEANUP_DEFERRING,
+                )
+                return interrupted_error
+            except ArtifactLimitError as error:
+                if interrupted_error is None:
+                    interrupted_error = error
+
+    def _record_regex_cleanup_deadline(self) -> ArtifactLimitError:
+        error = self._regex_cleanup_deadline_error
+        if error is None:
+            error = ArtifactLimitError("archive command deadline exceeded")
+            self._regex_cleanup_deadline_error = error
+        return error
+
+    def run_regex_worker_cleanup(
+        self,
+        cleanup: Callable[[], None],
+    ) -> None:
+        """Defer command alarms until one worker cleanup transaction completes."""
+
+        interrupted_error = self._begin_regex_cleanup()
+        previous_mask: set[signal.Signals] | None = None
+        setup_error: BaseException | None = None
+        cleanup_error: BaseException | None = None
+        restore_error: BaseException | None = None
+        try:
+            try:
+                self._require_signal_support()
+                previous_mask = signal.pthread_sigmask(
+                    signal.SIG_BLOCK,
+                    {signal.SIGALRM},
+                )
+                self._regex_cleanup_state = REGEX_CLEANUP_MASKED
+            except BaseException as error:
+                setup_error = error
+            if setup_error is None:
+                try:
+                    cleanup()
+                except BaseException as error:
+                    cleanup_error = error
+        finally:
+            if previous_mask is not None:
+                self._regex_cleanup_state = REGEX_CLEANUP_RESTORING
+                try:
+                    signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+                except BaseException as error:
+                    restore_error = error
+            self._regex_cleanup_state = REGEX_CLEANUP_IDLE
+
+        deadline_error = interrupted_error or self._regex_cleanup_deadline_error
+        if deadline_error is None and time.monotonic() >= self.deadline:
+            deadline_error = self._record_regex_cleanup_deadline()
+        if cleanup_error is not None:
+            raise cleanup_error from (restore_error or deadline_error)
+        if setup_error is not None:
+            raise setup_error from deadline_error
+        if restore_error is not None:
+            raise restore_error from deadline_error
+        if deadline_error is not None:
+            raise deadline_error
+
     def _raise_timeout(self, _signum: int, _frame: object) -> None:
         if self._closing:
             return
-        raise ArtifactLimitError("archive command deadline exceeded")
+        error = self._record_regex_cleanup_deadline()
+        if self._regex_cleanup_state != REGEX_CLEANUP_IDLE:
+            return
+        raise error
 
     def check(self, phase: str) -> None:
         if time.monotonic() >= self.deadline:
@@ -1074,6 +1162,7 @@ class IsolatedRegexMatcher:
         *,
         ignore_case: bool,
         budget: RegexMatchBudget,
+        command_deadline: ArchiveCommandDeadline | None = None,
     ) -> None:
         if len(pattern) > DEFAULT_MAX_REGEX_PATTERN_CHARS:
             raise ArtifactLimitError(
@@ -1083,6 +1172,7 @@ class IsolatedRegexMatcher:
         self._pattern = pattern
         self._ignore_case = ignore_case
         self._budget = budget
+        self._command_deadline = command_deadline
         self._process: subprocess.Popen[bytes] | None = None
         self._cleanup_recovery: dict[str, object] | None = None
 
@@ -1272,18 +1362,6 @@ class IsolatedRegexMatcher:
             raise RuntimeError("regular expression worker returned an error")
         return matched
 
-    @staticmethod
-    def _cleanup_alarm_mask_supported() -> bool:
-        return all(
-            hasattr(signal, name)
-            for name in (
-                "SIGALRM",
-                "pthread_sigmask",
-                "SIG_BLOCK",
-                "SIG_SETMASK",
-            )
-        )
-
     def _cleanup_error(
         self,
         process: subprocess.Popen[bytes],
@@ -1304,45 +1382,11 @@ class IsolatedRegexMatcher:
         self._cleanup_recovery = dict(error.recovery)
         return error
 
-    def _terminate(self) -> None:
-        previous_mask: set[signal.Signals] | None = None
-        pre_mask_deadline_error: ArtifactLimitError | None = None
-        if self._cleanup_alarm_mask_supported():
-            try:
-                previous_mask = signal.pthread_sigmask(
-                    signal.SIG_BLOCK,
-                    {signal.SIGALRM},
-                )
-            except ArtifactLimitError as deadline_error:
-                pre_mask_deadline_error = deadline_error
-                try:
-                    previous_mask = signal.pthread_sigmask(
-                        signal.SIG_BLOCK,
-                        {signal.SIGALRM},
-                    )
-                except BaseException as mask_error:
-                    process = self._process
-                    if process is None:
-                        raise deadline_error from mask_error
-                    cleanup_error = self._cleanup_error(
-                        process,
-                        cleanup_stage="signal-mask",
-                    )
-                    raise cleanup_error from deadline_error
-            except BaseException as mask_error:
-                process = self._process
-                if process is None:
-                    raise
-                cleanup_error = self._cleanup_error(
-                    process,
-                    cleanup_stage="signal-mask",
-                )
-                raise cleanup_error from mask_error
-
+    def _terminate_worker(self) -> None:
         process = self._process
         reaped = process is None
         cleanup_stage = "initial-poll"
-        deferred_error: BaseException | None = pre_mask_deadline_error
+        deferred_error: BaseException | None = None
         cleanup_error: RegexWorkerCleanupError | None = None
 
         def defer(error: BaseException) -> None:
@@ -1350,22 +1394,37 @@ class IsolatedRegexMatcher:
             if deferred_error is None:
                 deferred_error = error
 
-        try:
-            if process is not None:
+        if process is not None:
+            try:
+                reaped = process.poll() is not None
+            except BaseException as error:
+                defer(error)
+                reaped = False
+        if process is not None and not reaped:
+            cleanup_stage = "terminate"
+            try:
+                process.terminate()
+            except OSError:
+                pass
+            except BaseException as error:
+                defer(error)
+            cleanup_stage = "terminate-wait"
+            try:
+                process.wait(REGEX_WORKER_STOP_TIMEOUT_SECONDS)
+                reaped = True
+            except subprocess.TimeoutExpired:
+                pass
+            except BaseException as error:
+                defer(error)
+            if not reaped:
+                cleanup_stage = "kill"
                 try:
-                    reaped = process.poll() is not None
-                except BaseException as error:
-                    defer(error)
-                    reaped = False
-            if process is not None and not reaped:
-                cleanup_stage = "terminate"
-                try:
-                    process.terminate()
+                    process.kill()
                 except OSError:
                     pass
                 except BaseException as error:
                     defer(error)
-                cleanup_stage = "terminate-wait"
+                cleanup_stage = "kill-wait"
                 try:
                     process.wait(REGEX_WORKER_STOP_TIMEOUT_SECONDS)
                     reaped = True
@@ -1373,61 +1432,56 @@ class IsolatedRegexMatcher:
                     pass
                 except BaseException as error:
                     defer(error)
-                if not reaped:
-                    cleanup_stage = "kill"
+        if process is not None:
+            cleanup_stage = "pipe-close"
+            for pipe in (process.stdin, process.stdout):
+                if pipe is not None:
                     try:
-                        process.kill()
+                        pipe.close()
                     except OSError:
                         pass
                     except BaseException as error:
                         defer(error)
-                    cleanup_stage = "kill-wait"
-                    try:
-                        process.wait(REGEX_WORKER_STOP_TIMEOUT_SECONDS)
-                        reaped = True
-                    except subprocess.TimeoutExpired:
-                        pass
-                    except BaseException as error:
-                        defer(error)
-            if process is not None:
-                cleanup_stage = "pipe-close"
-                for pipe in (process.stdin, process.stdout):
-                    if pipe is not None:
-                        try:
-                            pipe.close()
-                        except OSError:
-                            pass
-                        except BaseException as error:
-                            defer(error)
-                if not reaped:
-                    cleanup_stage = "final-poll"
-                    try:
-                        reaped = process.poll() is not None
-                    except BaseException as error:
-                        defer(error)
-                if reaped:
-                    if self._process is process:
-                        self._process = None
-                    self._cleanup_recovery = None
-                else:
-                    cleanup_error = self._cleanup_error(
-                        process,
-                        cleanup_stage=cleanup_stage,
-                    )
-        finally:
-            restore_error: BaseException | None = None
-            if previous_mask is not None:
+            if not reaped:
+                cleanup_stage = "final-poll"
                 try:
-                    signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+                    reaped = process.poll() is not None
                 except BaseException as error:
-                    restore_error = error
+                    defer(error)
+            if reaped:
+                if self._process is process:
+                    self._process = None
+                self._cleanup_recovery = None
+            else:
+                cleanup_error = self._cleanup_error(
+                    process,
+                    cleanup_stage=cleanup_stage,
+                )
 
         if cleanup_error is not None:
-            raise cleanup_error from (restore_error or deferred_error)
-        if restore_error is not None:
-            raise restore_error
+            raise cleanup_error from deferred_error
         if deferred_error is not None:
             raise deferred_error
+
+    def _terminate(self) -> None:
+        command_deadline = self._command_deadline
+        if command_deadline is None:
+            self._terminate_worker()
+            return
+        try:
+            command_deadline.run_regex_worker_cleanup(self._terminate_worker)
+        except BaseException as error:
+            process = self._process
+            if process is not None and not isinstance(
+                error,
+                RegexWorkerCleanupError,
+            ):
+                cleanup_error = self._cleanup_error(
+                    process,
+                    cleanup_stage="signal-mask",
+                )
+                raise cleanup_error from error
+            raise
 
     def close(self) -> None:
         self._terminate()
@@ -2917,6 +2971,7 @@ def cmd_zip_list(args: argparse.Namespace) -> int:
                         args.match,
                         ignore_case=args.ignore_case,
                         budget=regex_budget,
+                        command_deadline=deadline,
                     )
                 )
                 if args.match
@@ -3072,6 +3127,7 @@ def cmd_zip_show(args: argparse.Namespace) -> int:
                         args.member,
                         ignore_case=args.ignore_case,
                         budget=regex_budget,
+                        command_deadline=deadline,
                     )
                 )
                 if args.regex
@@ -3083,6 +3139,7 @@ def cmd_zip_show(args: argparse.Namespace) -> int:
                         args.grep,
                         ignore_case=args.ignore_case,
                         budget=regex_budget,
+                        command_deadline=deadline,
                     )
                 )
                 if args.grep

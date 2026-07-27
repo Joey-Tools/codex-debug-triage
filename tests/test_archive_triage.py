@@ -1916,12 +1916,13 @@ class ArchiveTriageTests(unittest.TestCase):
         self,
     ) -> None:
         real_popen = subprocess.Popen
+        deadline = MODULE.ArchiveCommandDeadline()
         matcher = MODULE.IsolatedRegexMatcher(
             "safe",
             ignore_case=False,
             budget=MODULE.RegexMatchBudget(),
+            command_deadline=deadline,
         )
-        deadline = MODULE.ArchiveCommandDeadline()
         process = None
         worker_pgid = None
         initial_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
@@ -1996,6 +1997,290 @@ class ArchiveTriageTests(unittest.TestCase):
                     process.kill()
                     process.wait(timeout=2)
 
+        assert worker_pgid is not None
+        with self.assertRaises(ProcessLookupError):
+            os.killpg(worker_pgid, 0)
+
+    @unittest.skipUnless(
+        os.name == "posix"
+        and hasattr(os, "killpg")
+        and all(
+            hasattr(signal, name)
+            for name in (
+                "SIGALRM",
+                "ITIMER_REAL",
+                "setitimer",
+                "pthread_sigmask",
+                "sigpending",
+                "SIG_BLOCK",
+                "SIG_SETMASK",
+            )
+        ),
+        "deadline teardown handshake requires POSIX signal timers",
+    )
+    def test_regex_cleanup_handshake_preserves_true_original_signal_mask(
+        self,
+    ) -> None:
+        real_popen = subprocess.Popen
+        real_sigmask = signal.pthread_sigmask
+        deadline = MODULE.ArchiveCommandDeadline()
+        matcher = MODULE.IsolatedRegexMatcher(
+            "safe",
+            ignore_case=False,
+            budget=MODULE.RegexMatchBudget(),
+            command_deadline=deadline,
+        )
+        process = None
+        worker_pgid = None
+        captured_error = None
+        transition_attempts = 0
+        support_checks = 0
+        mask_events: list[tuple[str, set[signal.Signals]]] = []
+        initial_mask = real_sigmask(signal.SIG_BLOCK, set())
+        real_transition = deadline._transition_regex_cleanup
+        real_require_signal_support = deadline._require_signal_support
+
+        def isolated_worker_popen(
+            *args: object,
+            **kwargs: object,
+        ) -> subprocess.Popen[bytes]:
+            isolated_kwargs = dict(kwargs)
+            isolated_kwargs["start_new_session"] = True
+            return real_popen(*args, **isolated_kwargs)
+
+        def interrupt_first_transition(
+            expected_state: str,
+            next_state: str,
+        ) -> None:
+            nonlocal transition_attempts
+            if (
+                expected_state == MODULE.REGEX_CLEANUP_IDLE
+                and next_state == MODULE.REGEX_CLEANUP_DEFERRING
+            ):
+                transition_attempts += 1
+                if transition_attempts == 1:
+                    deadline._raise_timeout(signal.SIGALRM, None)
+            real_transition(expected_state, next_state)
+
+        def interrupt_support_check() -> None:
+            nonlocal support_checks
+            support_checks += 1
+            self.assertEqual(
+                deadline._regex_cleanup_state,
+                MODULE.REGEX_CLEANUP_DEFERRING,
+            )
+            deadline._raise_timeout(signal.SIGALRM, None)
+            real_require_signal_support()
+
+        def interrupt_first_mask(
+            operation: int,
+            signals: set[signal.Signals],
+        ) -> set[signal.Signals]:
+            requested_mask = set(signals)
+            if operation == signal.SIG_BLOCK:
+                self.assertEqual(
+                    deadline._regex_cleanup_state,
+                    MODULE.REGEX_CLEANUP_DEFERRING,
+                )
+                previous_mask = real_sigmask(operation, signals)
+                mask_events.append(("block-return", set(previous_mask)))
+                current_mask = real_sigmask(signal.SIG_BLOCK, set())
+                self.assertIn(signal.SIGALRM, current_mask)
+                deadline._raise_timeout(signal.SIGALRM, None)
+                return previous_mask
+            self.assertEqual(operation, signal.SIG_SETMASK)
+            self.assertEqual(
+                deadline._regex_cleanup_state,
+                MODULE.REGEX_CLEANUP_RESTORING,
+            )
+            mask_events.append(("restore-request", requested_mask))
+            return real_sigmask(operation, signals)
+
+        try:
+            deadline.arm()
+            with mock.patch.object(
+                MODULE.subprocess,
+                "Popen",
+                side_effect=isolated_worker_popen,
+            ):
+                matcher.__enter__()
+            process = matcher._process
+            self.assertIsNotNone(process)
+            assert process is not None
+            worker_pgid = os.getpgid(process.pid)
+            self.assertEqual(worker_pgid, process.pid)
+            self.assertTrue(matcher.search("safe"))
+
+            with (
+                mock.patch.object(
+                    deadline,
+                    "_transition_regex_cleanup",
+                    side_effect=interrupt_first_transition,
+                ),
+                mock.patch.object(
+                    deadline,
+                    "_require_signal_support",
+                    side_effect=interrupt_support_check,
+                ),
+                mock.patch.object(
+                    MODULE.signal,
+                    "pthread_sigmask",
+                    side_effect=interrupt_first_mask,
+                ),
+            ):
+                with self.assertRaises(MODULE.ArtifactLimitError) as error:
+                    matcher.close()
+                captured_error = error.exception
+        finally:
+            try:
+                real_sigmask(signal.SIG_BLOCK, {signal.SIGALRM})
+                deadline.close()
+            finally:
+                real_sigmask(signal.SIG_SETMASK, initial_mask)
+                if process is not None and process.poll() is None:
+                    process.kill()
+                    process.wait(timeout=2)
+
+        self.assertIsNotNone(captured_error)
+        assert captured_error is not None
+        self.assertIs(type(captured_error), MODULE.ArtifactLimitError)
+        self.assertEqual(
+            str(captured_error),
+            "archive command deadline exceeded",
+        )
+        self.assertEqual(transition_attempts, 2)
+        self.assertEqual(support_checks, 1)
+        self.assertEqual(
+            mask_events,
+            [
+                ("block-return", set(initial_mask)),
+                ("restore-request", set(initial_mask)),
+            ],
+        )
+        self.assertEqual(
+            real_sigmask(signal.SIG_BLOCK, set()),
+            initial_mask,
+        )
+        self.assertEqual(
+            deadline._regex_cleanup_state,
+            MODULE.REGEX_CLEANUP_IDLE,
+        )
+        self.assertIsNone(matcher._process)
+        assert process is not None
+        self.assertIsNotNone(process.poll())
+        assert worker_pgid is not None
+        with self.assertRaises(ProcessLookupError):
+            os.killpg(worker_pgid, 0)
+
+    @unittest.skipUnless(
+        os.name == "posix"
+        and hasattr(os, "killpg")
+        and all(
+            hasattr(signal, name)
+            for name in (
+                "SIGALRM",
+                "ITIMER_REAL",
+                "setitimer",
+                "pthread_sigmask",
+                "SIG_BLOCK",
+                "SIG_SETMASK",
+            )
+        ),
+        "live cleanup recovery evidence requires POSIX signal timers",
+    )
+    def test_regex_cleanup_setup_failure_retains_live_worker_recovery(
+        self,
+    ) -> None:
+        real_popen = subprocess.Popen
+        deadline = MODULE.ArchiveCommandDeadline()
+        matcher = MODULE.IsolatedRegexMatcher(
+            "safe",
+            ignore_case=False,
+            budget=MODULE.RegexMatchBudget(),
+            command_deadline=deadline,
+        )
+        process = None
+        worker_pgid = None
+        cleanup_error = None
+        initial_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+
+        def isolated_worker_popen(
+            *args: object,
+            **kwargs: object,
+        ) -> subprocess.Popen[bytes]:
+            isolated_kwargs = dict(kwargs)
+            isolated_kwargs["start_new_session"] = True
+            return real_popen(*args, **isolated_kwargs)
+
+        try:
+            deadline.arm()
+            with mock.patch.object(
+                MODULE.subprocess,
+                "Popen",
+                side_effect=isolated_worker_popen,
+            ):
+                matcher.__enter__()
+            process = matcher._process
+            self.assertIsNotNone(process)
+            assert process is not None
+            worker_pgid = os.getpgid(process.pid)
+            self.assertEqual(worker_pgid, process.pid)
+            self.assertTrue(matcher.search("safe"))
+
+            with mock.patch.object(
+                deadline,
+                "_require_signal_support",
+                side_effect=OSError(
+                    errno.EIO,
+                    "injected cleanup support failure",
+                ),
+            ):
+                with self.assertRaises(
+                    MODULE.RegexWorkerCleanupError
+                ) as raised:
+                    matcher.close()
+                cleanup_error = raised.exception
+
+            self.assertIs(matcher._process, process)
+            self.assertIs(cleanup_error.process, process)
+            self.assertEqual(cleanup_error.pid, process.pid)
+            self.assertEqual(cleanup_error.process_group_id, worker_pgid)
+            self.assertEqual(cleanup_error.cleanup_stage, "signal-mask")
+            self.assertEqual(
+                cleanup_error.recovery["process_handle"],
+                "retained",
+            )
+            self.assertEqual(
+                cleanup_error.recovery["reap_status"],
+                "unproven",
+            )
+            self.assertIsNone(process.poll())
+            os.killpg(worker_pgid, 0)
+            self.assertEqual(
+                signal.pthread_sigmask(signal.SIG_BLOCK, set()),
+                initial_mask,
+            )
+            self.assertEqual(
+                deadline._regex_cleanup_state,
+                MODULE.REGEX_CLEANUP_IDLE,
+            )
+        finally:
+            try:
+                signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGALRM})
+                deadline.close()
+            finally:
+                signal.pthread_sigmask(signal.SIG_SETMASK, initial_mask)
+                matcher._command_deadline = None
+                try:
+                    matcher.close()
+                except MODULE.RegexWorkerCleanupError:
+                    if process is not None and process.poll() is None:
+                        process.kill()
+                        process.wait(timeout=2)
+
+        self.assertIsNotNone(cleanup_error)
+        assert process is not None
+        self.assertIsNotNone(process.poll())
         assert worker_pgid is not None
         with self.assertRaises(ProcessLookupError):
             os.killpg(worker_pgid, 0)
@@ -5158,7 +5443,14 @@ class BugTriageDocumentationTests(unittest.TestCase):
         self.assertIn("must never call `setsid`", recipe)
         self.assertIn("apply TERM/KILL to that", recipe)
         self.assertIn("masks `SIGALRM` across TERM/KILL/reap", recipe)
-        self.assertIn("retains the authoritative\nprocess handle", recipe)
+        self.assertIn("retryable cleanup-state handshake", recipe)
+        self.assertIn("exactly one blocking mask call", recipe)
+        self.assertIn("timer\nremains armed", recipe)
+        self.assertIn("cleanup retains the authoritative", recipe)
+        self.assertIn(
+            "process handle plus the observed PID/process-group",
+            recipe,
+        )
         self.assertIn("validation drain", recipe)
         self.assertIn("temporarily enables `O_NONBLOCK`", recipe)
         self.assertIn("FIFO, socket, or terminal descriptor", recipe)
