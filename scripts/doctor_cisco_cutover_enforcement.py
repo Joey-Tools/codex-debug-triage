@@ -13,11 +13,13 @@ import pathlib
 import pwd
 import re
 import secrets
+import select
 import selectors
 import signal
 import stat
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -650,42 +652,159 @@ def _load_contract(contract: dict[str, Any]) -> dict[str, Any]:
     return contract
 
 
-def _signal_process_group(
-    process: subprocess.Popen[bytes],
+GROUP_SIGNAL_OPEN = "signal-open"
+GROUP_KILL_SENT_BEFORE_REAP = "kill-sent-before-reap"
+GROUP_MISSING_BEFORE_REAP = "group-missing-before-reap"
+GROUP_NO_SIGNALABLE_MEMBERS_BEFORE_REAP = (
+    "no-signalable-members-before-reap"
+)
+GROUP_DIRECT_PROCESS_ONLY = "direct-process-only"
+GROUP_SIGNAL_UNPROVEN_BEFORE_REAP = "signal-unproven-before-reap"
+SAFE_TERMINAL_GROUP_STATES = {
+    GROUP_KILL_SENT_BEFORE_REAP,
+    GROUP_MISSING_BEFORE_REAP,
+    GROUP_NO_SIGNALABLE_MEMBERS_BEFORE_REAP,
+    GROUP_DIRECT_PROCESS_ONLY,
+}
+
+
+class _ManagedProcess:
+    def __init__(self, process: subprocess.Popen[bytes]) -> None:
+        self.process = process
+        self.pid = process.pid
+        self.process_group = process.pid if os.name == "posix" else None
+        self.leader_state = "unreaped"
+        self.group_state = GROUP_SIGNAL_OPEN
+
+    def mark_reaped(self) -> None:
+        if self.group_state == GROUP_SIGNAL_OPEN:
+            self.group_state = GROUP_SIGNAL_UNPROVEN_BEFORE_REAP
+        self.leader_state = "reaped"
+
+
+def _leader_exited_without_reap(managed: _ManagedProcess) -> bool:
+    if managed.leader_state != "unreaped" or os.name != "posix":
+        return False
+    if all(
+        hasattr(os, name)
+        for name in ("waitid", "P_PID", "WEXITED", "WNOHANG", "WNOWAIT")
+    ):
+        try:
+            result = os.waitid(
+                os.P_PID,
+                managed.pid,
+                os.WEXITED | os.WNOHANG | os.WNOWAIT,
+            )
+        except (ChildProcessError, OSError):
+            return False
+        return (
+            result is not None
+            and getattr(result, "si_pid", 0) == managed.pid
+        )
+    if not (
+        sys.platform == "darwin"
+        and hasattr(select, "kqueue")
+        and hasattr(select, "kevent")
+        and hasattr(select, "KQ_FILTER_PROC")
+        and hasattr(select, "KQ_NOTE_EXIT")
+    ):
+        return False
+    try:
+        queue = select.kqueue()
+    except OSError:
+        return False
+    try:
+        change = select.kevent(
+            managed.pid,
+            filter=select.KQ_FILTER_PROC,
+            flags=select.KQ_EV_ADD | select.KQ_EV_ENABLE | select.KQ_EV_ONESHOT,
+            fflags=select.KQ_NOTE_EXIT,
+        )
+        try:
+            events = queue.control([change], 1, 0)
+        except ProcessLookupError:
+            # With SIGCHLD at its default disposition and no competing thread,
+            # an already-gone EVFILT_PROC target is this unreaped child.
+            return True
+        return any(
+            event.ident == managed.pid
+            and event.fflags & select.KQ_NOTE_EXIT
+            for event in events
+        )
+    except OSError:
+        return False
+    finally:
+        try:
+            queue.close()
+        except OSError:
+            pass
+
+
+def _signal_managed_process(
+    managed: _ManagedProcess,
     signal_number: int,
-) -> bool:
+) -> str:
+    if managed.leader_state != "unreaped":
+        return "prohibited"
     try:
         if os.name == "posix":
-            os.killpg(process.pid, signal_number)
+            if (
+                managed.group_state != GROUP_SIGNAL_OPEN
+                or managed.process_group is None
+            ):
+                return "prohibited"
+            os.killpg(managed.process_group, signal_number)
         elif signal_number == signal.SIGTERM:
-            process.terminate()
+            managed.process.terminate()
         else:
-            process.kill()
+            managed.process.kill()
     except ProcessLookupError:
-        return True
-    except Exception:
-        return False
-    return True
-
-
-def _process_group_state(
-    process: subprocess.Popen[bytes],
-    *,
-    direct_reaped: bool,
-) -> tuple[bool, bool]:
-    if os.name != "posix":
-        return (not direct_reaped, True)
-    try:
-        os.killpg(process.pid, 0)
-    except ProcessLookupError:
-        return (False, True)
+        return "missing"
     except PermissionError:
-        return (True, False)
-    except OSError as error:
-        if error.errno == errno.ESRCH:
-            return (False, True)
-        return (True, False)
-    return (True, True)
+        return "permission"
+    except Exception:
+        return "failed"
+    return "sent"
+
+
+def _seal_process_group_before_reap(
+    managed: _ManagedProcess,
+) -> list[str]:
+    if managed.group_state != GROUP_SIGNAL_OPEN:
+        return (
+            []
+            if managed.group_state in SAFE_TERMINAL_GROUP_STATES
+            else ["process-group-not-quiescent"]
+        )
+    if os.name != "posix":
+        outcome = _signal_managed_process(managed, signal.SIGKILL)
+        if outcome in ("sent", "missing"):
+            managed.group_state = GROUP_DIRECT_PROCESS_ONLY
+            return []
+        managed.group_state = GROUP_SIGNAL_UNPROVEN_BEFORE_REAP
+        return ["process-group-not-quiescent"]
+    outcome = _signal_managed_process(managed, signal.SIGKILL)
+    if outcome == "sent":
+        managed.group_state = GROUP_KILL_SENT_BEFORE_REAP
+    elif outcome == "missing" and managed.leader_state == "unreaped":
+        managed.group_state = GROUP_MISSING_BEFORE_REAP
+    elif (
+        outcome == "permission"
+        and sys.platform == "darwin"
+        and _leader_exited_without_reap(managed)
+    ):
+        # Darwin returns EPERM when the retained zombie leader is the only
+        # group member. A living same-UID member would make killpg succeed.
+        managed.group_state = GROUP_NO_SIGNALABLE_MEMBERS_BEFORE_REAP
+    else:
+        managed.group_state = GROUP_SIGNAL_UNPROVEN_BEFORE_REAP
+        if managed.leader_state == "unreaped":
+            try:
+                os.kill(managed.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+        return ["process-group-not-quiescent"]
+    return []
 
 
 def _drain_process_streams_once(
@@ -711,9 +830,10 @@ def _drain_process_streams_once(
 
 
 def _terminate_drain_reap_impl(
-    process: subprocess.Popen[bytes],
+    managed: _ManagedProcess,
 ) -> list[str]:
     failures: list[str] = []
+    process = managed.process
     streams = tuple(
         stream
         for stream in (process.stdout, process.stderr)
@@ -729,49 +849,24 @@ def _terminate_drain_reap_impl(
             continue
         open_stream_fds.add(fd)
 
-    term_signal_succeeded = _signal_process_group(process, signal.SIGTERM)
-    term_deadline = time.monotonic() + GH_PROCESS_TERM_GRACE_SECONDS
-    direct_reaped = False
-    group_active = True
-    group_state_reliable = True
-    while time.monotonic() < term_deadline:
-        failures.extend(_drain_process_streams_once(open_stream_fds))
-        try:
-            direct_reaped = process.poll() is not None
-        except Exception:
-            failures.append("process-poll")
-            break
-        group_active, group_state_reliable = _process_group_state(
-            process,
-            direct_reaped=direct_reaped,
-        )
-        if direct_reaped and not group_active and not open_stream_fds:
-            break
-        time.sleep(
-            min(
-                GH_PROCESS_CLEANUP_POLL_SECONDS,
-                max(0.0, term_deadline - time.monotonic()),
+    if managed.group_state == GROUP_SIGNAL_OPEN:
+        _signal_managed_process(managed, signal.SIGTERM)
+        term_deadline = time.monotonic() + GH_PROCESS_TERM_GRACE_SECONDS
+        while time.monotonic() < term_deadline:
+            failures.extend(_drain_process_streams_once(open_stream_fds))
+            time.sleep(
+                min(
+                    GH_PROCESS_CLEANUP_POLL_SECONDS,
+                    max(0.0, term_deadline - time.monotonic()),
+                )
             )
-        )
-
-    kill_required = not (
-        direct_reaped
-        and not group_active
-        and group_state_reliable
-        and not open_stream_fds
-    )
-    kill_signal_succeeded = True
-    if kill_required:
-        kill_signal_succeeded = _signal_process_group(
-            process,
-            signal.SIGKILL,
-        )
+        failures.extend(_seal_process_group_before_reap(managed))
 
     reap_deadline = time.monotonic() + GH_PROCESS_REAP_DEADLINE_SECONDS
     reap_wait_failed = False
     while time.monotonic() < reap_deadline:
         failures.extend(_drain_process_streams_once(open_stream_fds))
-        if not direct_reaped and not reap_wait_failed:
+        if managed.leader_state != "reaped" and not reap_wait_failed:
             remaining = reap_deadline - time.monotonic()
             try:
                 process.wait(
@@ -783,17 +878,13 @@ def _terminate_drain_reap_impl(
                         ),
                     ),
                 )
-                direct_reaped = True
+                managed.mark_reaped()
             except subprocess.TimeoutExpired:
                 pass
             except Exception:
                 failures.append("process-reap")
                 reap_wait_failed = True
-        group_active, group_state_reliable = _process_group_state(
-            process,
-            direct_reaped=direct_reaped,
-        )
-        if direct_reaped and not group_active and not open_stream_fds:
+        if managed.leader_state == "reaped" and not open_stream_fds:
             break
         time.sleep(
             min(
@@ -802,62 +893,46 @@ def _terminate_drain_reap_impl(
             )
         )
 
-    if not direct_reaped and not reap_wait_failed:
+    if managed.leader_state != "reaped" and not reap_wait_failed:
         failures.append("process-reap-timeout")
-    group_active, group_state_reliable = _process_group_state(
-        process,
-        direct_reaped=direct_reaped,
-    )
-    if not direct_reaped:
+    if managed.leader_state != "reaped":
         failures.append("process-not-reaped")
-    if group_active or not group_state_reliable:
+    if managed.group_state not in SAFE_TERMINAL_GROUP_STATES:
         failures.append("process-group-not-quiescent")
     if open_stream_fds:
         failures.append("stream-drain-incomplete")
-    if not term_signal_succeeded and not direct_reaped:
-        failures.append("term-signal")
-    if kill_required and not kill_signal_succeeded:
-        failures.append("kill-signal")
     return sorted(set(failures))
 
 
 def _terminate_drain_reap(
-    process: subprocess.Popen[bytes],
+    managed: _ManagedProcess,
 ) -> list[str]:
     try:
-        return _terminate_drain_reap_impl(process)
+        return _terminate_drain_reap_impl(managed)
     except BaseException:
         failures = ["process-cleanup-internal"]
-        if not _signal_process_group(process, signal.SIGKILL):
-            failures.append("kill-signal")
-        direct_reaped = False
+        if managed.group_state == GROUP_SIGNAL_OPEN:
+            failures.extend(_seal_process_group_before_reap(managed))
         try:
-            process.wait(timeout=GH_PROCESS_REAP_DEADLINE_SECONDS)
-            direct_reaped = True
+            managed.process.wait(timeout=GH_PROCESS_REAP_DEADLINE_SECONDS)
+            managed.mark_reaped()
         except BaseException:
             failures.append("process-reap")
-        try:
-            group_active, group_state_reliable = _process_group_state(
-                process,
-                direct_reaped=direct_reaped,
-            )
-        except BaseException:
-            group_active = True
-            group_state_reliable = False
-        if not direct_reaped:
+        if managed.leader_state != "reaped":
             failures.append("process-not-reaped")
-        if group_active or not group_state_reliable:
+        if managed.group_state not in SAFE_TERMINAL_GROUP_STATES:
             failures.append("process-group-not-quiescent")
         return sorted(set(failures))
 
 
 def _close_process_resources(
     selector: Optional[selectors.BaseSelector],
-    process: subprocess.Popen[bytes],
+    managed: _ManagedProcess,
     *,
     close_streams: bool = True,
 ) -> list[str]:
     failures: list[str] = []
+    process = managed.process
     if selector is not None:
         try:
             selector.close()
@@ -2135,11 +2210,28 @@ def _bounded_subprocess(
     environment: dict[str, str],
     execution_cwd: str,
     endpoint_class: str,
-    process_registry: dict[int, subprocess.Popen[bytes]],
+    process_registry: dict[int, _ManagedProcess],
     timeout_seconds: int,
     stdout_limit: int,
     stderr_limit: int,
 ) -> tuple[int, bytes, bytes]:
+    if os.name == "posix":
+        try:
+            sigchld_is_default = (
+                signal.getsignal(signal.SIGCHLD) == signal.SIG_DFL
+            )
+        except (OSError, ValueError):
+            sigchld_is_default = False
+        if not sigchld_is_default or threading.active_count() != 1:
+            raise _blocked(
+                "collector-unavailable",
+                "exclusive GitHub collector child supervision is unavailable",
+                api_failure=_api_failure(
+                    endpoint_class,
+                    http_status=None,
+                    failure_kind="process-supervision",
+                ),
+            )
     try:
         process = subprocess.Popen(
             command,
@@ -2161,11 +2253,12 @@ def _bounded_subprocess(
                 failure_kind="process-start",
             ),
         ) from error
+    managed = _ManagedProcess(process)
     selector: Optional[selectors.BaseSelector] = None
     try:
         if process.pid in process_registry:
             raise OSError("collector process identity is already registered")
-        process_registry[process.pid] = process
+        process_registry[process.pid] = managed
         chunks: dict[str, list[bytes]] = {"stdout": [], "stderr": []}
         retained: dict[str, int] = {"stdout": 0, "stderr": 0}
         deadline = time.monotonic() + timeout_seconds
@@ -2215,10 +2308,22 @@ def _bounded_subprocess(
                         ),
                     )
                 chunks[stream_name].append(chunk)
+        group_failures = _seal_process_group_before_reap(managed)
+        if group_failures:
+            raise _blocked(
+                "collector-inconclusive",
+                "GitHub API collector process group cleanup could not be proven",
+                api_failure=_api_failure(
+                    endpoint_class,
+                    http_status=None,
+                    failure_kind="process-cleanup",
+                ),
+            )
         try:
             return_code = process.wait(
                 timeout=max(0.001, deadline - time.monotonic()),
             )
+            managed.mark_reaped()
         except subprocess.TimeoutExpired as error:
             raise _blocked(
                 "api-timeout",
@@ -2229,25 +2334,11 @@ def _bounded_subprocess(
                     failure_kind="timeout",
                 ),
             ) from error
-        group_active, group_state_reliable = _process_group_state(
-            process,
-            direct_reaped=True,
-        )
-        if group_active or not group_state_reliable:
-            raise _blocked(
-                "collector-inconclusive",
-                "GitHub API collector process group remained active",
-                api_failure=_api_failure(
-                    endpoint_class,
-                    http_status=None,
-                    failure_kind="process-linger",
-                ),
-            )
     except BaseException as error:
-        cleanup_failures = _terminate_drain_reap(process)
+        cleanup_failures = _terminate_drain_reap(managed)
         resource_failures = _close_process_resources(
             selector,
-            process,
+            managed,
             close_streams=not cleanup_failures,
         )
         if cleanup_failures:
@@ -2260,7 +2351,7 @@ def _bounded_subprocess(
                     failure_kind="process-cleanup",
                 ),
             ) from error
-        if process_registry.get(process.pid) is process:
+        if process_registry.get(process.pid) is managed:
             process_registry.pop(process.pid)
         if resource_failures:
             raise _blocked(
@@ -2285,9 +2376,9 @@ def _bounded_subprocess(
                 failure_kind="process-io",
             ),
         ) from error
-    if process_registry.get(process.pid) is process:
+    if process_registry.get(process.pid) is managed:
         process_registry.pop(process.pid)
-    resource_failures = _close_process_resources(selector, process)
+    resource_failures = _close_process_resources(selector, managed)
     if resource_failures:
         raise _blocked(
             "collector-inconclusive",
@@ -2320,7 +2411,7 @@ class GitHubApiClient:
         self._snapshot_hosts_file: Optional[_BoundRegularFile] = None
         self._snapshot_global_config_file: Optional[_BoundRegularFile] = None
         self._provisional_cleanup_objects: list[dict[str, Any]] = []
-        self._active_processes: dict[int, subprocess.Popen[bytes]] = {}
+        self._active_processes: dict[int, _ManagedProcess] = {}
         self._source_fd: Optional[int] = None
         self._snapshot_fd: Optional[int] = None
         self._source_access_policy_binding: Optional[tuple[str, int, str]] = None
@@ -3222,8 +3313,8 @@ class GitHubApiClient:
         cleanup_proofs: list[bool] = []
         unresolved_processes: list[dict[str, Any]] = []
         active_processes = getattr(self, "_active_processes", {})
-        for process_id, process in tuple(active_processes.items()):
-            process_failures = _terminate_drain_reap(process)
+        for process_id, managed in tuple(active_processes.items()):
+            process_failures = _terminate_drain_reap(managed)
             if process_failures:
                 cleanup_failures.append("active-process-cleanup")
                 cleanup_proofs.append(False)
@@ -3239,11 +3330,11 @@ class GitHubApiClient:
                 continue
             process_resource_failures = _close_process_resources(
                 None,
-                process,
+                managed,
             )
             if process_resource_failures:
                 cleanup_failures.append("active-process-resource-close")
-            if active_processes.get(process_id) is process:
+            if active_processes.get(process_id) is managed:
                 active_processes.pop(process_id)
         process_cleanup_unproven = bool(unresolved_processes)
         if self._pinned:
@@ -3418,10 +3509,10 @@ class GitHubApiClient:
             [] if cleanup_proven else self._retained_cleanup_objects()
         )
 
-        for process in active_processes.values():
+        for managed in active_processes.values():
             process_resource_failures = _close_process_resources(
                 None,
-                process,
+                managed,
             )
             if process_resource_failures:
                 cleanup_failures.append("unresolved-process-resource-close")

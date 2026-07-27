@@ -481,14 +481,21 @@ tokens, and raw `gh` stderr are never copied into the doctor receipt.
 The process boundary starts immediately after `Popen`: the direct process is
 registered before deadline, buffer, or selector initialization. Every
 post-spawn error enters bounded TERM/grace/KILL with interleaved pipe drain and
-a second hard reap deadline. Successful completion and error cleanup both
-require direct-child reap and reliable process-group absence. Unexpected
-selector, stream, wait, or resource errors map to structured
-`collector-inconclusive` evidence. The client retries any unresolved registered
-process before credential cleanup; if quiescence is still unproven, it performs
-no snapshot `fchmod`, `unlink`, or `rmdir`, retains the owner-private runtime,
-and returns sanitized retained-object locators plus the unresolved process
-binding.
+a second hard reap deadline. Before the first `poll()` or `wait()`, successful
+completion and error cleanup both seal the process group while the unreaped
+leader still pins the numeric PID/PGID; after reap they never signal or probe
+that number. This protects group identity during signaling and prevents
+remaining members from continuing user-space credential access without
+claiming numeric group absence after reap. On Darwin, a zombie-only `EPERM`
+from the final group signal counts only when a non-reaping `waitid` or
+`EVFILT_PROC` check proves the leader exited; every unknown permission result
+remains inconclusive. Unexpected selector, stream, wait, or resource errors map
+to structured `collector-inconclusive` evidence. The client retries any
+unresolved registered process before credential cleanup, but a retry whose
+leader was already reaped cannot touch the old PGID. If quiescence is still
+unproven, it performs no snapshot `fchmod`, `unlink`, or `rmdir`, retains the
+owner-private runtime, and returns sanitized retained-object locators plus the
+unresolved process binding.
 
 Invoke the doctor only with administrator-pinned identities and the exact
 existing PR:

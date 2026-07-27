@@ -6572,7 +6572,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
         process.pid = 4242
         process.stdout = mock.Mock()
         process.stderr = mock.Mock()
-        process_registry: dict[int, subprocess.Popen[bytes]] = {}
+        process_registry: dict[int, object] = {}
 
         with (
             mock.patch.object(
@@ -6608,7 +6608,9 @@ class BugTriageDocumentationTests(unittest.TestCase):
                 stderr_limit=1024,
             )
 
-        cleanup.assert_called_once_with(process)
+        cleanup.assert_called_once()
+        managed = cleanup.call_args.args[0]
+        self.assertIs(managed.process, process)
         self.assertEqual(process_registry, {})
         self.assertEqual(raised.exception.reason_code, "collector-inconclusive")
         self.assertEqual(
@@ -6681,6 +6683,11 @@ class BugTriageDocumentationTests(unittest.TestCase):
                         "_terminate_drain_reap",
                         return_value=[],
                     ) as cleanup,
+                    mock.patch.object(
+                        ENFORCEMENT_MODULE,
+                        "_seal_process_group_before_reap",
+                        return_value=[],
+                    ),
                 ):
                     if failure_point == "create":
                         selector_context = mock.patch.object(
@@ -6730,7 +6737,9 @@ class BugTriageDocumentationTests(unittest.TestCase):
                                     stderr_limit=1024,
                                 )
 
-                cleanup.assert_called_once_with(process)
+                cleanup.assert_called_once()
+                managed = cleanup.call_args.args[0]
+                self.assertIs(managed.process, process)
                 self.assertEqual(
                     raised.exception.reason_code,
                     "collector-inconclusive",
@@ -6748,15 +6757,34 @@ class BugTriageDocumentationTests(unittest.TestCase):
                 if failure_point != "create":
                     selector.close.assert_called_once()
 
-    def test_enforcement_subprocess_normal_exit_rejects_lingering_group(
+    @unittest.skipUnless(os.name == "posix", "requires POSIX process groups")
+    def test_enforcement_subprocess_seals_group_before_reap_and_pid_reuse(
         self,
     ) -> None:
         process = mock.Mock()
+        process.pid = 4242
         process.stdout = mock.Mock()
         process.stderr = mock.Mock()
-        process.wait.return_value = 0
         selector = mock.Mock()
         selector.get_map.return_value = {}
+        process_registry: dict[int, object] = {}
+        pgid_reused = False
+        events: list[tuple[str, int]] = []
+
+        def record_group_signal(process_group: int, signal_number: int) -> None:
+            if pgid_reused:
+                self.fail("numeric PGID was used after direct-child reap")
+            events.append(("killpg", signal_number))
+            self.assertEqual(process_group, process.pid)
+
+        def reap_and_reuse(*, timeout: float) -> int:
+            nonlocal pgid_reused
+            self.assertGreater(timeout, 0)
+            events.append(("wait", 0))
+            pgid_reused = True
+            return 0
+
+        process.wait.side_effect = reap_and_reuse
         with (
             mock.patch.object(
                 ENFORCEMENT_MODULE.subprocess,
@@ -6769,40 +6797,32 @@ class BugTriageDocumentationTests(unittest.TestCase):
                 return_value=selector,
             ),
             mock.patch.object(
-                ENFORCEMENT_MODULE,
-                "_process_group_state",
-                return_value=(True, True),
-            ),
-            mock.patch.object(
-                ENFORCEMENT_MODULE,
-                "_terminate_drain_reap",
-                return_value=[],
-            ) as cleanup,
-            self.assertRaises(
-                ENFORCEMENT_MODULE.EnforcementDoctorError
-            ) as raised,
+                ENFORCEMENT_MODULE.os,
+                "killpg",
+                side_effect=record_group_signal,
+            ) as killpg,
         ):
-            ENFORCEMENT_MODULE._bounded_subprocess(
+            return_code, stdout, stderr = ENFORCEMENT_MODULE._bounded_subprocess(
                 ["/fixed/gh", "api", "/user"],
                 environment={},
                 execution_cwd=tempfile.gettempdir(),
                 endpoint_class="authenticated-user",
-                process_registry={},
+                process_registry=process_registry,
                 timeout_seconds=1,
                 stdout_limit=1024,
                 stderr_limit=1024,
             )
 
-        cleanup.assert_called_once_with(process)
-        self.assertEqual(raised.exception.reason_code, "collector-inconclusive")
+        self.assertEqual(return_code, 0)
+        self.assertEqual(stdout, b"")
+        self.assertEqual(stderr, b"")
         self.assertEqual(
-            raised.exception.api_failure,
-            {
-                "endpoint_class": "authenticated-user",
-                "failure_kind": "process-linger",
-                "http_status": None,
-            },
+            events,
+            [("killpg", signal.SIGKILL), ("wait", 0)],
         )
+        killpg.assert_called_once_with(process.pid, signal.SIGKILL)
+        process.poll.assert_not_called()
+        self.assertEqual(process_registry, {})
         selector.close.assert_called_once()
         process.stdout.close.assert_called_once()
         process.stderr.close.assert_called_once()
@@ -6862,7 +6882,9 @@ class BugTriageDocumentationTests(unittest.TestCase):
                 stderr_limit=1024,
             )
 
-        cleanup.assert_called_once_with(process)
+        cleanup.assert_called_once()
+        managed = cleanup.call_args.args[0]
+        self.assertIs(managed.process, process)
         self.assertEqual(raised.exception.reason_code, "collector-inconclusive")
         self.assertEqual(
             raised.exception.api_failure,
@@ -6880,7 +6902,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
         process.pid = 4242
         process.stdout = mock.Mock()
         process.stderr = mock.Mock()
-        process_registry: dict[int, subprocess.Popen[bytes]] = {}
+        process_registry: dict[int, object] = {}
         with (
             mock.patch.object(
                 ENFORCEMENT_MODULE.subprocess,
@@ -6915,8 +6937,10 @@ class BugTriageDocumentationTests(unittest.TestCase):
                 stderr_limit=1024,
             )
 
-        cleanup.assert_called_once_with(process)
-        self.assertIs(process_registry[process.pid], process)
+        cleanup.assert_called_once()
+        managed = cleanup.call_args.args[0]
+        self.assertIs(managed.process, process)
+        self.assertIs(process_registry[process.pid], managed)
         self.assertEqual(raised.exception.reason_code, "collector-inconclusive")
         self.assertEqual(
             raised.exception.api_failure,
@@ -6942,12 +6966,20 @@ class BugTriageDocumentationTests(unittest.TestCase):
         process.stderr = stderr
         observed_signals: list[int] = []
         observed_wait_timeouts: list[float] = []
+        events: list[str] = []
+        managed = ENFORCEMENT_MODULE._ManagedProcess(process)
 
-        def record_signal(_process: object, signal_number: int) -> bool:
+        def record_signal(_managed: object, signal_number: int) -> str:
+            events.append(f"signal-{signal_number}")
             observed_signals.append(signal_number)
-            return signal_number != signal.SIGKILL
+            return "sent" if signal_number == signal.SIGTERM else "failed"
+
+        def record_direct_kill(pid: int, signal_number: int) -> None:
+            events.append("direct-kill")
+            self.assertEqual((pid, signal_number), (process.pid, signal.SIGKILL))
 
         def reject_reap(*, timeout: float) -> None:
+            events.append("wait")
             observed_wait_timeouts.append(timeout)
             raise subprocess.TimeoutExpired("fixture-gh", timeout)
 
@@ -6970,17 +7002,17 @@ class BugTriageDocumentationTests(unittest.TestCase):
                 ),
                 mock.patch.object(
                     ENFORCEMENT_MODULE,
-                    "_signal_process_group",
+                    "_signal_managed_process",
                     side_effect=record_signal,
                 ),
                 mock.patch.object(
-                    ENFORCEMENT_MODULE,
-                    "_process_group_state",
-                    return_value=(True, True),
+                    ENFORCEMENT_MODULE.os,
+                    "kill",
+                    side_effect=record_direct_kill,
                 ),
             ):
                 process.wait.side_effect = reject_reap
-                failures = ENFORCEMENT_MODULE._terminate_drain_reap(process)
+                failures = ENFORCEMENT_MODULE._terminate_drain_reap(managed)
         finally:
             stdout.close()
             stderr.close()
@@ -6988,22 +7020,92 @@ class BugTriageDocumentationTests(unittest.TestCase):
             os.close(stderr_write_fd)
 
         self.assertEqual(observed_signals, [signal.SIGTERM, signal.SIGKILL])
+        self.assertEqual(
+            events[:3],
+            [
+                f"signal-{signal.SIGTERM}",
+                f"signal-{signal.SIGKILL}",
+                "direct-kill",
+            ],
+        )
+        self.assertTrue(all(event == "wait" for event in events[3:]))
         self.assertTrue(observed_wait_timeouts)
         self.assertTrue(
             all(0 <= timeout <= 0.0011 for timeout in observed_wait_timeouts)
         )
-        self.assertIn("kill-signal", failures)
         self.assertIn("process-reap-timeout", failures)
         self.assertIn("process-not-reaped", failures)
         self.assertIn("process-group-not-quiescent", failures)
+        self.assertEqual(
+            managed.group_state,
+            ENFORCEMENT_MODULE.GROUP_SIGNAL_UNPROVEN_BEFORE_REAP,
+        )
+        process.poll.assert_not_called()
+
+    def test_enforcement_darwin_permission_requires_unreaped_exit_proof(
+        self,
+    ) -> None:
+        for leader_exited, expected_failures, expected_group_state in (
+            (
+                True,
+                [],
+                ENFORCEMENT_MODULE.GROUP_NO_SIGNALABLE_MEMBERS_BEFORE_REAP,
+            ),
+            (
+                False,
+                ["process-group-not-quiescent"],
+                ENFORCEMENT_MODULE.GROUP_SIGNAL_UNPROVEN_BEFORE_REAP,
+            ),
+        ):
+            with self.subTest(leader_exited=leader_exited):
+                process = mock.Mock()
+                process.pid = 4242
+                managed = ENFORCEMENT_MODULE._ManagedProcess(process)
+                with (
+                    mock.patch.object(
+                        ENFORCEMENT_MODULE.sys,
+                        "platform",
+                        "darwin",
+                    ),
+                    mock.patch.object(
+                        ENFORCEMENT_MODULE,
+                        "_signal_managed_process",
+                        return_value="permission",
+                    ),
+                    mock.patch.object(
+                        ENFORCEMENT_MODULE,
+                        "_leader_exited_without_reap",
+                        return_value=leader_exited,
+                    ) as exit_proof,
+                    mock.patch.object(
+                        ENFORCEMENT_MODULE.os,
+                        "kill",
+                    ) as direct_kill,
+                ):
+                    failures = (
+                        ENFORCEMENT_MODULE._seal_process_group_before_reap(
+                            managed
+                        )
+                    )
+
+                self.assertEqual(failures, expected_failures)
+                self.assertEqual(managed.group_state, expected_group_state)
+                exit_proof.assert_called_once_with(managed)
+                if leader_exited:
+                    direct_kill.assert_not_called()
+                else:
+                    direct_kill.assert_called_once_with(
+                        process.pid,
+                        signal.SIGKILL,
+                    )
 
     @unittest.skipUnless(os.name == "posix", "requires POSIX process groups")
     def test_enforcement_subprocess_kills_and_reaps_term_ignoring_process(
         self,
     ) -> None:
         original_popen = subprocess.Popen
-        original_signal_process_group = (
-            ENFORCEMENT_MODULE._signal_process_group
+        original_signal_managed_process = (
+            ENFORCEMENT_MODULE._signal_managed_process
         )
         spawned: list[subprocess.Popen[bytes]] = []
 
@@ -7037,8 +7139,8 @@ class BugTriageDocumentationTests(unittest.TestCase):
                 ),
                 mock.patch.object(
                     ENFORCEMENT_MODULE,
-                    "_signal_process_group",
-                    wraps=original_signal_process_group,
+                    "_signal_managed_process",
+                    wraps=original_signal_managed_process,
                 ) as signaller,
                 self.assertRaises(
                     ENFORCEMENT_MODULE.EnforcementDoctorError
@@ -7116,7 +7218,8 @@ class BugTriageDocumentationTests(unittest.TestCase):
                 self.assertEqual(process.stdout.readline(), b"ready\n")
             finally:
                 readiness_selector.close()
-            client._active_processes[process.pid] = process
+            managed = ENFORCEMENT_MODULE._ManagedProcess(process)
+            client._active_processes[process.pid] = managed
             original_unlink = os.unlink
             unlink_observations = 0
 
@@ -7128,8 +7231,10 @@ class BugTriageDocumentationTests(unittest.TestCase):
                 nonlocal unlink_observations
                 unlink_observations += 1
                 self.assertIsNotNone(process.returncode)
-                with self.assertRaises(ProcessLookupError):
-                    os.killpg(process.pid, 0)
+                self.assertIn(
+                    managed.group_state,
+                    ENFORCEMENT_MODULE.SAFE_TERMINAL_GROUP_STATES,
+                )
                 original_unlink(path, dir_fd=dir_fd)
 
             try:
@@ -7164,7 +7269,8 @@ class BugTriageDocumentationTests(unittest.TestCase):
         self.assertGreater(unlink_observations, 0)
         self.assertFalse(run_path.exists())
 
-    def test_enforcement_client_retains_snapshot_when_process_is_unresolved(
+    @unittest.skipUnless(os.name == "posix", "requires POSIX process groups")
+    def test_enforcement_client_close_retry_never_uses_reused_process_group(
         self,
     ) -> None:
         with owner_controlled_temp_root() as temp_root:
@@ -7182,31 +7288,93 @@ class BugTriageDocumentationTests(unittest.TestCase):
             run_path = client._run_directory.path
             process = mock.Mock()
             process.pid = 4242
-            process.stdout = mock.Mock()
-            process.stderr = mock.Mock()
-            client._active_processes[process.pid] = process
+            process.stdout = None
+            process.stderr = None
+            managed = ENFORCEMENT_MODULE._ManagedProcess(process)
+            pgid_reused = False
+            numeric_uses_after_reap: list[tuple[str, int]] = []
+
+            def signal_group(process_group: int, signal_number: int) -> None:
+                if pgid_reused:
+                    numeric_uses_after_reap.append(("killpg", signal_number))
+                self.assertEqual(process_group, process.pid)
+                if signal_number == signal.SIGKILL:
+                    raise OSError(errno.EIO, "injected group signal failure")
+
+            def signal_leader(pid: int, signal_number: int) -> None:
+                if pgid_reused:
+                    numeric_uses_after_reap.append(("kill", signal_number))
+                self.assertEqual((pid, signal_number), (process.pid, signal.SIGKILL))
+
+            def reap_and_reuse(*, timeout: float) -> int:
+                nonlocal pgid_reused
+                self.assertGreaterEqual(timeout, 0)
+                pgid_reused = True
+                return 0
+
+            process.wait.side_effect = reap_and_reuse
             try:
                 with (
                     mock.patch.object(
                         ENFORCEMENT_MODULE,
-                        "_terminate_drain_reap",
-                        return_value=[
-                            "process-not-reaped",
-                            "process-group-not-quiescent",
-                        ],
+                        "GH_PROCESS_TERM_GRACE_SECONDS",
+                        0.0,
+                    ),
+                    mock.patch.object(
+                        ENFORCEMENT_MODULE,
+                        "GH_PROCESS_REAP_DEADLINE_SECONDS",
+                        0.05,
                     ),
                     mock.patch.object(
                         ENFORCEMENT_MODULE.os,
-                        "unlink",
-                        wraps=os.unlink,
-                    ) as unlink,
-                    self.assertRaises(
-                        ENFORCEMENT_MODULE.EnforcementDoctorError
-                    ) as raised,
+                        "killpg",
+                        side_effect=signal_group,
+                    ) as killpg,
+                    mock.patch.object(
+                        ENFORCEMENT_MODULE.os,
+                        "kill",
+                        side_effect=signal_leader,
+                    ) as kill,
                 ):
-                    client.close()
+                    first_failures = ENFORCEMENT_MODULE._terminate_drain_reap(
+                        managed
+                    )
+                    self.assertEqual(
+                        first_failures,
+                        ["process-group-not-quiescent"],
+                    )
+                    self.assertEqual(managed.leader_state, "reaped")
+                    self.assertEqual(
+                        managed.group_state,
+                        ENFORCEMENT_MODULE.GROUP_SIGNAL_UNPROVEN_BEFORE_REAP,
+                    )
+                    client._active_processes[process.pid] = managed
 
-                unlink.assert_not_called()
+                    with (
+                        mock.patch.object(
+                            ENFORCEMENT_MODULE.os,
+                            "unlink",
+                            wraps=os.unlink,
+                        ) as unlink,
+                        self.assertRaises(
+                            ENFORCEMENT_MODULE.EnforcementDoctorError
+                        ) as raised,
+                    ):
+                        client.close()
+
+                    self.assertEqual(
+                        killpg.call_args_list,
+                        [
+                            mock.call(process.pid, signal.SIGTERM),
+                            mock.call(process.pid, signal.SIGKILL),
+                        ],
+                    )
+                    kill.assert_called_once_with(process.pid, signal.SIGKILL)
+                    self.assertEqual(process.wait.call_count, 1)
+                    self.assertEqual(numeric_uses_after_reap, [])
+                    process.poll.assert_not_called()
+                    unlink.assert_not_called()
+
                 cleanup = raised.exception.cleanup_failure
                 self.assertEqual(cleanup["cleanup_proof"], "inconclusive")
                 self.assertIn(

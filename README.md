@@ -101,11 +101,18 @@ therefore remains mandatory.
 Doctor receipt schema 5 adds the static-equivalence boundary and sanitized
 cleanup-failure evidence. Every spawned `gh` process is registered before
 selector or deadline setup and is unregistered only after its direct child is
-reaped, both pipes reach EOF, and its POSIX process group is reliably absent.
-Any post-spawn timeout, byte-limit, selector, stream, or wait failure enters
-one bounded TERM/grace/KILL transaction with interleaved drain and a separate
-hard reap deadline. Snapshot deletion begins only after that transaction
-proves quiescence. If a close-time retry still cannot prove it, the doctor
+reaped, both pipes reach EOF, and its process group was sealed while the
+unreaped leader still pinned the numeric PID/PGID. The protected property is
+stable group identity for signaling and termination of user-space credential
+access, not numeric group absence after reap: the doctor performs no
+`poll()`/`wait()` before its final group action and never signals or probes that
+PGID afterward. Darwin's zombie-only `EPERM` result is accepted only when a
+non-reaping child-exit check proves the leader exited; an unknown permission
+result stays inconclusive. Any post-spawn timeout, byte-limit, selector, stream,
+or wait failure enters one bounded TERM/grace/KILL transaction with interleaved
+drain and a separate hard reap deadline. Snapshot deletion begins only after
+that transaction proves the group was sealed, the child was reaped, and the
+pipes were drained. If a close-time retry still cannot prove it, the doctor
 leaves the owner-private runtime intact and reports its verified locator plus
 the unresolved PID/process-group binding.
 
