@@ -128,8 +128,11 @@ File unlink proof requires the retained inode to reach zero links; directory
 removal is issued relative to the retained owner-private parent only after
 path/descriptor identity agrees. A pre-cleanup ACL or mode drift, or any failed
 `fchmod`, `unlink`, or `rmdir`, is `collector-inconclusive` rather than a
-silent best-effort cleanup. When the run directory remains bound at its
-trusted name, the blocked receipt includes a sanitized
+silent best-effort cleanup. A failed directory owner-mode restoration remains
+proof-affecting even if all later identity-bound removals succeed; in that
+case `cleanup_proof` is inconclusive without claiming that a removed runtime
+or snapshot is retained. When the run directory remains bound at its trusted
+name, the blocked receipt includes a sanitized
 `cleanup_failure.retained_runtime` locator with its absolute path, device,
 inode, and verified path-binding state. Any still-linked bound or provisional
 snapshot also appears in `retained_objects` with its exact device/inode. Its

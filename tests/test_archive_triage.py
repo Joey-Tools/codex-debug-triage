@@ -1899,7 +1899,7 @@ class ArchiveTriageTests(unittest.TestCase):
         os.name == "posix" and hasattr(os, "killpg"),
         "process-group containment requires POSIX",
     )
-    def test_external_group_termination_reaps_catastrophic_regex_worker(
+    def test_external_group_termination_stops_catastrophic_regex_worker(
         self,
     ) -> None:
         launcher = "\n".join(
@@ -1935,23 +1935,81 @@ class ArchiveTriageTests(unittest.TestCase):
             )
         )
 
-        def process_exists(pid: int) -> bool:
-            try:
-                os.kill(pid, 0)
-            except ProcessLookupError:
-                return False
-            except PermissionError:
-                return True
-            return True
+        class DarwinProcBsdInfo(ctypes.Structure):
+            _fields_ = [
+                ("pbi_flags", ctypes.c_uint32),
+                ("pbi_status", ctypes.c_uint32),
+                ("pbi_xstatus", ctypes.c_uint32),
+                ("pbi_pid", ctypes.c_uint32),
+                ("pbi_ppid", ctypes.c_uint32),
+                ("pbi_uid", ctypes.c_uint32),
+                ("pbi_gid", ctypes.c_uint32),
+                ("pbi_ruid", ctypes.c_uint32),
+                ("pbi_rgid", ctypes.c_uint32),
+                ("pbi_svuid", ctypes.c_uint32),
+                ("pbi_svgid", ctypes.c_uint32),
+                ("rfu_1", ctypes.c_uint32),
+                ("pbi_comm", ctypes.c_char * 16),
+                ("pbi_name", ctypes.c_char * 32),
+                ("pbi_nfiles", ctypes.c_uint32),
+                ("pbi_pgid", ctypes.c_uint32),
+                ("pbi_pjobc", ctypes.c_uint32),
+                ("e_tdev", ctypes.c_uint32),
+                ("e_tpgid", ctypes.c_uint32),
+                ("pbi_nice", ctypes.c_int32),
+                ("pbi_start_tvsec", ctypes.c_uint64),
+                ("pbi_start_tvusec", ctypes.c_uint64),
+            ]
 
-        def process_group_exists(pgid: int) -> bool:
-            try:
-                os.killpg(pgid, 0)
-            except ProcessLookupError:
-                return False
-            except PermissionError:
-                return True
-            return True
+        darwin_proc_pidinfo = None
+        darwin_proc_pid_bsd_info = 3
+        darwin_process_zombie = 5
+        if sys.platform == "darwin":
+            libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+            darwin_proc_pidinfo = libproc.proc_pidinfo
+            darwin_proc_pidinfo.argtypes = [
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_uint64,
+                ctypes.c_void_p,
+                ctypes.c_int,
+            ]
+            darwin_proc_pidinfo.restype = ctypes.c_int
+            self.assertEqual(ctypes.sizeof(DarwinProcBsdInfo), 136)
+
+        def process_state(pid: int) -> str | None:
+            if sys.platform.startswith("linux"):
+                try:
+                    status_payload = Path(f"/proc/{pid}/stat").read_text(
+                        encoding="ascii"
+                    )
+                except FileNotFoundError:
+                    return None
+                command_end = status_payload.rfind(")")
+                self.assertGreaterEqual(command_end, 0)
+                return status_payload[command_end + 2]
+            if sys.platform == "darwin":
+                assert darwin_proc_pidinfo is not None
+                info = DarwinProcBsdInfo()
+                ctypes.set_errno(0)
+                bytes_read = darwin_proc_pidinfo(
+                    pid,
+                    darwin_proc_pid_bsd_info,
+                    0,
+                    ctypes.byref(info),
+                    ctypes.sizeof(info),
+                )
+                if bytes_read == 0:
+                    error_number = ctypes.get_errno()
+                    if error_number not in (0, errno.ESRCH):
+                        raise OSError(
+                            error_number,
+                            "proc_pidinfo process-state inspection failed",
+                        )
+                    return None
+                self.assertEqual(bytes_read, ctypes.sizeof(info))
+                return "Z" if info.pbi_status == darwin_process_zombie else "R"
+            self.skipTest("process-state inspection requires Linux or Darwin")
 
         with tempfile.TemporaryDirectory() as temp_dir:
             archive_path = Path(temp_dir) / "external-group-kill.zip"
@@ -2005,24 +2063,22 @@ class ArchiveTriageTests(unittest.TestCase):
                         assert worker_pid is not None
                         assert worker_pgid is not None
                         self.assertEqual(worker_pgid, helper_pgid)
-                        self.assertTrue(process_exists(worker_pid))
+                        self.assertNotIn(process_state(worker_pid), (None, "Z"))
                         time.sleep(0.05)
                         self.assertIsNone(process.poll())
 
                         os.killpg(helper_pgid, termination_signal)
                         process.wait(timeout=2)
 
-                        reap_deadline = time.monotonic() + 2.0
-                        worker_still_exists = True
-                        group_still_exists = True
-                        while time.monotonic() < reap_deadline:
-                            worker_still_exists = process_exists(worker_pid)
-                            group_still_exists = process_group_exists(helper_pgid)
-                            if not worker_still_exists and not group_still_exists:
-                                break
+                        stop_deadline = time.monotonic() + 2.0
+                        worker_state = process_state(worker_pid)
+                        while (
+                            worker_state not in (None, "Z")
+                            and time.monotonic() < stop_deadline
+                        ):
                             time.sleep(0.01)
-                        self.assertFalse(worker_still_exists)
-                        self.assertFalse(group_still_exists)
+                            worker_state = process_state(worker_pid)
+                        self.assertIn(worker_state, (None, "Z"))
                     finally:
                         if process.poll() is None:
                             os.killpg(helper_pgid, signal.SIGKILL)
@@ -6548,6 +6604,11 @@ class BugTriageDocumentationTests(unittest.TestCase):
                         **kwargs: object,
                     ) -> tuple[int, bytes, bytes]:
                         try:
+                            if os.geteuid() == 0:
+                                raise PermissionError(
+                                    errno.EACCES,
+                                    "root test process bypasses directory DAC",
+                                )
                             client._snapshot_path.rename(
                                 client._snapshot_path.with_name("gh.replaced")
                             )
@@ -7818,17 +7879,34 @@ class BugTriageDocumentationTests(unittest.TestCase):
             config_snapshot = client._config_snapshot_directory.path
             config_fd = client._config_snapshot_directory.fd
             original_fchmod = os.fchmod
+            original_unlink = os.unlink
 
             def reject_config_fchmod(fd: int, mode: int) -> None:
                 if fd == config_fd:
                     raise PermissionError(errno.EACCES, "fixture fchmod failure")
                 original_fchmod(fd, mode)
 
+            def reject_hosts_unlink(
+                path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+                *,
+                dir_fd: int | None = None,
+            ) -> None:
+                if path == "hosts.yml" and dir_fd == config_fd:
+                    raise PermissionError(errno.EACCES, "fixture unlink failure")
+                original_unlink(path, dir_fd=dir_fd)
+
             try:
-                with mock.patch.object(
-                    ENFORCEMENT_MODULE.os,
-                    "fchmod",
-                    side_effect=reject_config_fchmod,
+                with (
+                    mock.patch.object(
+                        ENFORCEMENT_MODULE.os,
+                        "fchmod",
+                        side_effect=reject_config_fchmod,
+                    ),
+                    mock.patch.object(
+                        ENFORCEMENT_MODULE.os,
+                        "unlink",
+                        side_effect=reject_hosts_unlink,
+                    ),
                 ):
                     with self.assertRaises(
                         ENFORCEMENT_MODULE.EnforcementDoctorError
@@ -7841,6 +7919,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
                     "config-directory-owner-mode",
                     cleanup["failed_operations"],
                 )
+                self.assertIn("unlink-hosts.yml", cleanup["failed_operations"])
                 self.assertEqual(
                     cleanup["retained_runtime"]["path"],
                     str(run_path),
@@ -7854,6 +7933,50 @@ class BugTriageDocumentationTests(unittest.TestCase):
                     config_snapshot.chmod(0o700)
                 if run_path.exists():
                     shutil.rmtree(run_path)
+
+    def test_enforcement_gh_cleanup_fchmod_failure_stays_inconclusive_after_removal(
+        self,
+    ) -> None:
+        with owner_controlled_temp_root() as temp_root:
+            trusted_gh = temp_root / "trusted-gh"
+            trusted_payload = b"#!/bin/sh\nexit 0\n"
+            trusted_gh.write_bytes(trusted_payload)
+            trusted_gh.chmod(0o700)
+            config_dir, runtime_parent = self._make_private_gh_config(temp_root)
+            client = ENFORCEMENT_MODULE.GitHubApiClient(
+                trusted_gh,
+                hashlib.sha256(trusted_payload).hexdigest(),
+                config_dir,
+                runtime_parent=runtime_parent,
+            )
+            run_path = client._run_directory.path
+            config_fd = client._config_snapshot_directory.fd
+            original_fchmod = os.fchmod
+
+            def change_then_reject_config_fchmod(fd: int, mode: int) -> None:
+                original_fchmod(fd, mode)
+                if fd == config_fd:
+                    raise PermissionError(errno.EACCES, "fixture fchmod failure")
+
+            with mock.patch.object(
+                ENFORCEMENT_MODULE.os,
+                "fchmod",
+                side_effect=change_then_reject_config_fchmod,
+            ):
+                with self.assertRaises(
+                    ENFORCEMENT_MODULE.EnforcementDoctorError
+                ) as raised:
+                    client.close()
+
+            cleanup = raised.exception.cleanup_failure
+            self.assertEqual(cleanup["cleanup_proof"], "inconclusive")
+            self.assertEqual(
+                cleanup["failed_operations"],
+                ["config-directory-owner-mode"],
+            )
+            self.assertNotIn("retained_runtime", cleanup)
+            self.assertNotIn("retained_objects", cleanup)
+            self.assertFalse(run_path.exists())
 
     def test_enforcement_gh_constructor_reports_cleanup_failure_locator(
         self,
@@ -9228,6 +9351,20 @@ class BugTriageDocumentationTests(unittest.TestCase):
                     "CISCO_CUTOVER_TARGET_HEAD_SHA",
                 ).update({"value": "8" * 40}),
                 "selector-mismatch",
+            ),
+            "workflow-id-input-tamper": (
+                lambda evidence: self._cutover_variable(
+                    evidence,
+                    "CISCO_CUTOVER_EXPECTED_WORKFLOW_ID",
+                ).update({"value": str(self._workflow_id + 1)}),
+                "workflow-input-binding-mismatch",
+            ),
+            "workflow-sha-input-tamper": (
+                lambda evidence: self._cutover_variable(
+                    evidence,
+                    "CISCO_CUTOVER_EXPECTED_WORKFLOW_SHA",
+                ).update({"value": "8" * 40}),
+                "workflow-input-binding-mismatch",
             ),
         }
         for label, (mutate, reason_code) in cases.items():

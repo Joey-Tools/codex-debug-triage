@@ -235,7 +235,9 @@ neutral job rather than being blocked by evidence that belongs to the one
 retirement PR. A target-head change fails instead of becoming neutral. The
 doctor independently reads both selector variables twice and requires them to
 equal its PR number and candidate-head arguments; changing the selector cannot
-turn a neutral run into target evidence.
+turn a neutral run into target evidence. It also requires the workflow ID and
+SHA variables to equal both the administrator-pinned doctor arguments and the
+native workflow metadata and source commit returned by GitHub.
 
 The target admission job binds the selector outputs, exact event PR
 number/head, receipt cutover object, and workflow ID/SHA before validating the

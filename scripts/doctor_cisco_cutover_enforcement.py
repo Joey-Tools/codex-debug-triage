@@ -3378,7 +3378,7 @@ class GitHubApiClient:
                 lambda: self._prepare_directory_for_cleanup(
                     self._config_snapshot_directory
                 ),
-                proof_required=False,
+                proof_required=True,
             )
             for name, bound_file, label in (
                 (
@@ -3422,7 +3422,7 @@ class GitHubApiClient:
                 lambda: self._prepare_directory_for_cleanup(
                     self._executable_snapshot_directory
                 ),
-                proof_required=False,
+                proof_required=True,
             )
             attempt(
                 "unlink-gh",
@@ -4532,6 +4532,29 @@ def _assert_static_identity(
             "workflow-identity-mismatch",
             "workflow source commit differs from the pinned SHA",
         )
+    expected_workflow_variables = {
+        "CISCO_CUTOVER_EXPECTED_WORKFLOW_ID": str(expected_workflow_id),
+        "CISCO_CUTOVER_EXPECTED_WORKFLOW_SHA": expected_workflow_sha,
+    }
+    native_workflow_variables = {
+        "CISCO_CUTOVER_EXPECTED_WORKFLOW_ID": str(workflow["id"]),
+        "CISCO_CUTOVER_EXPECTED_WORKFLOW_SHA": source_commit["sha"],
+    }
+    for name, expected_value in expected_workflow_variables.items():
+        selected = cutover_variables.get(name)
+        if (
+            selected is None
+            or selected["name"] != name
+            or selected["value"] != expected_value
+            or selected["value"] != native_workflow_variables[name]
+        ):
+            raise _blocked(
+                "workflow-input-binding-mismatch",
+                (
+                    "administrator workflow input variable differs from "
+                    "the selected native workflow identity"
+                ),
+            )
 
 
 def _collect_snapshot(
