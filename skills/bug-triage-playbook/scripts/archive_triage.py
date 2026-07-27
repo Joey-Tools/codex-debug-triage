@@ -117,6 +117,11 @@ REGEX_CLEANUP_IDLE = "idle"
 REGEX_CLEANUP_DEFERRING = "deferring"
 REGEX_CLEANUP_MASKED = "masked"
 REGEX_CLEANUP_RESTORING = "restoring"
+REGEX_SPAWN_IDLE = "idle"
+REGEX_SPAWN_DEFERRING = "deferring"
+REGEX_SPAWN_MASKED = "masked"
+REGEX_SPAWN_RESTORING = "restoring"
+REGEX_SPAWN_FENCED = "fenced"
 
 
 def _member_identity_character_limit(max_raw_name_bytes: int) -> int:
@@ -210,6 +215,7 @@ class ArchiveCommandDeadline:
         self._previous_handler: object | None = None
         self._regex_cleanup_state = REGEX_CLEANUP_IDLE
         self._regex_cleanup_deadline_error: ArtifactLimitError | None = None
+        self._regex_spawn_state = REGEX_SPAWN_IDLE
 
     @staticmethod
     def _require_signal_support() -> None:
@@ -371,9 +377,112 @@ class ArchiveCommandDeadline:
             self._regex_cleanup_deadline_error = error
         return error
 
+    def _transition_regex_spawn(
+        self,
+        expected_state: str,
+        next_state: str,
+    ) -> None:
+        if self._regex_spawn_state != expected_state:
+            raise RuntimeError(
+                "archive command regex spawn state transition failed: "
+                f"{self._regex_spawn_state} != {expected_state}"
+            )
+        self._regex_spawn_state = next_state
+
+    def _begin_regex_spawn(self) -> ArtifactLimitError | None:
+        interrupted_error = None
+        while True:
+            try:
+                self._transition_regex_spawn(
+                    REGEX_SPAWN_IDLE,
+                    REGEX_SPAWN_DEFERRING,
+                )
+                return interrupted_error
+            except ArtifactLimitError as error:
+                if interrupted_error is None:
+                    interrupted_error = error
+
+    def enter_regex_worker(
+        self,
+        workers: contextlib.ExitStack,
+        matcher: IsolatedRegexMatcher,
+    ) -> IsolatedRegexMatcher:
+        """Publish one worker cleanup callback before command alarms resume."""
+
+        interrupted_error = self._begin_regex_spawn()
+        previous_mask: set[signal.Signals] | None = None
+        mask_attempted = False
+        registered = False
+        entered_matcher: IsolatedRegexMatcher | None = None
+        setup_error: BaseException | None = None
+        operation_error: BaseException | None = None
+        cleanup_error: BaseException | None = None
+        restore_error: BaseException | None = None
+        try:
+            try:
+                self._require_signal_support()
+                mask_attempted = True
+                previous_mask = signal.pthread_sigmask(
+                    signal.SIG_BLOCK,
+                    {signal.SIGALRM},
+                )
+                self._regex_spawn_state = REGEX_SPAWN_MASKED
+            except BaseException as error:
+                setup_error = error
+            if setup_error is None:
+                matcher._spawn_transaction_owned = True
+                try:
+                    entered_matcher = workers.enter_context(matcher)
+                    registered = True
+                except BaseException as error:
+                    operation_error = error
+                finally:
+                    matcher._spawn_transaction_owned = False
+                if not registered and matcher._process is not None:
+                    try:
+                        matcher._terminate_worker()
+                    except BaseException as error:
+                        cleanup_error = error
+        finally:
+            safe_to_restore = registered or matcher._process is None
+            if previous_mask is not None and safe_to_restore:
+                self._regex_spawn_state = REGEX_SPAWN_RESTORING
+                try:
+                    signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+                except BaseException as error:
+                    restore_error = error
+            if (
+                (mask_attempted and previous_mask is None)
+                or not safe_to_restore
+                or restore_error is not None
+            ):
+                self._regex_spawn_state = REGEX_SPAWN_FENCED
+            else:
+                self._regex_spawn_state = REGEX_SPAWN_IDLE
+
+        deadline_error = interrupted_error or self._regex_cleanup_deadline_error
+        if deadline_error is None and time.monotonic() >= self.deadline:
+            deadline_error = self._record_regex_cleanup_deadline()
+        if cleanup_error is not None:
+            raise cleanup_error from (
+                operation_error or restore_error or deadline_error
+            )
+        if setup_error is not None:
+            raise setup_error from deadline_error
+        if operation_error is not None:
+            raise operation_error from (restore_error or deadline_error)
+        if restore_error is not None:
+            raise restore_error from deadline_error
+        if deadline_error is not None:
+            raise deadline_error
+        assert entered_matcher is not None
+        return entered_matcher
+
     def run_regex_worker_cleanup(
         self,
         cleanup: Callable[[], None],
+        *,
+        rethrow_deadline: bool = True,
     ) -> None:
         """Defer command alarms until one worker cleanup transaction completes."""
 
@@ -415,14 +524,17 @@ class ArchiveCommandDeadline:
             raise setup_error from deadline_error
         if restore_error is not None:
             raise restore_error from deadline_error
-        if deadline_error is not None:
+        if deadline_error is not None and rethrow_deadline:
             raise deadline_error
 
     def _raise_timeout(self, _signum: int, _frame: object) -> None:
         if self._closing:
             return
         error = self._record_regex_cleanup_deadline()
-        if self._regex_cleanup_state != REGEX_CLEANUP_IDLE:
+        if (
+            self._regex_cleanup_state != REGEX_CLEANUP_IDLE
+            or self._regex_spawn_state != REGEX_SPAWN_IDLE
+        ):
             return
         raise error
 
@@ -1175,6 +1287,7 @@ class IsolatedRegexMatcher:
         self._command_deadline = command_deadline
         self._process: subprocess.Popen[bytes] | None = None
         self._cleanup_recovery: dict[str, object] | None = None
+        self._spawn_transaction_owned = False
 
     def __enter__(self) -> IsolatedRegexMatcher:
         script_path = pathlib.Path(__file__).resolve()
@@ -1213,7 +1326,8 @@ class IsolatedRegexMatcher:
                 )
                 raise re.error(str(detail))
         except BaseException:
-            self.close()
+            if not self._spawn_transaction_owned:
+                self.close()
             raise
         return self
 
@@ -1223,7 +1337,12 @@ class IsolatedRegexMatcher:
         exc_value: object,
         traceback: object,
     ) -> None:
-        self.close()
+        command_deadline = self._command_deadline
+        rethrow_deadline = not (
+            command_deadline is not None
+            and exc_value is command_deadline._regex_cleanup_deadline_error
+        )
+        self._terminate(rethrow_deadline=rethrow_deadline)
 
     def _running_process(self) -> subprocess.Popen[bytes]:
         process = self._process
@@ -1463,13 +1582,16 @@ class IsolatedRegexMatcher:
         if deferred_error is not None:
             raise deferred_error
 
-    def _terminate(self) -> None:
+    def _terminate(self, *, rethrow_deadline: bool = True) -> None:
         command_deadline = self._command_deadline
         if command_deadline is None:
             self._terminate_worker()
             return
         try:
-            command_deadline.run_regex_worker_cleanup(self._terminate_worker)
+            command_deadline.run_regex_worker_cleanup(
+                self._terminate_worker,
+                rethrow_deadline=rethrow_deadline,
+            )
         except BaseException as error:
             process = self._process
             if process is not None and not isinstance(
@@ -2966,7 +3088,8 @@ def cmd_zip_list(args: argparse.Namespace) -> int:
         regex_budget = RegexMatchBudget()
         with contextlib.ExitStack() as workers:
             matcher = (
-                workers.enter_context(
+                deadline.enter_regex_worker(
+                    workers,
                     IsolatedRegexMatcher(
                         args.match,
                         ignore_case=args.ignore_case,
@@ -3122,7 +3245,8 @@ def cmd_zip_show(args: argparse.Namespace) -> int:
         regex_budget = RegexMatchBudget()
         with contextlib.ExitStack() as workers:
             member_matcher = (
-                workers.enter_context(
+                deadline.enter_regex_worker(
+                    workers,
                     IsolatedRegexMatcher(
                         args.member,
                         ignore_case=args.ignore_case,
@@ -3134,7 +3258,8 @@ def cmd_zip_show(args: argparse.Namespace) -> int:
                 else None
             )
             grep_matcher = (
-                workers.enter_context(
+                deadline.enter_regex_worker(
+                    workers,
                     IsolatedRegexMatcher(
                         args.grep,
                         ignore_case=args.ignore_case,

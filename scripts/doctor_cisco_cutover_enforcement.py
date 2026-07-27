@@ -22,7 +22,7 @@ import sys
 import threading
 import time
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 CONTRACT_SCHEMA_VERSION = 4
 COLLECTOR_SCHEMA_VERSION = 3
@@ -55,6 +55,7 @@ GH_PROCESS_TERM_GRACE_SECONDS = 1.0
 GH_PROCESS_REAP_DEADLINE_SECONDS = 5.0
 GH_PROCESS_CLEANUP_POLL_SECONDS = 0.01
 GH_PROCESS_DRAIN_CHUNKS_PER_TICK = 16
+GH_TERMINATION_SIGNAL_NAMES = ("SIGHUP", "SIGINT", "SIGQUIT", "SIGTERM")
 MAX_DARWIN_ACL_BYTES = 64 * 1024
 MAX_DARWIN_ACL_ENTRIES = 128
 GH_EXECUTABLE_ENVIRONMENT_PROFILE = "minimal-snapshotted-config-v2"
@@ -666,6 +667,172 @@ SAFE_TERMINAL_GROUP_STATES = {
     GROUP_NO_SIGNALABLE_MEMBERS_BEFORE_REAP,
     GROUP_DIRECT_PROCESS_ONLY,
 }
+
+
+class _DeferredTerminationSignal(BaseException):
+    def __init__(self, signal_number: int) -> None:
+        self.signal_number = signal_number
+        super().__init__(f"deferred termination signal {signal_number}")
+
+
+class _TerminationSignalGuard:
+    """Defer process termination until a spawned child has a cleanup owner."""
+
+    def __init__(self) -> None:
+        self._requested_signals = tuple(
+            dict.fromkeys(
+                getattr(signal, name)
+                for name in GH_TERMINATION_SIGNAL_NAMES
+                if hasattr(signal, name)
+            )
+        )
+        self._managed_signals: tuple[int, ...] = ()
+        self._original_handlers: dict[int, Any] = {}
+        self._original_mask: set[signal.Signals] | None = None
+        self._state = "new"
+        self._deferred_signal: int | None = None
+        self._errors: list[BaseException] = []
+
+    @property
+    def deferred_signal(self) -> int | None:
+        return self._deferred_signal
+
+    @property
+    def errors(self) -> tuple[BaseException, ...]:
+        return tuple(self._errors)
+
+    def _record_signal(self, signal_number: int) -> None:
+        if self._deferred_signal is None:
+            self._deferred_signal = signal_number
+
+    def _handle_signal(self, signal_number: int, _frame: object) -> None:
+        self._record_signal(signal_number)
+        if self._state == "running":
+            raise _DeferredTerminationSignal(signal_number)
+
+    def start(self) -> None:
+        required_names = (
+            "pthread_sigmask",
+            "sigpending",
+            "sigwait",
+            "SIG_BLOCK",
+            "SIG_SETMASK",
+        )
+        if (
+            os.name != "posix"
+            or threading.current_thread() is not threading.main_thread()
+            or threading.active_count() != 1
+            or any(not hasattr(signal, name) for name in required_names)
+            or not self._requested_signals
+        ):
+            raise OSError("termination-signal deferral is unavailable")
+
+        requested = set(self._requested_signals)
+        installed: list[int] = []
+        try:
+            self._original_mask = signal.pthread_sigmask(
+                signal.SIG_BLOCK,
+                requested,
+            )
+            for signal_number in self._requested_signals:
+                if signal_number in self._original_mask:
+                    continue
+                original_handler = signal.getsignal(signal_number)
+                if original_handler == signal.SIG_IGN:
+                    continue
+                self._original_handlers[signal_number] = original_handler
+                signal.signal(signal_number, self._handle_signal)
+                installed.append(signal_number)
+            self._managed_signals = tuple(installed)
+            self._state = "blocked"
+        except BaseException:
+            for signal_number in reversed(installed):
+                try:
+                    signal.signal(
+                        signal_number,
+                        self._original_handlers[signal_number],
+                    )
+                except BaseException:
+                    pass
+            if self._original_mask is not None:
+                try:
+                    signal.pthread_sigmask(
+                        signal.SIG_SETMASK,
+                        self._original_mask,
+                    )
+                except BaseException:
+                    pass
+            self._state = "failed"
+            raise
+
+    def publish(self, _managed: _ManagedProcess) -> None:
+        if self._state != "blocked" or self._original_mask is None:
+            raise RuntimeError("termination-signal guard publication is invalid")
+        self._state = "running"
+        signal.pthread_sigmask(signal.SIG_SETMASK, self._original_mask)
+
+    def _drain_pending(self) -> None:
+        try:
+            pending = set(signal.sigpending()).intersection(self._managed_signals)
+        except BaseException as error:
+            self._errors.append(error)
+            return
+        for signal_number in self._managed_signals:
+            if signal_number not in pending:
+                continue
+            try:
+                received = signal.sigwait({signal_number})
+            except BaseException as error:
+                self._errors.append(error)
+                continue
+            if received != signal_number:
+                self._errors.append(
+                    RuntimeError(
+                        "termination-signal drain returned an unexpected signal"
+                    )
+                )
+                continue
+            self._record_signal(signal_number)
+
+    def begin_cleanup(self) -> None:
+        if self._state in ("cleanup", "fenced", "closed"):
+            return
+        self._state = "cleanup"
+        try:
+            signal.pthread_sigmask(
+                signal.SIG_BLOCK,
+                set(self._requested_signals),
+            )
+        except BaseException as error:
+            self._errors.append(error)
+        self._drain_pending()
+
+    def finish(self) -> None:
+        self.begin_cleanup()
+        self._drain_pending()
+        handlers_restored = True
+        for signal_number in reversed(self._managed_signals):
+            try:
+                signal.signal(
+                    signal_number,
+                    self._original_handlers[signal_number],
+                )
+            except BaseException as error:
+                self._errors.append(error)
+                handlers_restored = False
+        if not handlers_restored or self._original_mask is None:
+            self._state = "fenced"
+            return
+        try:
+            signal.pthread_sigmask(
+                signal.SIG_SETMASK,
+                self._original_mask,
+            )
+        except BaseException as error:
+            self._errors.append(error)
+            self._state = "fenced"
+            return
+        self._state = "closed"
 
 
 class _ManagedProcess:
@@ -2204,13 +2371,14 @@ def _write_all(fd: int, payload: bytes) -> None:
         offset += written
 
 
-def _bounded_subprocess(
+def _bounded_subprocess_supervised(
     command: list[str],
     *,
     environment: dict[str, str],
     execution_cwd: str,
     endpoint_class: str,
     process_registry: dict[int, _ManagedProcess],
+    process_registered: Callable[[_ManagedProcess], None],
     timeout_seconds: int,
     stdout_limit: int,
     stderr_limit: int,
@@ -2259,6 +2427,7 @@ def _bounded_subprocess(
         if process.pid in process_registry:
             raise OSError("collector process identity is already registered")
         process_registry[process.pid] = managed
+        process_registered(managed)
         chunks: dict[str, list[bytes]] = {"stdout": [], "stderr": []}
         retained: dict[str, int] = {"stdout": 0, "stderr": 0}
         deadline = time.monotonic() + timeout_seconds
@@ -2390,6 +2559,129 @@ def _bounded_subprocess(
             ),
         )
     return return_code, b"".join(chunks["stdout"]), b"".join(chunks["stderr"])
+
+
+def _process_supervision_error(
+    endpoint_class: str,
+    reason: str,
+    *,
+    unavailable: bool,
+) -> EnforcementDoctorError:
+    return _blocked(
+        "collector-unavailable" if unavailable else "collector-inconclusive",
+        reason,
+        api_failure=_api_failure(
+            endpoint_class,
+            http_status=None,
+            failure_kind="process-supervision",
+        ),
+    )
+
+
+def _forward_deferred_termination_signal(
+    signal_number: int,
+    secondary_error: BaseException | None,
+) -> None:
+    try:
+        os.kill(os.getpid(), signal_number)
+    except BaseException as signal_error:
+        if secondary_error is not None:
+            raise signal_error from secondary_error
+        raise
+    deferred = _DeferredTerminationSignal(signal_number)
+    if secondary_error is not None:
+        raise deferred from secondary_error
+    raise deferred
+
+
+def _bounded_subprocess(
+    command: list[str],
+    *,
+    environment: dict[str, str],
+    execution_cwd: str,
+    endpoint_class: str,
+    process_registry: dict[int, _ManagedProcess],
+    timeout_seconds: int,
+    stdout_limit: int,
+    stderr_limit: int,
+    termination_cleanup: Callable[[], None] | None = None,
+) -> tuple[int, bytes, bytes]:
+    signal_guard = _TerminationSignalGuard()
+    try:
+        signal_guard.start()
+    except Exception as error:
+        raise _process_supervision_error(
+            endpoint_class,
+            "GitHub API collector termination-signal supervision is unavailable",
+            unavailable=True,
+        ) from error
+
+    process_result: tuple[int, bytes, bytes] | None = None
+    primary_error: BaseException | None = None
+    try:
+        try:
+            process_result = _bounded_subprocess_supervised(
+                command,
+                environment=environment,
+                execution_cwd=execution_cwd,
+                endpoint_class=endpoint_class,
+                process_registry=process_registry,
+                process_registered=signal_guard.publish,
+                timeout_seconds=timeout_seconds,
+                stdout_limit=stdout_limit,
+                stderr_limit=stderr_limit,
+            )
+        except BaseException as error:
+            primary_error = error
+        finally:
+            signal_guard.begin_cleanup()
+    except BaseException as error:
+        if primary_error is None:
+            primary_error = error
+
+    deferred_signal = signal_guard.deferred_signal
+    credential_cleanup_error: BaseException | None = None
+    if deferred_signal is not None and termination_cleanup is not None:
+        try:
+            termination_cleanup()
+        except BaseException as error:
+            credential_cleanup_error = error
+    signal_guard.finish()
+
+    supervision_error = None
+    if signal_guard.errors:
+        supervision_error = _process_supervision_error(
+            endpoint_class,
+            "GitHub API collector termination-signal state could not be restored",
+            unavailable=False,
+        )
+    if deferred_signal is not None:
+        secondary_error = (
+            credential_cleanup_error
+            or supervision_error
+            or (
+                primary_error
+                if not isinstance(primary_error, _DeferredTerminationSignal)
+                else None
+            )
+        )
+        if supervision_error is not None:
+            deferred = _DeferredTerminationSignal(deferred_signal)
+            if secondary_error is not None:
+                raise deferred from secondary_error
+            raise deferred
+        _forward_deferred_termination_signal(
+            deferred_signal,
+            secondary_error,
+        )
+    if supervision_error is not None:
+        if primary_error is not None:
+            raise supervision_error from primary_error
+        raise supervision_error
+    if primary_error is not None:
+        raise primary_error
+    assert process_result is not None
+    return process_result
 
 
 class GitHubApiClient:
@@ -3638,8 +3930,11 @@ class GitHubApiClient:
                 timeout_seconds=max(1, min(MAX_API_SECONDS, int(remaining))),
                 stdout_limit=stdout_limit,
                 stderr_limit=MAX_API_STDERR_BYTES,
+                termination_cleanup=self.close,
             )
         except BaseException:
+            if self._closed:
+                raise
             self._revalidate_snapshot()
             raise
         self._revalidate_snapshot()

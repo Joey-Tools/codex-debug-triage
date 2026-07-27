@@ -191,8 +191,20 @@ remains armed, and any command expiration recorded during the deferred cleanup
 is rethrown after mask restoration instead of extending or erasing the
 deadline. If terminal reap cannot be proven, cleanup retains the authoritative
 process handle plus the observed PID/process-group recovery identity instead
-of discarding the handle. Decoded member text escapes terminal control and
-non-printing characters before output character accounting and publication.
+of discarding the handle.
+
+Worker startup uses the same property across a wider publication transaction:
+one true original `SIGALRM` mask covers `Popen`, publication of the returned
+handle on the matcher, worker initialization, and publication of its cleanup
+callback in the owning `ExitStack`. The helper restores that mask only after
+the callback is registered or after a failed startup has completed
+terminate/reap and pipe closure. A deadline observed at signal-support or
+first-mask boundaries is recorded and rethrown after safe publication; a
+deadline at the `Popen` return boundary cannot strand the still-unpublished
+handle. If neither cleanup publication nor terminal reap can be proved, the
+helper retains both the handle and the blocked signal fence for explicit
+recovery. Decoded member text escapes terminal control and non-printing
+characters before output character accounting and publication.
 
 ## 5. Report Decisive Evidence
 

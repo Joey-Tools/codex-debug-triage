@@ -480,24 +480,35 @@ and malformed responses map to `api-unavailable`; and bounded command expiry
 maps to `api-timeout`. Response bodies, raw headers, command environments,
 tokens, and raw `gh` stderr are never copied into the doctor receipt.
 
-The process boundary starts immediately after `Popen`: the direct process is
-registered before deadline, buffer, or selector initialization. Every
-post-spawn error enters bounded TERM/grace/KILL with interleaved pipe drain and
-a second hard reap deadline. Before the first `poll()` or `wait()`, successful
-completion and error cleanup both seal the process group while the unreaped
-leader still pins the numeric PID/PGID; after reap they never signal or probe
-that number. This protects group identity during signaling and prevents
-remaining members from continuing user-space credential access without
-claiming numeric group absence after reap. On Darwin, a zombie-only `EPERM`
-from the final group signal counts only when a non-reaping `waitid` or
-`EVFILT_PROC` check proves the leader exited; every unknown permission result
-remains inconclusive. Unexpected selector, stream, wait, or resource errors map
-to structured `collector-inconclusive` evidence. The client retries any
-unresolved registered process before credential cleanup, but a retry whose
-leader was already reaped cannot touch the old PGID. If quiescence is still
-unproven, it performs no snapshot `fchmod`, `unlink`, or `rmdir`, retains the
-owner-private runtime, and returns sanitized retained-object locators plus the
-unresolved process binding.
+The process boundary starts before `Popen`: the collector blocks the ordinary
+catchable termination signals while spawning, constructing the managed-process
+handle, and publishing it in the client registry. It restores delivery only
+after that registry publication. A signal deferred across this boundary, or
+received while the registered child is running, first drives bounded
+TERM/grace/KILL, drain, and reap, then closes the owner-private credential and
+executable snapshot, restores the caller's handlers and signal mask, and
+forwards the original signal to the caller's handler. The original signal
+remains primary when child or snapshot cleanup also fails; an unsafe
+handler/mask restoration keeps the termination signals fenced instead of
+opening an unowned interruption window.
+
+The direct process is registered before deadline, buffer, or selector
+initialization. Every post-spawn error enters bounded TERM/grace/KILL with
+interleaved pipe drain and a second hard reap deadline. Before the first
+`poll()` or `wait()`, successful completion and error cleanup both seal the
+process group while the unreaped leader still pins the numeric PID/PGID; after
+reap they never signal or probe that number. This protects group identity
+during signaling and prevents remaining members from continuing user-space
+credential access without claiming numeric group absence after reap. On
+Darwin, a zombie-only `EPERM` from the final group signal counts only when a
+non-reaping `waitid` or `EVFILT_PROC` check proves the leader exited; every
+unknown permission result remains inconclusive. Unexpected selector, stream,
+wait, or resource errors map to structured `collector-inconclusive` evidence.
+The client retries any unresolved registered process before credential
+cleanup, but a retry whose leader was already reaped cannot touch the old PGID.
+If quiescence is still unproven, it performs no snapshot `fchmod`, `unlink`, or
+`rmdir`, retains the owner-private runtime, and returns sanitized
+retained-object locators plus the unresolved process binding.
 
 Invoke the doctor only with administrator-pinned identities and the exact
 existing PR:

@@ -2174,6 +2174,248 @@ class ArchiveTriageTests(unittest.TestCase):
 
     @unittest.skipUnless(
         os.name == "posix"
+        and all(
+            hasattr(signal, name)
+            for name in (
+                "SIGALRM",
+                "ITIMER_REAL",
+                "setitimer",
+                "pthread_sigmask",
+                "SIG_BLOCK",
+                "SIG_SETMASK",
+            )
+        ),
+        "regex spawn publication requires POSIX signal timers",
+    )
+    def test_regex_spawn_defers_deadline_at_popen_return_boundary(self) -> None:
+        real_popen = subprocess.Popen
+        deadline = MODULE.ArchiveCommandDeadline()
+        matcher = MODULE.IsolatedRegexMatcher(
+            "safe",
+            ignore_case=False,
+            budget=MODULE.RegexMatchBudget(),
+            command_deadline=deadline,
+        )
+        process = None
+        initial_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+
+        def interrupt_after_popen_returns(
+            *args: object,
+            **kwargs: object,
+        ) -> subprocess.Popen[bytes]:
+            nonlocal process
+            process = real_popen(*args, **kwargs)
+            self.assertIsNone(matcher._process)
+            self.assertEqual(
+                deadline._regex_spawn_state,
+                MODULE.REGEX_SPAWN_MASKED,
+            )
+            os.kill(os.getpid(), signal.SIGALRM)
+            self.assertIn(signal.SIGALRM, signal.sigpending())
+            return process
+
+        try:
+            deadline.arm()
+            with mock.patch.object(
+                MODULE.subprocess,
+                "Popen",
+                side_effect=interrupt_after_popen_returns,
+            ):
+                with self.assertRaises(MODULE.ArtifactLimitError) as raised:
+                    with MODULE.contextlib.ExitStack() as workers:
+                        deadline.enter_regex_worker(workers, matcher)
+            self.assertEqual(
+                str(raised.exception),
+                "archive command deadline exceeded",
+            )
+            self.assertIsNot(raised.exception.__context__, raised.exception)
+            self.assertIsNone(matcher._process)
+            assert process is not None
+            self.assertIsNotNone(process.poll())
+            self.assertEqual(
+                signal.pthread_sigmask(signal.SIG_BLOCK, set()),
+                initial_mask,
+            )
+            self.assertEqual(
+                deadline._regex_spawn_state,
+                MODULE.REGEX_SPAWN_IDLE,
+            )
+        finally:
+            try:
+                signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGALRM})
+                deadline.close()
+            finally:
+                signal.pthread_sigmask(signal.SIG_SETMASK, initial_mask)
+                if process is not None and process.poll() is None:
+                    process.kill()
+                    process.wait(timeout=2)
+
+    @unittest.skipUnless(
+        os.name == "posix"
+        and all(
+            hasattr(signal, name)
+            for name in (
+                "SIGALRM",
+                "ITIMER_REAL",
+                "setitimer",
+                "pthread_sigmask",
+                "SIG_BLOCK",
+                "SIG_SETMASK",
+            )
+        ),
+        "regex spawn handshake requires POSIX signal timers",
+    )
+    def test_regex_spawn_handshake_preserves_true_original_signal_mask(
+        self,
+    ) -> None:
+        real_sigmask = signal.pthread_sigmask
+        deadline = MODULE.ArchiveCommandDeadline()
+        matcher = MODULE.IsolatedRegexMatcher(
+            "safe",
+            ignore_case=False,
+            budget=MODULE.RegexMatchBudget(),
+            command_deadline=deadline,
+        )
+        process = None
+        support_checks = 0
+        spawn_mask_calls = 0
+        initial_mask = real_sigmask(signal.SIG_BLOCK, set())
+        real_require_signal_support = deadline._require_signal_support
+
+        def interrupt_support_check() -> None:
+            nonlocal support_checks
+            if deadline._regex_spawn_state == MODULE.REGEX_SPAWN_DEFERRING:
+                support_checks += 1
+                deadline._raise_timeout(signal.SIGALRM, None)
+            real_require_signal_support()
+
+        def interrupt_first_spawn_mask(
+            operation: int,
+            signals: set[signal.Signals],
+        ) -> set[signal.Signals]:
+            nonlocal spawn_mask_calls
+            previous_mask = real_sigmask(operation, signals)
+            if (
+                operation == signal.SIG_BLOCK
+                and deadline._regex_spawn_state == MODULE.REGEX_SPAWN_DEFERRING
+            ):
+                spawn_mask_calls += 1
+                deadline._raise_timeout(signal.SIGALRM, None)
+            return previous_mask
+
+        try:
+            deadline.arm()
+            with (
+                mock.patch.object(
+                    deadline,
+                    "_require_signal_support",
+                    side_effect=interrupt_support_check,
+                ),
+                mock.patch.object(
+                    MODULE.signal,
+                    "pthread_sigmask",
+                    side_effect=interrupt_first_spawn_mask,
+                ),
+                self.assertRaises(MODULE.ArtifactLimitError) as raised,
+            ):
+                with MODULE.contextlib.ExitStack() as workers:
+                    deadline.enter_regex_worker(workers, matcher)
+            process = matcher._process
+            self.assertIsNone(process)
+            self.assertEqual(
+                str(raised.exception),
+                "archive command deadline exceeded",
+            )
+        finally:
+            try:
+                real_sigmask(signal.SIG_BLOCK, {signal.SIGALRM})
+                deadline.close()
+            finally:
+                real_sigmask(signal.SIG_SETMASK, initial_mask)
+                if process is not None and process.poll() is None:
+                    process.kill()
+                    process.wait(timeout=2)
+
+        self.assertEqual(support_checks, 1)
+        self.assertEqual(spawn_mask_calls, 1)
+        self.assertEqual(
+            real_sigmask(signal.SIG_BLOCK, set()),
+            initial_mask,
+        )
+        self.assertEqual(
+            deadline._regex_spawn_state,
+            MODULE.REGEX_SPAWN_IDLE,
+        )
+
+    def test_regex_spawn_cleanup_failure_retains_signal_fence(self) -> None:
+        deadline = MODULE.ArchiveCommandDeadline()
+        matcher = MODULE.IsolatedRegexMatcher(
+            "safe",
+            ignore_case=False,
+            budget=MODULE.RegexMatchBudget(),
+            command_deadline=deadline,
+        )
+        process = mock.Mock()
+        process.pid = 4242
+        process.stdin = mock.Mock()
+        process.stdout = mock.Mock()
+        process.poll.return_value = None
+        cleanup_error = MODULE.RegexWorkerCleanupError(
+            process,
+            cleanup_stage="kill-wait",
+            process_group_id=4242,
+        )
+        mask_operations: list[int] = []
+
+        def change_mask(
+            operation: int,
+            _signals: object,
+        ) -> set[signal.Signals]:
+            mask_operations.append(operation)
+            if operation == signal.SIG_SETMASK:
+                self.fail("an unproven worker must retain the signal fence")
+            return set()
+
+        with (
+            mock.patch.object(deadline, "_require_signal_support"),
+            mock.patch.object(
+                MODULE.signal,
+                "pthread_sigmask",
+                side_effect=change_mask,
+            ),
+            mock.patch.object(
+                MODULE.subprocess,
+                "Popen",
+                return_value=process,
+            ),
+            mock.patch.object(MODULE.os, "set_blocking"),
+            mock.patch.object(
+                matcher,
+                "_request",
+                side_effect=RuntimeError("injected worker setup failure"),
+            ),
+            mock.patch.object(
+                matcher,
+                "_terminate_worker",
+                side_effect=cleanup_error,
+            ) as cleanup,
+            self.assertRaises(MODULE.RegexWorkerCleanupError) as raised,
+        ):
+            with MODULE.contextlib.ExitStack() as workers:
+                deadline.enter_regex_worker(workers, matcher)
+
+        self.assertIs(raised.exception, cleanup_error)
+        self.assertIsInstance(raised.exception.__cause__, RuntimeError)
+        self.assertIs(matcher._process, process)
+        self.assertEqual(
+            deadline._regex_spawn_state,
+            MODULE.REGEX_SPAWN_FENCED,
+        )
+        self.assertEqual(mask_operations, [signal.SIG_BLOCK])
+        cleanup.assert_called_once_with()
+
+    @unittest.skipUnless(
+        os.name == "posix"
         and hasattr(os, "killpg")
         and all(
             hasattr(signal, name)
@@ -7126,6 +7368,215 @@ class BugTriageDocumentationTests(unittest.TestCase):
         )
         process.stdout.close.assert_called_once()
         process.stderr.close.assert_called_once()
+
+    @unittest.skipUnless(
+        os.name == "posix"
+        and all(
+            hasattr(signal, name)
+            for name in (
+                "SIGINT",
+                "pthread_sigmask",
+                "sigpending",
+                "sigwait",
+                "SIG_BLOCK",
+                "SIG_SETMASK",
+            )
+        ),
+        "collector spawn publication requires POSIX signal controls",
+    )
+    def test_enforcement_subprocess_defers_signal_before_registry_publication(
+        self,
+    ) -> None:
+        process = mock.Mock()
+        process.pid = 4242
+        process.stdout = mock.Mock()
+        process.stderr = mock.Mock()
+        process_registry: dict[int, object] = {}
+        events: list[str] = []
+        original_handler = signal.getsignal(signal.SIGINT)
+        original_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+        original_managed_process = ENFORCEMENT_MODULE._ManagedProcess
+        if signal.SIGINT in original_mask:
+            self.skipTest("the test runner already blocks SIGINT")
+
+        def interrupt_before_publication(*_args: object, **_kwargs: object) -> object:
+            self.assertEqual(process_registry, {})
+            events.append("popen-return")
+            os.kill(os.getpid(), signal.SIGINT)
+            self.assertIn(signal.SIGINT, signal.sigpending())
+            return process
+
+        def construct_managed_process(spawned_process: object) -> object:
+            self.assertEqual(process_registry, {})
+            self.assertIn(signal.SIGINT, signal.sigpending())
+            events.append("managed-construction")
+            return original_managed_process(spawned_process)
+
+        def terminate_child(_managed: object) -> list[str]:
+            events.append("child-cleanup")
+            return []
+
+        def cleanup_credentials() -> None:
+            self.assertEqual(process_registry, {})
+            events.append("credential-cleanup")
+
+        try:
+            signal.signal(signal.SIGINT, signal.default_int_handler)
+            with (
+                mock.patch.object(
+                    ENFORCEMENT_MODULE.subprocess,
+                    "Popen",
+                    side_effect=interrupt_before_publication,
+                ),
+                mock.patch.object(
+                    ENFORCEMENT_MODULE,
+                    "_ManagedProcess",
+                    side_effect=construct_managed_process,
+                ),
+                mock.patch.object(
+                    ENFORCEMENT_MODULE,
+                    "_terminate_drain_reap",
+                    side_effect=terminate_child,
+                ) as cleanup,
+                self.assertRaises(KeyboardInterrupt),
+            ):
+                ENFORCEMENT_MODULE._bounded_subprocess(
+                    ["/fixed/gh", "api", "/user"],
+                    environment={},
+                    execution_cwd=tempfile.gettempdir(),
+                    endpoint_class="authenticated-user",
+                    process_registry=process_registry,
+                    timeout_seconds=1,
+                    stdout_limit=1024,
+                    stderr_limit=1024,
+                    termination_cleanup=cleanup_credentials,
+                )
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, original_mask)
+            signal.signal(signal.SIGINT, original_handler)
+
+        cleanup.assert_called_once()
+        self.assertEqual(
+            events,
+            [
+                "popen-return",
+                "managed-construction",
+                "child-cleanup",
+                "credential-cleanup",
+            ],
+        )
+        self.assertEqual(process_registry, {})
+        process.stdout.close.assert_called_once_with()
+        process.stderr.close.assert_called_once_with()
+
+    def test_enforcement_forwarded_signal_keeps_cleanup_error_secondary(
+        self,
+    ) -> None:
+        cleanup_error = ENFORCEMENT_MODULE.EnforcementDoctorError(
+            "collector-inconclusive",
+            "injected credential cleanup failure",
+        )
+        with (
+            mock.patch.object(
+                ENFORCEMENT_MODULE.os,
+                "kill",
+                side_effect=KeyboardInterrupt,
+            ),
+            self.assertRaises(KeyboardInterrupt) as raised,
+        ):
+            ENFORCEMENT_MODULE._forward_deferred_termination_signal(
+                signal.SIGINT,
+                cleanup_error,
+            )
+
+        self.assertIs(raised.exception.__cause__, cleanup_error)
+
+    @unittest.skipUnless(
+        os.name == "posix"
+        and all(
+            hasattr(signal, name)
+            for name in (
+                "SIGINT",
+                "pthread_sigmask",
+                "sigpending",
+                "sigwait",
+                "SIG_BLOCK",
+                "SIG_SETMASK",
+            )
+        ),
+        "collector registry publication requires POSIX signal controls",
+    )
+    def test_enforcement_client_cleans_snapshot_after_published_signal(
+        self,
+    ) -> None:
+        original_handler = signal.getsignal(signal.SIGINT)
+        original_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+        if signal.SIGINT in original_mask:
+            self.skipTest("the test runner already blocks SIGINT")
+        real_monotonic = time.monotonic
+
+        with owner_controlled_temp_root() as temp_root:
+            trusted_gh = temp_root / "trusted-gh"
+            trusted_payload = b"#!/bin/sh\nexit 0\n"
+            trusted_gh.write_bytes(trusted_payload)
+            trusted_gh.chmod(0o700)
+            config_dir, runtime_parent = self._make_private_gh_config(temp_root)
+            client = ENFORCEMENT_MODULE.GitHubApiClient(
+                trusted_gh,
+                hashlib.sha256(trusted_payload).hexdigest(),
+                config_dir,
+                runtime_parent=runtime_parent,
+            )
+            run_path = client._run_directory.path
+            process = mock.Mock()
+            process.pid = 4242
+            process.stdout = mock.Mock()
+            process.stderr = mock.Mock()
+            monotonic_calls = 0
+
+            def interrupt_after_publication() -> float:
+                nonlocal monotonic_calls
+                monotonic_calls += 1
+                if monotonic_calls == 2:
+                    managed = client._active_processes.get(process.pid)
+                    self.assertIsNotNone(managed)
+                    self.assertIs(managed.process, process)
+                    os.kill(os.getpid(), signal.SIGINT)
+                return real_monotonic()
+
+            try:
+                signal.signal(signal.SIGINT, signal.default_int_handler)
+                with (
+                    mock.patch.object(
+                        ENFORCEMENT_MODULE.subprocess,
+                        "Popen",
+                        return_value=process,
+                    ),
+                    mock.patch.object(
+                        ENFORCEMENT_MODULE,
+                        "_terminate_drain_reap",
+                        return_value=[],
+                    ) as cleanup,
+                    mock.patch.object(
+                        ENFORCEMENT_MODULE.time,
+                        "monotonic",
+                        side_effect=interrupt_after_publication,
+                    ),
+                    self.assertRaises(KeyboardInterrupt),
+                ):
+                    client.get_json("/user")
+            finally:
+                signal.pthread_sigmask(signal.SIG_SETMASK, original_mask)
+                signal.signal(signal.SIGINT, original_handler)
+                if not client._closed:
+                    client.close()
+
+        cleanup.assert_called_once()
+        self.assertTrue(client._closed)
+        self.assertEqual(client._active_processes, {})
+        self.assertFalse(run_path.exists())
+        process.stdout.close.assert_called_once_with()
+        process.stderr.close.assert_called_once_with()
 
     def test_enforcement_subprocess_selector_failures_terminate_before_return(
         self,
