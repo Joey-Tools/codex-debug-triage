@@ -22,7 +22,13 @@ import tempfile
 import time
 import unittest
 import zipfile
-from contextlib import contextmanager, nullcontext, redirect_stderr, redirect_stdout
+from contextlib import (
+    ExitStack,
+    contextmanager,
+    nullcontext,
+    redirect_stderr,
+    redirect_stdout,
+)
 from pathlib import Path
 from typing import Iterator
 from unittest import mock
@@ -82,6 +88,26 @@ def owner_controlled_temp_root() -> Iterator[Path]:
         temp_root = Path(temp_dir).resolve()
         temp_root.chmod(0o700)
         yield temp_root
+
+
+def _set_fixture_darwin_acl(path: Path, entry: str) -> None:
+    subprocess.run(
+        ["/bin/chmod", "+a", entry, str(path)],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+
+
+def _clear_fixture_darwin_acl(path: Path) -> None:
+    subprocess.run(
+        ["/bin/chmod", "-N", str(path)],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
 
 
 class ArchiveTriageTests(unittest.TestCase):
@@ -1068,6 +1094,126 @@ class ArchiveTriageTests(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertEqual(stdout.getvalue(), "")
         self.assertIn("archive changed during snapshot binding", stderr.getvalue())
+
+    def test_snapshot_ignores_ambient_tmpdir_and_is_unlinked_before_copy(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            archive_path = self._make_archive(root)
+            ambient_tmpdir = root / "ambient-tmp"
+            ambient_tmpdir.mkdir(mode=0o700)
+            real_copy = MODULE._copy_archive_snapshot
+            observed: dict[str, int] = {}
+
+            def inspect_snapshot_before_copy(
+                source_fd: int,
+                snapshot_fd: int,
+                archive_size: int,
+                deadline: MODULE.ArchiveCommandDeadline,
+            ) -> bytes:
+                metadata = os.fstat(snapshot_fd)
+                observed["links"] = metadata.st_nlink
+                observed["mode"] = stat.S_IMODE(metadata.st_mode)
+                return real_copy(
+                    source_fd,
+                    snapshot_fd,
+                    archive_size,
+                    deadline,
+                )
+
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {"TMPDIR": str(ambient_tmpdir)},
+                    clear=False,
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "_copy_archive_snapshot",
+                    side_effect=inspect_snapshot_before_copy,
+                ),
+                MODULE._open_pinned_archive(
+                    archive_path,
+                    MODULE.DEFAULT_MAX_ARCHIVE_BYTES,
+                ) as archive_stream,
+            ):
+                archive_stream.seek(0)
+                self.assertEqual(archive_stream.read(4), b"PK\x03\x04")
+
+            self.assertEqual(list(ambient_tmpdir.iterdir()), [])
+            self.assertEqual(observed, {"links": 0, "mode": 0o600})
+
+    def test_snapshot_acl_is_validated_before_first_archive_byte_is_written(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            archive_path = self._make_archive(Path(temp_dir))
+            real_policy = MODULE._stable_snapshot_access_policy_binding
+
+            def reject_regular_file(fd: int) -> tuple[str, int, str]:
+                if stat.S_ISREG(os.fstat(fd).st_mode):
+                    raise OSError(errno.EACCES, "injected snapshot ACL grant")
+                return real_policy(fd)
+
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_stable_snapshot_access_policy_binding",
+                    side_effect=reject_regular_file,
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "_copy_archive_snapshot",
+                ) as copied,
+                self.assertRaisesRegex(
+                    OSError,
+                    "injected snapshot ACL grant",
+                ),
+            ):
+                with MODULE._open_pinned_archive(
+                    archive_path,
+                    MODULE.DEFAULT_MAX_ARCHIVE_BYTES,
+                ):
+                    self.fail("unsafe snapshot was published")
+
+            copied.assert_not_called()
+
+    @unittest.skipUnless(
+        sys.platform == "darwin",
+        "requires Darwin inherited extended ACLs",
+    )
+    def test_snapshot_rejects_inherited_allow_acl_before_copy(self) -> None:
+        with owner_controlled_temp_root() as temp_root:
+            archive_path = self._make_archive(temp_root)
+            _set_fixture_darwin_acl(
+                temp_root,
+                "everyone allow read,file_inherit,directory_inherit",
+            )
+            try:
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "ARCHIVE_SNAPSHOT_PARENT",
+                        temp_root,
+                    ),
+                    mock.patch.object(
+                        MODULE,
+                        "_copy_archive_snapshot",
+                    ) as copied,
+                    self.assertRaisesRegex(
+                        OSError,
+                        "Darwin extended ACL grants are not allowed",
+                    ),
+                ):
+                    with MODULE._open_pinned_archive(
+                        archive_path,
+                        MODULE.DEFAULT_MAX_ARCHIVE_BYTES,
+                    ):
+                        self.fail("inherited snapshot grant was accepted")
+                copied.assert_not_called()
+            finally:
+                _clear_fixture_darwin_acl(temp_root)
 
     def test_final_validation_allows_timestamp_only_churn(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -5512,6 +5658,10 @@ class BugTriageDocumentationTests(unittest.TestCase):
         check_run["pull_requests"] = [
             self._api_pr_link(link) for link in check_run["pull_requests"]
         ]
+        check_suite = {
+            "head_sha": check_run["head_sha"],
+            "id": check_run["check_suite"]["id"],
+        }
         cutover_variables = self._copy_json(
             {"values": evidence["cutover_input_variables"]}
         )["values"]
@@ -5624,13 +5774,17 @@ class BugTriageDocumentationTests(unittest.TestCase):
                 "item_key": "workflow_runs",
                 "pages": [[run]],
             },
-            f"/repos/{target_name}/commits/{pull_request['base']['sha']}/check-runs": {
+            f"/repos/{target_name}/commits/{pull_request['base']['sha']}/check-suites": {
+                "item_key": "check_suites",
+                "pages": [[check_suite]],
+            },
+            f"/repos/{target_name}/commits/{self._canonical_commit}/check-suites": {
+                "item_key": "check_suites",
+                "pages": [[]],
+            },
+            f"/repos/{target_name}/check-suites/{check_suite['id']}/check-runs": {
                 "item_key": "check_runs",
                 "pages": [[check_run]],
-            },
-            f"/repos/{target_name}/commits/{self._canonical_commit}/check-runs": {
-                "item_key": "check_runs",
-                "pages": [[]],
             },
             (f"/repos/{target_name}/actions/runs/10101/attempts/1/jobs"): {
                 "item_key": "jobs",
@@ -5640,6 +5794,24 @@ class BugTriageDocumentationTests(unittest.TestCase):
         return FixtureApiClient(
             objects=objects,
             collections=collections,
+        )
+
+    def _collect_live_snapshot(self, client: object) -> dict[str, object]:
+        contract = json.loads(
+            CUTOVER_ENFORCEMENT_CONTRACT_PATH.read_text(encoding="utf-8")
+        )
+        return ENFORCEMENT_MODULE._collect_snapshot(
+            client,
+            {"object_reads": [], "page_bounds": []},
+            contract,
+            phase="test",
+            expected_run_attempt=1,
+            expected_run_id=10101,
+            expected_ruleset_id=self._ruleset_id,
+            expected_workflow_id=self._workflow_id,
+            expected_workflow_sha=self._workflow_source_commit,
+            candidate_head_sha=self._canonical_commit,
+            pull_request_number=7,
         )
 
     def _run_enforcement_doctor(
@@ -5803,23 +5975,11 @@ class BugTriageDocumentationTests(unittest.TestCase):
 
     @staticmethod
     def _set_darwin_acl(path: Path, entry: str) -> None:
-        subprocess.run(
-            ["/bin/chmod", "+a", entry, str(path)],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
+        _set_fixture_darwin_acl(path, entry)
 
     @staticmethod
     def _clear_darwin_acl(path: Path) -> None:
-        subprocess.run(
-            ["/bin/chmod", "-N", str(path)],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
+        _clear_fixture_darwin_acl(path)
 
     @staticmethod
     def _cutover_variable(
@@ -5917,6 +6077,11 @@ class BugTriageDocumentationTests(unittest.TestCase):
         self.assertIn("monotonic 100-millisecond poll budget", recipe)
         self.assertIn("descriptor blocking state", recipe)
         self.assertIn("owner-private, descriptor-only temporary snapshot", recipe)
+        self.assertIn("does not consult ambient `TMPDIR`", recipe)
+        self.assertIn("unique `0700` root plus a `0600` regular file", recipe)
+        self.assertIn("before writing the first archive byte", recipe)
+        self.assertIn("rejects every extended allow", recipe)
+        self.assertIn("leaving a zero-link descriptor", recipe)
         self.assertIn("complete SHA-256 content", recipe)
         self.assertIn("same-inode/same-size rewrites", recipe)
         self.assertIn("Before constructing Python `ZipInfo` objects", recipe)
@@ -6154,6 +6319,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
         self.assertIn("runs-on: macos-latest", workflow)
         self.assertNotIn("continue-on-error:", workflow)
         for test_name in (
+            "test_snapshot_rejects_inherited_allow_acl_before_copy",
             "test_enforcement_darwin_acl_ctypes_abi_constants_and_iteration",
             "test_enforcement_gh_acl_allows_only_noninherited_deny_entries",
             "test_enforcement_gh_acl_rejects_inherited_source_token_read_grant",
@@ -6669,23 +6835,206 @@ class BugTriageDocumentationTests(unittest.TestCase):
             all(bound["terminal_empty_page"] == 2 for bound in ruleset_bounds)
         )
         self.assertTrue(all(bound["item_count"] == 1 for bound in ruleset_bounds))
-        check_bounds = [
+        suite_bounds = [
             bound
             for bound in receipt["collector"]["page_bounds"]
             if bound["label"].startswith("selected PR ")
-            and bound["label"].endswith(" check runs")
+            and bound["label"].endswith(" check suites")
         ]
-        self.assertEqual(len(check_bounds), 4)
+        self.assertEqual(len(suite_bounds), 4)
         self.assertEqual(
-            {bound["endpoint"] for bound in check_bounds},
+            {bound["endpoint"] for bound in suite_bounds},
             {
                 (
                     "/repos/Joey-Tools/codex-debug-triage/commits/"
-                    f"{self._canonical_commit}/check-runs"
+                    f"{self._canonical_commit}/check-suites"
                 ),
-                (f"/repos/Joey-Tools/codex-debug-triage/commits/{'9' * 40}/check-runs"),
+                (
+                    "/repos/Joey-Tools/codex-debug-triage/commits/"
+                    f"{'9' * 40}/check-suites"
+                ),
             },
         )
+        self.assertTrue(all(bound["parameters"] == {} for bound in suite_bounds))
+        check_run_bounds = [
+            bound
+            for bound in receipt["collector"]["page_bounds"]
+            if bound["label"] == "check suite 30303 check runs"
+        ]
+        self.assertEqual(len(check_run_bounds), 2)
+        self.assertTrue(
+            all(bound["terminal_empty_page"] == 2 for bound in check_run_bounds)
+        )
+
+    def test_enforcement_live_collector_reads_more_than_one_thousand_suites(
+        self,
+    ) -> None:
+        client = self._matching_live_api_client()
+        base_sha = "9" * 40
+        target_name = "Joey-Tools/codex-debug-triage"
+        suite_endpoint = f"/repos/{target_name}/commits/{base_sha}/check-suites"
+        original_suite = self._copy_json(
+            client.collections[suite_endpoint]["pages"][0][0]
+        )
+        suites = [original_suite]
+        for offset in range(1, 1_001):
+            suite_id = 40_000 + offset
+            suites.append({"head_sha": base_sha, "id": suite_id})
+            client.collections[
+                f"/repos/{target_name}/check-suites/{suite_id}/check-runs"
+            ] = {
+                "item_key": "check_runs",
+                "pages": [[]],
+            }
+        client.collections[suite_endpoint]["pages"] = [
+            suites[index : index + ENFORCEMENT_MODULE.API_PER_PAGE]
+            for index in range(0, len(suites), ENFORCEMENT_MODULE.API_PER_PAGE)
+        ]
+
+        snapshot = self._collect_live_snapshot(client)
+
+        self.assertEqual(len(suites), 1_001)
+        self.assertEqual([check["id"] for check in snapshot["check_runs"]], [20202])
+        requested_suite_pages = [
+            query["page"]
+            for endpoint, query in client.calls
+            if endpoint == suite_endpoint
+        ]
+        self.assertEqual(requested_suite_pages, list(range(1, 13)))
+
+    def test_enforcement_live_collector_rejects_duplicate_suite_and_run_ids(
+        self,
+    ) -> None:
+        target_name = "Joey-Tools/codex-debug-triage"
+        base_sha = "9" * 40
+        suite_endpoint = f"/repos/{target_name}/commits/{base_sha}/check-suites"
+        cases = ("suite", "check-run")
+        for duplicate_kind in cases:
+            with self.subTest(duplicate=duplicate_kind):
+                client = self._matching_live_api_client()
+                original_suite = self._copy_json(
+                    client.collections[suite_endpoint]["pages"][0][0]
+                )
+                if duplicate_kind == "suite":
+                    client.collections[suite_endpoint]["pages"].append(
+                        [self._copy_json(original_suite)]
+                    )
+                    expected_reason = "check-suite-identity-mismatch"
+                else:
+                    duplicate_suite_id = 40_404
+                    client.collections[suite_endpoint]["pages"][0].append(
+                        {
+                            "head_sha": base_sha,
+                            "id": duplicate_suite_id,
+                        }
+                    )
+                    original_check = self._copy_json(
+                        client.collections[
+                            f"/repos/{target_name}/check-suites/"
+                            f"{original_suite['id']}/check-runs"
+                        ]["pages"][0][0]
+                    )
+                    original_check["check_suite"]["id"] = duplicate_suite_id
+                    client.collections[
+                        f"/repos/{target_name}/check-suites/"
+                        f"{duplicate_suite_id}/check-runs"
+                    ] = {
+                        "item_key": "check_runs",
+                        "pages": [[original_check]],
+                    }
+                    expected_reason = "check-run-identity-mismatch"
+
+                with self.assertRaises(
+                    ENFORCEMENT_MODULE.EnforcementDoctorError
+                ) as raised:
+                    self._collect_live_snapshot(client)
+
+                self.assertEqual(raised.exception.reason_code, expected_reason)
+
+    def test_enforcement_check_suite_collection_fails_closed_on_capacity(
+        self,
+    ) -> None:
+        client = self._matching_live_api_client()
+        target_name = "Joey-Tools/codex-debug-triage"
+        suite_endpoint = (
+            f"/repos/{target_name}/commits/{'9' * 40}/check-suites"
+        )
+        client.collections[suite_endpoint]["pages"][0].append(
+            {"head_sha": "9" * 40, "id": 40_404}
+        )
+
+        with (
+            mock.patch.object(ENFORCEMENT_MODULE, "MAX_CHECK_SUITES", 1),
+            self.assertRaises(ENFORCEMENT_MODULE.EnforcementDoctorError) as raised,
+        ):
+            self._collect_live_snapshot(client)
+
+        self.assertEqual(raised.exception.reason_code, "api-search-cap-exceeded")
+
+    def test_enforcement_check_suite_collection_fails_closed_on_page_exhaustion(
+        self,
+    ) -> None:
+        client = self._matching_live_api_client()
+        endpoint = (
+            "/repos/Joey-Tools/codex-debug-triage/commits/"
+            f"{'9' * 40}/check-suites"
+        )
+
+        with (
+            mock.patch.object(ENFORCEMENT_MODULE, "MAX_API_PAGES", 1),
+            self.assertRaises(ENFORCEMENT_MODULE.EnforcementDoctorError) as raised,
+        ):
+            ENFORCEMENT_MODULE._collect_pages(
+                client,
+                {"object_reads": [], "page_bounds": []},
+                phase="test",
+                label="selected PR check suites",
+                endpoint=endpoint,
+                parameters={},
+                item_key="check_suites",
+                result_cap=ENFORCEMENT_MODULE.MAX_CHECK_SUITES,
+            )
+
+        self.assertEqual(raised.exception.reason_code, "api-pagination-incomplete")
+
+    def test_enforcement_check_suite_collection_rejects_partial_total(
+        self,
+    ) -> None:
+        client = self._matching_live_api_client()
+        endpoint = (
+            "/repos/Joey-Tools/codex-debug-triage/commits/"
+            f"{'9' * 40}/check-suites"
+        )
+        original_get_json = client.get_json
+
+        def partial_get_json(
+            selected_endpoint: str,
+            parameters: dict[str, object] | None = None,
+        ) -> object:
+            result = original_get_json(selected_endpoint, parameters)
+            if (
+                selected_endpoint == endpoint
+                and int((parameters or {}).get("page", 0)) == 1
+            ):
+                result["total_count"] += 1
+            return result
+
+        client.get_json = partial_get_json
+        with self.assertRaises(
+            ENFORCEMENT_MODULE.EnforcementDoctorError
+        ) as raised:
+            ENFORCEMENT_MODULE._collect_pages(
+                client,
+                {"object_reads": [], "page_bounds": []},
+                phase="test",
+                label="selected PR check suites",
+                endpoint=endpoint,
+                parameters={},
+                item_key="check_suites",
+                result_cap=ENFORCEMENT_MODULE.MAX_CHECK_SUITES,
+            )
+
+        self.assertEqual(raised.exception.reason_code, "api-pagination-incomplete")
 
     def test_enforcement_live_collector_reads_hidden_later_page(
         self,
@@ -7575,6 +7924,211 @@ class BugTriageDocumentationTests(unittest.TestCase):
                         token_output,
                         f"{SYNTHETIC_ACCESS_TOKEN}\n".encode("ascii"),
                     )
+
+    def test_enforcement_initialization_deadline_precedes_default_path_read(
+        self,
+    ) -> None:
+        with owner_controlled_temp_root() as temp_root:
+            trusted_gh = temp_root / "trusted-gh"
+            trusted_payload = b"#!/bin/sh\nexit 0\n"
+            trusted_gh.write_bytes(trusted_payload)
+            trusted_gh.chmod(0o700)
+            config_dir, runtime_parent = self._make_private_gh_config(temp_root)
+            observed: dict[str, object] = {}
+
+            def select_runtime_parent(
+                *,
+                deadline_check: object,
+            ) -> Path:
+                observed["deadline"] = deadline_check
+                deadline_check()
+                return runtime_parent
+
+            with mock.patch.object(
+                ENFORCEMENT_MODULE,
+                "_default_gh_runtime_parent",
+                side_effect=select_runtime_parent,
+            ):
+                with ENFORCEMENT_MODULE.GitHubApiClient(
+                    trusted_gh,
+                    hashlib.sha256(trusted_payload).hexdigest(),
+                    config_dir,
+                ) as client:
+                    self.assertLess(time.monotonic(), client.deadline)
+
+            self.assertTrue(callable(observed["deadline"]))
+            self.assertEqual(list(runtime_parent.glob("run-*")), [])
+
+    def test_enforcement_initialization_stalls_honor_deadline_and_cleanup(
+        self,
+    ) -> None:
+        for phase in (
+            "config-read",
+            "executable-copy",
+            "executable-fsync",
+            "executable-reopen",
+        ):
+            with self.subTest(phase=phase), owner_controlled_temp_root() as temp_root:
+                trusted_gh = temp_root / "trusted-gh"
+                trusted_payload = b"#!/bin/sh\nexit 0\n"
+                trusted_gh.write_bytes(trusted_payload)
+                trusted_gh.chmod(0o700)
+                config_dir, runtime_parent = self._make_private_gh_config(temp_root)
+                real_monotonic = time.monotonic
+                expired = False
+                exercised = False
+
+                def controlled_monotonic() -> float:
+                    offset = (
+                        ENFORCEMENT_MODULE.MAX_COLLECTION_SECONDS + 1.0
+                        if expired
+                        else 0.0
+                    )
+                    return real_monotonic() + offset
+
+                with ExitStack() as stack:
+                    stack.enter_context(
+                        mock.patch.object(
+                            ENFORCEMENT_MODULE.time,
+                            "monotonic",
+                            side_effect=controlled_monotonic,
+                        )
+                    )
+                    if phase == "config-read":
+                        real_read = ENFORCEMENT_MODULE._read_fd_payload_bounded
+
+                        def stall_config_read(
+                            fd: int,
+                            *,
+                            label: str,
+                            limit: int,
+                            deadline_check: object = None,
+                        ) -> bytes:
+                            nonlocal expired, exercised
+                            if (
+                                label == "GitHub CLI source hosts.yml"
+                                and not exercised
+                            ):
+                                self.assertIsNotNone(deadline_check)
+                                exercised = True
+                                expired = True
+                                deadline_check()
+                            return real_read(
+                                fd,
+                                label=label,
+                                limit=limit,
+                                deadline_check=deadline_check,
+                            )
+
+                        stack.enter_context(
+                            mock.patch.object(
+                                ENFORCEMENT_MODULE,
+                                "_read_fd_payload_bounded",
+                                side_effect=stall_config_read,
+                            )
+                        )
+                    elif phase == "executable-copy":
+                        real_write = ENFORCEMENT_MODULE._write_all
+
+                        def stall_executable_copy(
+                            fd: int,
+                            payload: bytes,
+                            *,
+                            deadline_check: object = None,
+                        ) -> None:
+                            nonlocal expired, exercised
+                            real_write(
+                                fd,
+                                payload,
+                                deadline_check=deadline_check,
+                            )
+                            if payload == trusted_payload and not exercised:
+                                self.assertIsNotNone(deadline_check)
+                                exercised = True
+                                expired = True
+                                deadline_check()
+
+                        stack.enter_context(
+                            mock.patch.object(
+                                ENFORCEMENT_MODULE,
+                                "_write_all",
+                                side_effect=stall_executable_copy,
+                            )
+                        )
+                    elif phase == "executable-fsync":
+                        real_fsync = os.fsync
+
+                        def stall_executable_fsync(fd: int) -> None:
+                            nonlocal expired, exercised
+                            real_fsync(fd)
+                            if (
+                                stat.S_IMODE(os.fstat(fd).st_mode) == 0o500
+                                and not exercised
+                            ):
+                                exercised = True
+                                expired = True
+
+                        stack.enter_context(
+                            mock.patch.object(
+                                ENFORCEMENT_MODULE.os,
+                                "fsync",
+                                side_effect=stall_executable_fsync,
+                            )
+                        )
+                    else:
+                        real_open = os.open
+
+                        def stall_executable_reopen(
+                            path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+                            flags: int,
+                            mode: int = 0o777,
+                            *,
+                            dir_fd: int | None = None,
+                        ) -> int:
+                            nonlocal expired, exercised
+                            fd = real_open(
+                                path,
+                                flags,
+                                mode,
+                                dir_fd=dir_fd,
+                            )
+                            if (
+                                path == "gh"
+                                and flags & os.O_ACCMODE == os.O_RDONLY
+                                and not exercised
+                            ):
+                                exercised = True
+                                expired = True
+                            return fd
+
+                        stack.enter_context(
+                            mock.patch.object(
+                                ENFORCEMENT_MODULE.os,
+                                "open",
+                                side_effect=stall_executable_reopen,
+                            )
+                        )
+                    with self.assertRaises(
+                        ENFORCEMENT_MODULE.EnforcementDoctorError
+                    ) as raised:
+                        ENFORCEMENT_MODULE.GitHubApiClient(
+                            trusted_gh,
+                            hashlib.sha256(trusted_payload).hexdigest(),
+                            config_dir,
+                            runtime_parent=runtime_parent,
+                        )
+
+                self.assertTrue(exercised)
+                self.assertEqual(raised.exception.reason_code, "api-timeout")
+                self.assertEqual(
+                    raised.exception.api_failure,
+                    {
+                        "endpoint_class": "collector-initialization",
+                        "failure_kind": "timeout",
+                        "http_status": None,
+                    },
+                )
+                self.assertEqual(list(runtime_parent.glob("run-*")), [])
 
     def test_enforcement_subprocess_registers_before_deadline_initialization(
         self,
@@ -8610,7 +9164,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
                 )
                 client.close()
 
-    def test_enforcement_revalidation_cache_bounds_4096_call_amplification(
+    def test_enforcement_revalidation_cache_bounds_total_call_amplification(
         self,
     ) -> None:
         with owner_controlled_temp_root() as temp_root:
@@ -9555,7 +10109,10 @@ class BugTriageDocumentationTests(unittest.TestCase):
                     opened_fds.append(fd)
                 return fd
 
-            def fail_final_parent_revalidation() -> None:
+            def fail_final_parent_revalidation(
+                *,
+                deadline_check: object = None,
+            ) -> None:
                 nonlocal revalidation_calls
                 revalidation_calls += 1
                 if revalidation_calls == 2:
@@ -9563,7 +10120,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
                         "collector-inconclusive",
                         "fixture parent revalidation failure",
                     )
-                original_revalidate()
+                original_revalidate(deadline_check=deadline_check)
 
             try:
                 with (

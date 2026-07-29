@@ -35,12 +35,14 @@ API_VERSION = "2026-03-10"
 API_ACCEPT = "application/vnd.github+json"
 API_PER_PAGE = 100
 MAX_API_PAGES = 100
-MAX_API_CALLS = 4_096
+MAX_API_CALLS = 16_384
 MAX_API_RESPONSE_BYTES = 8 * 1024 * 1024
 MAX_API_STDERR_BYTES = 64 * 1024
 MAX_API_TOTAL_BYTES = 64 * 1024 * 1024
 MAX_API_SECONDS = 30
 MAX_COLLECTION_SECONDS = 180
+MAX_CHECK_SUITES = 2_000
+MAX_CHECK_RUNS = 10_000
 MAX_WORKFLOW_RUNS = 1_000
 MAX_RUN_ATTEMPTS = 20
 MAX_JOB_ATTEMPT_QUERIES = 1_000
@@ -1200,7 +1202,9 @@ def _api_endpoint_class(endpoint: str) -> str:
                 return "workflow-run-attempt"
             return "workflow-runs"
         if suffix[:1] == ["commits"]:
-            return "check-runs" if suffix[-1:] == ["check-runs"] else "commit"
+            return "check-suites" if suffix[-1:] == ["check-suites"] else "commit"
+        if suffix[:1] == ["check-suites"] and suffix[-1:] == ["check-runs"]:
+            return "check-runs"
     return "github-api"
 
 
@@ -1412,12 +1416,16 @@ def _file_status(status_value: os.stat_result) -> dict[str, int]:
     }
 
 
-def _fixed_curl_trust_binding() -> tuple[dict[str, int], tuple[str, int, str]]:
+def _fixed_curl_trust_binding(
+    *,
+    deadline_check: Callable[[], None] | None = None,
+) -> tuple[dict[str, int], tuple[str, int, str]]:
     for directory in (
         pathlib.Path("/"),
         pathlib.Path("/usr"),
         CURL_EXECUTABLE.parent,
     ):
+        _check_deadline(deadline_check)
         try:
             directory_status = os.lstat(directory)
         except OSError as error:
@@ -1439,10 +1447,12 @@ def _fixed_curl_trust_binding() -> tuple[dict[str, int], tuple[str, int, str]]:
     flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
     descriptor: int | None = None
     try:
+        _check_deadline(deadline_check)
         descriptor = os.open(CURL_EXECUTABLE, flags)
         descriptor_status = os.fstat(descriptor)
         path_status = os.lstat(CURL_EXECUTABLE)
         access_policy = _stable_fd_access_policy_binding(descriptor)
+        _check_deadline(deadline_check)
     except EnforcementDoctorError:
         raise
     except OSError as error:
@@ -1708,6 +1718,11 @@ def _require_safe_directory_status(
         )
 
 
+def _check_deadline(deadline_check: Callable[[], None] | None) -> None:
+    if deadline_check is not None:
+        deadline_check()
+
+
 class _BoundDirectory:
     def __init__(
         self,
@@ -1715,6 +1730,7 @@ class _BoundDirectory:
         *,
         label: str,
         create_final: bool = False,
+        deadline_check: Callable[[], None] | None = None,
     ) -> None:
         self.path = path
         self.label = label
@@ -1723,6 +1739,7 @@ class _BoundDirectory:
         self._access_policy_bindings: list[tuple[str, int, str]] = []
         self._relations: list[tuple[int, str, int]] = []
         self._closed = False
+        _check_deadline(deadline_check)
         if (
             not path.is_absolute()
             or path == pathlib.Path("/")
@@ -1750,9 +1767,11 @@ class _BoundDirectory:
             | getattr(os, "O_CLOEXEC", 0)
         )
         try:
+            _check_deadline(deadline_check)
             root_fd = os.open("/", flags)
             self._fds.append(root_fd)
             root_status = os.fstat(root_fd)
+            _check_deadline(deadline_check)
             _require_safe_directory_status(
                 root_status,
                 label=f"{label} root ancestor",
@@ -1762,9 +1781,11 @@ class _BoundDirectory:
             self._access_policy_bindings.append(
                 _stable_fd_access_policy_binding(root_fd)
             )
+            _check_deadline(deadline_check)
             parent_fd = root_fd
             components = path.parts[1:]
             for index, component in enumerate(components):
+                _check_deadline(deadline_check)
                 is_final = index == len(components) - 1
                 created = False
                 try:
@@ -1788,6 +1809,7 @@ class _BoundDirectory:
                         f"{label} component identity is unstable",
                     )
                 child_access_policy = _stable_fd_access_policy_binding(child_fd)
+                _check_deadline(deadline_check)
                 _require_safe_directory_status(
                     child_descriptor,
                     label=f"{label} component {component!r}",
@@ -1804,6 +1826,7 @@ class _BoundDirectory:
                             f"{label} newly created component is not private",
                         )
                     os.fchmod(child_fd, 0o700)
+                    _check_deadline(deadline_check)
                     child_descriptor = os.fstat(child_fd)
                     child_path = os.stat(
                         component,
@@ -1823,13 +1846,14 @@ class _BoundDirectory:
                         owner_private=True,
                     )
                     child_access_policy = _stable_fd_access_policy_binding(child_fd)
+                    _check_deadline(deadline_check)
                 binding = _directory_status(child_descriptor)
                 self._bindings.append(binding)
                 self._access_policy_bindings.append(child_access_policy)
                 self._relations.append((parent_fd, component, child_fd))
                 parent_fd = child_fd
             self.fd = self._fds[-1]
-            self.revalidate()
+            self.revalidate(deadline_check=deadline_check)
         except EnforcementDoctorError:
             self.close()
             raise
@@ -1840,7 +1864,12 @@ class _BoundDirectory:
                 f"{label} cannot be opened without following components",
             ) from error
 
-    def revalidate(self) -> None:
+    def revalidate(
+        self,
+        *,
+        deadline_check: Callable[[], None] | None = None,
+    ) -> None:
+        _check_deadline(deadline_check)
         if self._closed or not self._fds:
             raise _blocked(
                 "collector-inconclusive",
@@ -1852,6 +1881,7 @@ class _BoundDirectory:
                 self._bindings,
                 self._access_policy_bindings,
             ):
+                _check_deadline(deadline_check)
                 current = os.fstat(fd)
                 if (
                     not stat.S_ISDIR(current.st_mode)
@@ -1860,6 +1890,7 @@ class _BoundDirectory:
                 ):
                     raise self._inconclusive()
             for relation, expected in zip(self._relations, self._bindings[1:]):
+                _check_deadline(deadline_check)
                 parent_fd, component, child_fd = relation
                 child_descriptor = os.fstat(child_fd)
                 child_path = os.stat(
@@ -1872,6 +1903,7 @@ class _BoundDirectory:
                     or _directory_status(child_path) != expected
                 ):
                     raise self._inconclusive()
+            _check_deadline(deadline_check)
         except EnforcementDoctorError:
             raise
         except OSError as error:
@@ -1918,17 +1950,24 @@ class _BoundDirectory:
             f"{self.label} identity or access policy changed",
         )
 
-    def set_owner_mode(self, mode: int) -> None:
+    def set_owner_mode(
+        self,
+        mode: int,
+        *,
+        deadline_check: Callable[[], None] | None = None,
+    ) -> None:
         if mode not in (0o500, 0o700):
             raise _blocked(
                 "collector-unavailable",
                 f"{self.label} requested an unsupported access policy",
             )
-        self.revalidate()
+        self.revalidate(deadline_check=deadline_check)
         try:
+            _check_deadline(deadline_check)
             os.fchmod(self.fd, mode)
             descriptor = os.fstat(self.fd)
             access_policy = _stable_fd_access_policy_binding(self.fd)
+            _check_deadline(deadline_check)
             if (
                 not stat.S_ISDIR(descriptor.st_mode)
                 or descriptor.st_uid != os.geteuid()
@@ -1937,7 +1976,7 @@ class _BoundDirectory:
                 raise self._inconclusive()
             self._bindings[-1] = _directory_status(descriptor)
             self._access_policy_bindings[-1] = access_policy
-            self.revalidate()
+            self.revalidate(deadline_check=deadline_check)
         except EnforcementDoctorError:
             raise
         except OSError as error:
@@ -1963,12 +2002,14 @@ class _BoundRegularFile:
         *,
         label: str,
         max_bytes: int,
+        deadline_check: Callable[[], None] | None = None,
     ) -> None:
         self.parent = parent
         self.name = name
         self.label = label
         self.max_bytes = max_bytes
         self.fd: Optional[int] = None
+        _check_deadline(deadline_check)
         if (
             not name
             or "/" in name
@@ -1985,7 +2026,8 @@ class _BoundRegularFile:
         )
         local_fd: Optional[int] = None
         try:
-            parent.revalidate()
+            parent.revalidate(deadline_check=deadline_check)
+            _check_deadline(deadline_check)
             local_fd = os.open(name, flags, dir_fd=parent.fd)
             descriptor_before = os.fstat(local_fd)
             path_before = os.stat(
@@ -1994,15 +2036,18 @@ class _BoundRegularFile:
                 follow_symlinks=False,
             )
             access_policy_before = _stable_fd_access_policy_binding(local_fd)
+            _check_deadline(deadline_check)
             first = _read_fd_payload_bounded(
                 local_fd,
                 label=label,
                 limit=max_bytes,
+                deadline_check=deadline_check,
             )
             second = _read_fd_payload_bounded(
                 local_fd,
                 label=label,
                 limit=max_bytes,
+                deadline_check=deadline_check,
             )
             descriptor_after = os.fstat(local_fd)
             path_after = os.stat(
@@ -2011,6 +2056,7 @@ class _BoundRegularFile:
                 follow_symlinks=False,
             )
             access_policy_after = _stable_fd_access_policy_binding(local_fd)
+            _check_deadline(deadline_check)
             if (
                 not stat.S_ISREG(descriptor_before.st_mode)
                 or not stat.S_ISREG(path_before.st_mode)
@@ -2031,8 +2077,10 @@ class _BoundRegularFile:
                     f"{label} identity, access policy, or content is unsafe",
                 )
             binding = _file_status(descriptor_before)
+            _check_deadline(deadline_check)
             sha256 = hashlib.sha256(first).hexdigest()
-            parent.revalidate()
+            _check_deadline(deadline_check)
+            parent.revalidate(deadline_check=deadline_check)
             self.payload = first
             self.binding = binding
             self.access_policy_binding = access_policy_before
@@ -2063,7 +2111,7 @@ class _BoundRegularFile:
             raise self._inconclusive()
         if deadline_check is not None:
             deadline_check()
-        self.parent.revalidate()
+        self.parent.revalidate(deadline_check=deadline_check)
         try:
             descriptor_before = os.fstat(self.fd)
             path_before = os.stat(
@@ -2131,7 +2179,7 @@ class _BoundRegularFile:
             self.content_generation = generation_after
         if deadline_check is not None:
             deadline_check()
-        self.parent.revalidate()
+        self.parent.revalidate(deadline_check=deadline_check)
         if deadline_check is not None:
             deadline_check()
 
@@ -2150,7 +2198,11 @@ class _BoundRegularFile:
             self.fd = None
 
 
-def _default_gh_runtime_parent() -> pathlib.Path:
+def _default_gh_runtime_parent(
+    *,
+    deadline_check: Callable[[], None] | None = None,
+) -> pathlib.Path:
+    _check_deadline(deadline_check)
     try:
         account = pwd.getpwuid(os.geteuid())
     except (KeyError, OSError) as error:
@@ -2158,6 +2210,7 @@ def _default_gh_runtime_parent() -> pathlib.Path:
             "collector-unavailable",
             "the effective account home directory is unavailable",
         ) from error
+    _check_deadline(deadline_check)
     home = pathlib.Path(account.pw_dir)
     if not home.is_absolute() or home == pathlib.Path("/"):
         raise _blocked(
@@ -2381,7 +2434,9 @@ def _create_private_child_directory(
     name: str,
     *,
     label: str,
+    deadline_check: Callable[[], None] | None = None,
 ) -> _BoundDirectory:
+    _check_deadline(deadline_check)
     if (
         not name
         or "/" in name
@@ -2394,8 +2449,9 @@ def _create_private_child_directory(
             "collector-unavailable",
             f"{label} component is invalid",
         )
-    parent.revalidate()
+    parent.revalidate(deadline_check=deadline_check)
     try:
+        _check_deadline(deadline_check)
         os.mkdir(name, 0o700, dir_fd=parent.fd)
         flags = (
             os.O_RDONLY
@@ -2406,6 +2462,7 @@ def _create_private_child_directory(
         )
         child_fd = os.open(name, flags, dir_fd=parent.fd)
         try:
+            _check_deadline(deadline_check)
             descriptor = os.fstat(child_fd)
             path_status = os.stat(
                 name,
@@ -2413,6 +2470,7 @@ def _create_private_child_directory(
                 follow_symlinks=False,
             )
             initial_access_policy = _stable_fd_access_policy_binding(child_fd)
+            _check_deadline(deadline_check)
             if (
                 not stat.S_ISDIR(descriptor.st_mode)
                 or descriptor.st_uid != os.geteuid()
@@ -2425,6 +2483,7 @@ def _create_private_child_directory(
                     f"{label} initial object is unsafe",
                 )
             os.fchmod(child_fd, 0o700)
+            _check_deadline(deadline_check)
             descriptor = os.fstat(child_fd)
             path_status = os.stat(
                 name,
@@ -2432,6 +2491,7 @@ def _create_private_child_directory(
                 follow_symlinks=False,
             )
             final_access_policy = _stable_fd_access_policy_binding(child_fd)
+            _check_deadline(deadline_check)
             if (
                 _directory_status(descriptor) != _directory_status(path_status)
                 or stat.S_IMODE(descriptor.st_mode) != 0o700
@@ -2455,9 +2515,13 @@ def _create_private_child_directory(
             "collector-unavailable",
             f"{label} could not be created safely",
         ) from error
-    parent.revalidate()
+    parent.revalidate(deadline_check=deadline_check)
     try:
-        return _BoundDirectory(parent.path / name, label=label)
+        return _BoundDirectory(
+            parent.path / name,
+            label=label,
+            deadline_check=deadline_check,
+        )
     except BaseException:
         try:
             os.rmdir(name, dir_fd=parent.fd)
@@ -2475,13 +2539,15 @@ def _create_private_regular_file(
     label: str,
     mode: int,
     max_bytes: int,
+    deadline_check: Callable[[], None] | None = None,
 ) -> _BoundRegularFile:
+    _check_deadline(deadline_check)
     if len(payload) > max_bytes:
         raise _blocked(
             "collector-unavailable",
             f"{label} exceeds its byte ceiling",
         )
-    parent.revalidate()
+    parent.revalidate(deadline_check=deadline_check)
     flags = (
         os.O_WRONLY
         | os.O_CREAT
@@ -2494,6 +2560,7 @@ def _create_private_regular_file(
     cleanup_anchor: Optional[dict[str, Any]] = None
     cleanup_anchor_registered = False
     try:
+        _check_deadline(deadline_check)
         fd = os.open(name, flags, mode, dir_fd=parent.fd)
         cleanup_anchor = {
             "fd": fd,
@@ -2509,6 +2576,7 @@ def _create_private_regular_file(
             follow_symlinks=False,
         )
         initial_access_policy = _stable_fd_access_policy_binding(fd)
+        _check_deadline(deadline_check)
         if (
             not stat.S_ISREG(descriptor.st_mode)
             or descriptor.st_uid != os.geteuid()
@@ -2520,9 +2588,12 @@ def _create_private_regular_file(
                 "collector-unavailable",
                 f"{label} initial object is unsafe",
             )
-        _write_all(fd, payload)
+        _write_all(fd, payload, deadline_check=deadline_check)
+        _check_deadline(deadline_check)
         os.fchmod(fd, mode)
+        _check_deadline(deadline_check)
         os.fsync(fd)
+        _check_deadline(deadline_check)
         descriptor = os.fstat(fd)
         path_status = os.stat(
             name,
@@ -2530,6 +2601,7 @@ def _create_private_regular_file(
             follow_symlinks=False,
         )
         final_access_policy = _stable_fd_access_policy_binding(fd)
+        _check_deadline(deadline_check)
         if (
             _file_status(descriptor) != _file_status(path_status)
             or descriptor.st_size != len(payload)
@@ -2540,12 +2612,13 @@ def _create_private_regular_file(
                 "collector-unavailable",
                 f"{label} could not be bound after creation",
             )
-        parent.revalidate()
+        parent.revalidate(deadline_check=deadline_check)
         bound_file = _BoundRegularFile(
             parent,
             name,
             label=label,
             max_bytes=max_bytes,
+            deadline_check=deadline_check,
         )
         cleanup_anchors.remove(cleanup_anchor)
         cleanup_anchor_registered = False
@@ -2565,10 +2638,17 @@ def _create_private_regular_file(
                 pass
 
 
-def _write_all(fd: int, payload: bytes) -> None:
+def _write_all(
+    fd: int,
+    payload: bytes,
+    *,
+    deadline_check: Callable[[], None] | None = None,
+) -> None:
     offset = 0
     while offset < len(payload):
+        _check_deadline(deadline_check)
         written = os.write(fd, payload[offset:])
+        _check_deadline(deadline_check)
         if written <= 0:
             raise OSError("short write while pinning executable")
         offset += written
@@ -3024,13 +3104,19 @@ class GitHubApiClient:
                 unavailable=True,
             ) from error
         try:
-            selected_runtime_parent = runtime_parent or _default_gh_runtime_parent()
+            self.deadline = time.monotonic() + MAX_COLLECTION_SECONDS
+            initialization_check = self._check_initialization_deadline
+            initialization_check()
+            selected_runtime_parent = runtime_parent or _default_gh_runtime_parent(
+                deadline_check=initialization_check,
+            )
             self._runtime_parent = _BoundDirectory(
                 selected_runtime_parent,
                 label="GitHub CLI fixed runtime parent",
                 create_final=True,
+                deadline_check=initialization_check,
             )
-            self._create_run_directory()
+            self._create_run_directory(deadline_check=initialization_check)
             if self._run_directory is None:
                 raise _blocked(
                     "collector-unavailable",
@@ -3040,8 +3126,12 @@ class GitHubApiClient:
                 self._run_directory,
                 "transport",
                 label="GitHub API private transport directory",
+                deadline_check=initialization_check,
             )
-            self._snapshot_configuration(gh_config_dir)
+            self._snapshot_configuration(
+                gh_config_dir,
+                deadline_check=initialization_check,
+            )
             if self._run_directory is None:
                 raise _blocked(
                     "collector-unavailable",
@@ -3051,17 +3141,38 @@ class GitHubApiClient:
                 self._run_directory,
                 "bin",
                 label="GitHub CLI private executable snapshot directory",
+                deadline_check=initialization_check,
             )
-            self._pin_executable(gh_executable, expected_gh_sha256)
-            self._curl_trust_binding = _fixed_curl_trust_binding()
-            self._config_snapshot_directory.set_owner_mode(0o500)
-            self._executable_snapshot_directory.set_owner_mode(0o500)
+            self._pin_executable(
+                gh_executable,
+                expected_gh_sha256,
+                deadline_check=initialization_check,
+            )
+            initialization_check()
+            self._curl_trust_binding = _fixed_curl_trust_binding(
+                deadline_check=initialization_check,
+            )
+            initialization_check()
+            self._config_snapshot_directory.set_owner_mode(
+                0o500,
+                deadline_check=initialization_check,
+            )
+            self._executable_snapshot_directory.set_owner_mode(
+                0o500,
+                deadline_check=initialization_check,
+            )
             if self._snapshot_auth_header_file is not None:
-                self._transport_directory.set_owner_mode(0o500)
-            self._revalidate_snapshot()
+                self._transport_directory.set_owner_mode(
+                    0o500,
+                    deadline_check=initialization_check,
+                )
+            self._revalidate_snapshot(
+                absolute_deadline=self.deadline,
+                endpoint_class="collector-initialization",
+            )
             self.calls = 0
             self.total_bytes = 0
-            self.deadline = time.monotonic() + MAX_COLLECTION_SECONDS
+            initialization_check()
             self._termination_signal_guard.check_deferred()
         except BaseException as initialization_error:
             cleanup_error = self._cleanup_noexcept()
@@ -3069,19 +3180,32 @@ class GitHubApiClient:
                 raise cleanup_error from initialization_error
             raise
 
-    def _create_run_directory(self) -> None:
+    def _check_initialization_deadline(self) -> None:
+        self._require_deadline_remaining(
+            self.deadline,
+            "collector-initialization",
+        )
+        self._termination_signal_guard.check_deferred()
+
+    def _create_run_directory(
+        self,
+        *,
+        deadline_check: Callable[[], None] | None = None,
+    ) -> None:
         if self._runtime_parent is None:
             raise _blocked(
                 "collector-unavailable",
                 "GitHub CLI fixed runtime parent is unavailable",
             )
         for _ in range(64):
+            _check_deadline(deadline_check)
             run_name = f"run-{os.getpid()}-{secrets.token_hex(16)}"
             try:
                 run_directory = _create_private_child_directory(
                     self._runtime_parent,
                     run_name,
                     label="GitHub CLI private run directory",
+                    deadline_check=deadline_check,
                 )
             except EnforcementDoctorError as error:
                 if (
@@ -3099,7 +3223,13 @@ class GitHubApiClient:
             "GitHub CLI private run name collision limit was reached",
         )
 
-    def _snapshot_configuration(self, gh_config_dir: pathlib.Path) -> None:
+    def _snapshot_configuration(
+        self,
+        gh_config_dir: pathlib.Path,
+        *,
+        deadline_check: Callable[[], None] | None = None,
+    ) -> None:
+        _check_deadline(deadline_check)
         if not gh_config_dir.is_absolute():
             raise _blocked(
                 "collector-unavailable",
@@ -3108,14 +3238,17 @@ class GitHubApiClient:
         self._source_config_directory = _BoundDirectory(
             gh_config_dir,
             label="GitHub CLI source config directory",
+            deadline_check=deadline_check,
         )
         self._source_hosts_file = _BoundRegularFile(
             self._source_config_directory,
             "hosts.yml",
             label="GitHub CLI source hosts.yml",
             max_bytes=MAX_GH_CONFIG_BYTES,
+            deadline_check=deadline_check,
         )
         try:
+            _check_deadline(deadline_check)
             os.stat(
                 "config.yml",
                 dir_fd=self._source_config_directory.fd,
@@ -3134,11 +3267,16 @@ class GitHubApiClient:
                 "config.yml",
                 label="GitHub CLI source config.yml",
                 max_bytes=MAX_GH_CONFIG_BYTES,
+                deadline_check=deadline_check,
             )
+            _check_deadline(deadline_check)
             _validate_no_transport_redirects(self._source_global_config_file.payload)
+            _check_deadline(deadline_check)
+        _check_deadline(deadline_check)
         minimal_hosts, configured_token = _minimal_github_hosts(
             self._source_hosts_file.payload
         )
+        _check_deadline(deadline_check)
         self._source_hosts_file.payload = b""
         if self._source_global_config_file is not None:
             self._source_global_config_file.payload = b""
@@ -3151,6 +3289,7 @@ class GitHubApiClient:
             self._run_directory,
             "config",
             label="GitHub CLI private config snapshot directory",
+            deadline_check=deadline_check,
         )
         self._snapshot_hosts_file = _create_private_regular_file(
             self._config_snapshot_directory,
@@ -3160,6 +3299,7 @@ class GitHubApiClient:
             label="GitHub CLI private hosts.yml snapshot",
             mode=0o400,
             max_bytes=MAX_GH_CONFIG_BYTES,
+            deadline_check=deadline_check,
         )
         self._snapshot_global_config_file = _create_private_regular_file(
             self._config_snapshot_directory,
@@ -3169,6 +3309,7 @@ class GitHubApiClient:
             label="GitHub CLI private config.yml snapshot",
             mode=0o400,
             max_bytes=MAX_GH_CONFIG_BYTES,
+            deadline_check=deadline_check,
         )
         self._snapshot_hosts_file.payload = b""
         self._snapshot_global_config_file.payload = b""
@@ -3186,11 +3327,13 @@ class GitHubApiClient:
                 label="GitHub API private authorization header",
                 mode=0o400,
                 max_bytes=MAX_GH_CONFIG_BYTES,
+                deadline_check=deadline_check,
             )
             self._snapshot_auth_header_file.payload = b""
         self.config_snapshot_sha256 = hashlib.sha256(
             b"hosts.yml\0" + minimal_hosts + b"\0config.yml\0" + GH_SNAPSHOT_CONFIG
         ).hexdigest()
+        _check_deadline(deadline_check)
         # Authentication is deliberately limited to the controlled minimal
         # snapshot. No ambient HOME, TMPDIR, token, loader, proxy, CA, PATH, or
         # other GH_* variables are inherited by the collector subprocess.
@@ -3204,7 +3347,10 @@ class GitHubApiClient:
     @staticmethod
     def _initial_source_status(
         gh_executable: pathlib.Path,
+        *,
+        deadline_check: Callable[[], None] | None = None,
     ) -> tuple[int, os.stat_result, tuple[str, int, str]]:
+        _check_deadline(deadline_check)
         if not gh_executable.is_absolute():
             raise _blocked(
                 "collector-unavailable",
@@ -3222,6 +3368,7 @@ class GitHubApiClient:
                 "collector-unavailable",
                 "GitHub CLI executable is unavailable",
             ) from error
+        _check_deadline(deadline_check)
         if stat.S_ISLNK(path_status.st_mode) or not stat.S_ISREG(path_status.st_mode):
             raise _blocked(
                 "collector-unavailable",
@@ -3238,6 +3385,7 @@ class GitHubApiClient:
                 "GitHub CLI executable cannot be safely opened",
             ) from error
         try:
+            _check_deadline(deadline_check)
             descriptor_status = os.fstat(source_fd)
         except OSError as error:
             os.close(source_fd)
@@ -3266,13 +3414,17 @@ class GitHubApiClient:
                 "collector-unavailable",
                 "GitHub CLI executable ACL policy is unsafe",
             ) from error
+        _check_deadline(deadline_check)
         return source_fd, descriptor_status, access_policy
 
     def _pin_executable(
         self,
         gh_executable: pathlib.Path,
         expected_gh_sha256: str,
+        *,
+        deadline_check: Callable[[], None] | None = None,
     ) -> None:
+        _check_deadline(deadline_check)
         if self._executable_snapshot_directory is None:
             raise _blocked(
                 "collector-unavailable",
@@ -3280,11 +3432,18 @@ class GitHubApiClient:
             )
         source_fd: Optional[int]
         source_fd, source_before, source_access_policy_before = (
-            self._initial_source_status(gh_executable)
+            self._initial_source_status(
+                gh_executable,
+                deadline_check=deadline_check,
+            )
         )
         snapshot_write_fd: Optional[int] = None
+        snapshot_cleanup_anchor: Optional[dict[str, Any]] = None
+        snapshot_cleanup_anchor_registered = False
         try:
-            self._executable_snapshot_directory.revalidate()
+            self._executable_snapshot_directory.revalidate(
+                deadline_check=deadline_check
+            )
             snapshot_path = self._executable_snapshot_directory.path / "gh"
             flags = (
                 os.O_WRONLY
@@ -3300,6 +3459,14 @@ class GitHubApiClient:
                 0o500,
                 dir_fd=self._executable_snapshot_directory.fd,
             )
+            snapshot_cleanup_anchor = {
+                "fd": snapshot_write_fd,
+                "label": "GitHub CLI executable snapshot",
+                "last_known_path": snapshot_path,
+            }
+            self._provisional_cleanup_objects.append(snapshot_cleanup_anchor)
+            snapshot_cleanup_anchor_registered = True
+            _check_deadline(deadline_check)
             initial_snapshot_descriptor = os.fstat(snapshot_write_fd)
             initial_snapshot_path = os.stat(
                 "gh",
@@ -3309,6 +3476,7 @@ class GitHubApiClient:
             initial_snapshot_access_policy = _stable_fd_access_policy_binding(
                 snapshot_write_fd
             )
+            _check_deadline(deadline_check)
             if (
                 not stat.S_ISREG(initial_snapshot_descriptor.st_mode)
                 or initial_snapshot_descriptor.st_uid != os.geteuid()
@@ -3324,11 +3492,13 @@ class GitHubApiClient:
             digest = hashlib.sha256()
             copied = 0
             while True:
+                _check_deadline(deadline_check)
                 chunk = os.pread(
                     source_fd,
                     min(64 * 1024, MAX_GH_EXECUTABLE_BYTES + 1 - copied),
                     copied,
                 )
+                _check_deadline(deadline_check)
                 if not chunk:
                     break
                 copied += len(chunk)
@@ -3338,9 +3508,14 @@ class GitHubApiClient:
                         "GitHub CLI executable exceeds the byte ceiling",
                     )
                 digest.update(chunk)
-                _write_all(snapshot_write_fd, chunk)
+                _write_all(
+                    snapshot_write_fd,
+                    chunk,
+                    deadline_check=deadline_check,
+                )
             source_after = os.fstat(source_fd)
             source_access_policy_after = _stable_fd_access_policy_binding(source_fd)
+            _check_deadline(deadline_check)
             source_access_before = (
                 stat.S_IMODE(source_before.st_mode),
                 source_before.st_uid,
@@ -3382,8 +3557,11 @@ class GitHubApiClient:
             }
             self._source_access_policy_binding = source_access_policy_after
             self._source_content_generation = _file_content_generation(source_after)
+            _check_deadline(deadline_check)
             os.fchmod(snapshot_write_fd, 0o500)
+            _check_deadline(deadline_check)
             os.fsync(snapshot_write_fd)
+            _check_deadline(deadline_check)
             snapshot_status = os.fstat(snapshot_write_fd)
             snapshot_path_status = os.stat(
                 "gh",
@@ -3391,6 +3569,7 @@ class GitHubApiClient:
                 follow_symlinks=False,
             )
             snapshot_access_policy = _stable_fd_access_policy_binding(snapshot_write_fd)
+            _check_deadline(deadline_check)
             if (
                 not stat.S_ISREG(snapshot_status.st_mode)
                 or snapshot_status.st_size != copied
@@ -3404,8 +3583,7 @@ class GitHubApiClient:
                     "collector-unavailable",
                     "GitHub CLI snapshot object or access policy is invalid",
                 )
-            os.close(snapshot_write_fd)
-            snapshot_write_fd = None
+            _check_deadline(deadline_check)
             self._snapshot_fd = os.open(
                 "gh",
                 os.O_RDONLY
@@ -3416,6 +3594,7 @@ class GitHubApiClient:
             )
             pinned_status = os.fstat(self._snapshot_fd)
             pinned_access_policy = _stable_fd_access_policy_binding(self._snapshot_fd)
+            _check_deadline(deadline_check)
             if pinned_access_policy != snapshot_access_policy:
                 raise _blocked(
                     "collector-unavailable",
@@ -3438,8 +3617,17 @@ class GitHubApiClient:
             self._source_fd = source_fd
             source_fd = None
             self._pinned = True
-            self._executable_snapshot_directory.revalidate()
-            self._revalidate_snapshot()
+            self._provisional_cleanup_objects.remove(snapshot_cleanup_anchor)
+            snapshot_cleanup_anchor_registered = False
+            os.close(snapshot_write_fd)
+            snapshot_write_fd = None
+            self._executable_snapshot_directory.revalidate(
+                deadline_check=deadline_check
+            )
+            self._revalidate_snapshot(
+                absolute_deadline=self.deadline,
+                endpoint_class="collector-initialization",
+            )
         except EnforcementDoctorError:
             raise
         except (OSError, ValueError) as error:
@@ -3448,7 +3636,10 @@ class GitHubApiClient:
                 "GitHub CLI executable could not be pinned safely",
             ) from error
         finally:
-            if snapshot_write_fd is not None:
+            if (
+                snapshot_write_fd is not None
+                and not snapshot_cleanup_anchor_registered
+            ):
                 try:
                     os.close(snapshot_write_fd)
                 except OSError:
@@ -3518,17 +3709,19 @@ class GitHubApiClient:
 
         try:
             check_deadline()
-            self._runtime_parent.revalidate()
+            self._runtime_parent.revalidate(deadline_check=check_deadline)
             check_deadline()
-            self._run_directory.revalidate()
+            self._run_directory.revalidate(deadline_check=check_deadline)
             check_deadline()
-            self._executable_snapshot_directory.revalidate()
+            self._executable_snapshot_directory.revalidate(
+                deadline_check=check_deadline
+            )
             check_deadline()
-            self._config_snapshot_directory.revalidate()
+            self._config_snapshot_directory.revalidate(deadline_check=check_deadline)
             check_deadline()
-            self._transport_directory.revalidate()
+            self._transport_directory.revalidate(deadline_check=check_deadline)
             check_deadline()
-            self._source_config_directory.revalidate()
+            self._source_config_directory.revalidate(deadline_check=check_deadline)
             self._source_hosts_file.revalidate(deadline_check=check_deadline)
             if self._source_global_config_file is not None:
                 self._source_global_config_file.revalidate(
@@ -4213,14 +4406,30 @@ class GitHubApiClient:
                 ),
                 proof_required=True,
             )
+            executable_cleanup_fd = self._snapshot_fd
+            executable_cleanup_binding = getattr(self, "_snapshot_binding", None)
+            if (
+                executable_cleanup_fd is None
+                or executable_cleanup_binding is None
+            ):
+                (
+                    provisional_fd,
+                    provisional_binding,
+                ) = self._cleanup_file_binding(
+                    None,
+                    self._executable_snapshot_directory.path / "gh",
+                )
+                if provisional_fd is not None:
+                    executable_cleanup_fd = provisional_fd
+                    executable_cleanup_binding = provisional_binding
             attempt(
                 "unlink-gh",
                 lambda: self._unlink_cleanup_file(
                     self._executable_snapshot_directory,
                     "gh",
                     label="GitHub CLI executable snapshot",
-                    bound_fd=self._snapshot_fd,
-                    expected_binding=getattr(self, "_snapshot_binding", None),
+                    bound_fd=executable_cleanup_fd,
+                    expected_binding=executable_cleanup_binding,
                 ),
                 proof_required=True,
             )
@@ -4605,6 +4814,13 @@ class GitHubApiClient:
                 ),
             )
         header_payload = b"Authorization: Bearer " + token + b"\n"
+
+        def deadline_check() -> None:
+            self._require_deadline_remaining(
+                self.deadline,
+                "authentication-preflight",
+            )
+
         self._snapshot_auth_header_file = _create_private_regular_file(
             self._transport_directory,
             "authorization.headers",
@@ -4613,9 +4829,13 @@ class GitHubApiClient:
             label="GitHub API private authorization header",
             mode=0o400,
             max_bytes=MAX_GH_CONFIG_BYTES,
+            deadline_check=deadline_check,
         )
         self._snapshot_auth_header_file.payload = b""
-        self._transport_directory.set_owner_mode(0o500)
+        self._transport_directory.set_owner_mode(
+            0o500,
+            deadline_check=deadline_check,
+        )
         self._revalidate_snapshot(
             absolute_deadline=self.deadline,
             endpoint_class="authentication-preflight",
@@ -5467,6 +5687,19 @@ def _normalize_check_run(value: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _normalize_check_suite(value: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "head_sha": _exact_sha1(
+            value.get("head_sha"),
+            label="check-suite head SHA",
+        ),
+        "id": _exact_positive_integer(
+            value.get("id"),
+            label="check-suite ID",
+        ),
+    }
+
+
 def _assert_static_identity(
     snapshot: dict[str, Any],
     contract: dict[str, Any],
@@ -5810,44 +6043,87 @@ def _collect_snapshot(
         pull_request_number=pull_request_number,
     )
     expected_pr_link = _expected_pr_link(pull_request)
+    check_suite_ids: set[int] = set()
+    check_run_ids: set[int] = set()
     same_name_checks_by_id: dict[int, dict[str, Any]] = {}
     for check_head_sha in sorted({candidate_head_sha, pull_request["base"]["sha"]}):
-        check_values = _collect_pages(
+        check_suite_values = _collect_pages(
             client,
             trace,
             phase=phase,
-            label=f"selected PR {check_head_sha} check runs",
-            endpoint=f"/repos/{target_name}/commits/{check_head_sha}/check-runs",
-            parameters={"filter": "all"},
-            item_key="check_runs",
+            label=f"selected PR {check_head_sha} check suites",
+            endpoint=f"/repos/{target_name}/commits/{check_head_sha}/check-suites",
+            parameters={},
+            item_key="check_suites",
+            result_cap=MAX_CHECK_SUITES,
         )
-        for value in check_values:
-            raw_check = _exact_dict(value, label="selected PR check run")
-            check_name = _exact_string(
-                raw_check.get("name"),
-                label="selected PR check-run name",
+        for value in check_suite_values:
+            check_suite = _normalize_check_suite(
+                _exact_dict(value, label="selected PR check suite")
             )
-            if check_name != workflow_contract["check_name"]:
-                continue
-            check = _normalize_check_run(raw_check)
-            if check["head_sha"] != check_head_sha:
+            check_suite_id = check_suite["id"]
+            if check_suite["head_sha"] != check_head_sha:
                 raise _blocked(
-                    "check-run-identity-mismatch",
-                    "check-run search returned another commit",
+                    "check-suite-identity-mismatch",
+                    "check-suite search returned another commit",
                 )
-            if expected_pr_link not in check["pull_requests"]:
-                continue
-            existing = same_name_checks_by_id.get(check["id"])
-            if existing is not None:
+            if check_suite_id in check_suite_ids:
                 raise _blocked(
-                    "check-run-identity-mismatch",
-                    "same check-run ID was repeated during collection",
+                    "check-suite-identity-mismatch",
+                    "same check-suite ID was repeated during collection",
                 )
-            same_name_checks_by_id[check["id"]] = check
+            check_suite_ids.add(check_suite_id)
+            if len(check_suite_ids) > MAX_CHECK_SUITES:
+                raise _blocked(
+                    "api-search-cap-exceeded",
+                    "candidate check suites exceed the complete-search cap",
+                )
+            check_values = _collect_pages(
+                client,
+                trace,
+                phase=phase,
+                label=f"check suite {check_suite_id} check runs",
+                endpoint=f"/repos/{target_name}/check-suites/{check_suite_id}/check-runs",
+                parameters={"filter": "all"},
+                item_key="check_runs",
+                result_cap=MAX_CHECK_RUNS,
+            )
+            for check_value in check_values:
+                raw_check = _exact_dict(
+                    check_value,
+                    label="selected PR check run",
+                )
+                check = _normalize_check_run(raw_check)
+                if (
+                    check["check_suite_id"] != check_suite_id
+                    or check["head_sha"] != check_head_sha
+                ):
+                    raise _blocked(
+                        "check-run-identity-mismatch",
+                        "check-run search returned another suite or commit",
+                    )
+                if check["id"] in check_run_ids:
+                    raise _blocked(
+                        "check-run-identity-mismatch",
+                        "same check-run ID was repeated during collection",
+                    )
+                check_run_ids.add(check["id"])
+                if len(check_run_ids) > MAX_CHECK_RUNS:
+                    raise _blocked(
+                        "api-search-cap-exceeded",
+                        "candidate check runs exceed the complete-search cap",
+                    )
+                if (
+                    check["name"] == workflow_contract["check_name"]
+                    and expected_pr_link in check["pull_requests"]
+                ):
+                    same_name_checks_by_id[check["id"]] = check
     same_name_checks = list(same_name_checks_by_id.values())
     all_runs_by_id: dict[int, dict[str, Any]] = {}
-    check_suite_ids = sorted({check["check_suite_id"] for check in same_name_checks})
-    for check_suite_id in check_suite_ids:
+    relevant_check_suite_ids = sorted(
+        {check["check_suite_id"] for check in same_name_checks}
+    )
+    for check_suite_id in relevant_check_suite_ids:
         run_values = _collect_pages(
             client,
             trace,

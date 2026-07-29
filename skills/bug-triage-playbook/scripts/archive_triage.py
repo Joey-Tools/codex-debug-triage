@@ -8,6 +8,7 @@ import binascii
 import codecs
 import collections
 import contextlib
+import ctypes
 import errno
 import hashlib
 import io
@@ -15,13 +16,13 @@ import json
 import os
 import pathlib
 import re
+import secrets
 import selectors
 import signal
 import stat
 import struct
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 import unicodedata
@@ -108,6 +109,22 @@ UINT32_MAX = 0xFFFFFFFF
 UINT64_MAX = 0xFFFFFFFFFFFFFFFF
 DEFLATE_INPUT_CHUNK_BYTES = 64 * 1024
 ARCHIVE_DIGEST_CHUNK_BYTES = 1024 * 1024
+ARCHIVE_SNAPSHOT_PARENT = pathlib.Path(
+    "/private/tmp" if sys.platform == "darwin" else "/tmp"
+)
+ARCHIVE_SNAPSHOT_DIRECTORY_ATTEMPTS = 64
+ARCHIVE_SNAPSHOT_FILE_NAME = "archive.snapshot"
+DARWIN_LIBSYSTEM_PATH = "/usr/lib/libSystem.B.dylib"
+DARWIN_ACL_TYPE_EXTENDED = 0x00000100
+DARWIN_ACL_EXTENDED_ALLOW = 1
+DARWIN_ACL_EXTENDED_DENY = 2
+DARWIN_ACL_FIRST_ENTRY = 0
+DARWIN_ACL_NEXT_ENTRY = -1
+DARWIN_ACL_INHERITANCE_FLAGS = (1 << 4, 1 << 5, 1 << 6, 1 << 7, 1 << 8)
+MAX_DARWIN_ACL_BYTES = 64 * 1024
+MAX_DARWIN_ACL_ENTRIES = 128
+DARWIN_SNAPSHOT_ACL_PROFILE = "darwin-fd-no-extended-grants-v1"
+LINUX_SNAPSHOT_ACL_PROFILE = "linux-posix-mode-mask-v1"
 DEFAULT_MAX_REGEX_PATTERN_CHARS = 4 * 1024
 DEFAULT_REGEX_WORKER_START_TIMEOUT_SECONDS = 1.0
 DEFAULT_REGEX_MATCH_TIMEOUT_SECONDS = 0.25
@@ -607,6 +624,7 @@ class ArchiveFileBinding:
     link_count: int
     size: int
     sha256: bytes
+    access_policy: tuple[str, int, str]
 
 
 def _archive_metadata_binding(metadata: os.stat_result) -> tuple[int, ...]:
@@ -621,6 +639,398 @@ def _archive_metadata_binding(metadata: os.stat_result) -> tuple[int, ...]:
         metadata.st_nlink,
         metadata.st_size,
     )
+
+
+class _DarwinSnapshotAclRuntime:
+    def __init__(self) -> None:
+        self._libc = ctypes.CDLL(DARWIN_LIBSYSTEM_PATH, use_errno=True)
+        self._libc.acl_get_fd_np.argtypes = [ctypes.c_int, ctypes.c_int]
+        self._libc.acl_get_fd_np.restype = ctypes.c_void_p
+        self._libc.acl_get_entry.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_void_p),
+        ]
+        self._libc.acl_get_entry.restype = ctypes.c_int
+        self._libc.acl_get_tag_type.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_int),
+        ]
+        self._libc.acl_get_tag_type.restype = ctypes.c_int
+        self._libc.acl_get_flagset_np.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_void_p),
+        ]
+        self._libc.acl_get_flagset_np.restype = ctypes.c_int
+        self._libc.acl_get_flag_np.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        self._libc.acl_get_flag_np.restype = ctypes.c_int
+        self._libc.acl_size.argtypes = [ctypes.c_void_p]
+        self._libc.acl_size.restype = ctypes.c_ssize_t
+        self._libc.acl_copy_ext.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_ssize_t,
+        ]
+        self._libc.acl_copy_ext.restype = ctypes.c_ssize_t
+        self._libc.acl_free.argtypes = [ctypes.c_void_p]
+        self._libc.acl_free.restype = ctypes.c_int
+
+    @staticmethod
+    def _error(operation: str, *, fallback: int = errno.EIO) -> OSError:
+        error_number = ctypes.get_errno() or fallback
+        return OSError(error_number, f"Darwin ACL {operation} failed")
+
+    def binding(self, fd: int) -> tuple[str, int, str]:
+        ctypes.set_errno(0)
+        acl = self._libc.acl_get_fd_np(fd, DARWIN_ACL_TYPE_EXTENDED)
+        if not acl:
+            if ctypes.get_errno() == errno.ENOENT:
+                return (
+                    DARWIN_SNAPSHOT_ACL_PROFILE,
+                    0,
+                    "no-extended-grants-or-inheritance",
+                )
+            raise self._error("descriptor query")
+        try:
+            ctypes.set_errno(0)
+            external_size = self._libc.acl_size(acl)
+            if external_size <= 0 or external_size > MAX_DARWIN_ACL_BYTES:
+                raise OSError(
+                    errno.EOVERFLOW,
+                    "Darwin ACL external representation exceeds its byte ceiling",
+                )
+            external = ctypes.create_string_buffer(external_size)
+            ctypes.set_errno(0)
+            copied = self._libc.acl_copy_ext(external, acl, external_size)
+            if copied != external_size:
+                raise self._error("external copy")
+
+            entry = ctypes.c_void_p()
+            entry_id = DARWIN_ACL_FIRST_ENTRY
+            entry_count = 0
+            while True:
+                ctypes.set_errno(0)
+                result = self._libc.acl_get_entry(
+                    acl,
+                    entry_id,
+                    ctypes.byref(entry),
+                )
+                if result != 0:
+                    if ctypes.get_errno() == errno.EINVAL and entry_count > 0:
+                        break
+                    raise self._error("entry enumeration")
+                entry_count += 1
+                if entry_count > MAX_DARWIN_ACL_ENTRIES:
+                    raise OSError(
+                        errno.EOVERFLOW,
+                        "Darwin ACL entry count exceeds its ceiling",
+                    )
+
+                tag = ctypes.c_int()
+                ctypes.set_errno(0)
+                if self._libc.acl_get_tag_type(entry, ctypes.byref(tag)) != 0:
+                    raise self._error("entry tag query")
+                if tag.value == DARWIN_ACL_EXTENDED_ALLOW:
+                    raise OSError(
+                        errno.EACCES,
+                        "Darwin extended ACL grants are not allowed",
+                    )
+                if tag.value != DARWIN_ACL_EXTENDED_DENY:
+                    raise OSError(
+                        errno.EINVAL,
+                        "Darwin ACL contains an unsupported entry tag",
+                    )
+
+                flagset = ctypes.c_void_p()
+                ctypes.set_errno(0)
+                if (
+                    self._libc.acl_get_flagset_np(
+                        entry,
+                        ctypes.byref(flagset),
+                    )
+                    != 0
+                ):
+                    raise self._error("entry flag-set query")
+                for flag in DARWIN_ACL_INHERITANCE_FLAGS:
+                    ctypes.set_errno(0)
+                    present = self._libc.acl_get_flag_np(flagset, flag)
+                    if present < 0:
+                        raise self._error("entry inheritance query")
+                    if present:
+                        raise OSError(
+                            errno.EACCES,
+                            "Darwin inherited or inheritable ACL entries "
+                            "are not allowed",
+                        )
+                entry_id = DARWIN_ACL_NEXT_ENTRY
+        except BaseException:
+            self._libc.acl_free(acl)
+            raise
+        if self._libc.acl_free(acl) != 0:
+            raise self._error("release")
+        return (
+            DARWIN_SNAPSHOT_ACL_PROFILE,
+            0,
+            "no-extended-grants-or-inheritance",
+        )
+
+
+_DARWIN_SNAPSHOT_ACL_RUNTIME: _DarwinSnapshotAclRuntime | None = None
+
+
+def _snapshot_access_policy_binding(fd: int) -> tuple[str, int, str]:
+    if sys.platform == "darwin":
+        global _DARWIN_SNAPSHOT_ACL_RUNTIME
+        if _DARWIN_SNAPSHOT_ACL_RUNTIME is None:
+            try:
+                _DARWIN_SNAPSHOT_ACL_RUNTIME = _DarwinSnapshotAclRuntime()
+            except (AttributeError, OSError) as error:
+                raise OSError(
+                    errno.ENOTSUP,
+                    "fixed Darwin descriptor ACL runtime is unavailable",
+                ) from error
+        return _DARWIN_SNAPSHOT_ACL_RUNTIME.binding(fd)
+    if sys.platform.startswith("linux"):
+        return (LINUX_SNAPSHOT_ACL_PROFILE, 0, "mode-bits-authoritative")
+    raise OSError(
+        errno.ENOTSUP,
+        "archive snapshot ACL policy is unsupported on this platform",
+    )
+
+
+def _stable_snapshot_access_policy_binding(fd: int) -> tuple[str, int, str]:
+    first = _snapshot_access_policy_binding(fd)
+    second = _snapshot_access_policy_binding(fd)
+    if first != second:
+        raise OSError(
+            errno.EAGAIN,
+            "archive snapshot access policy changed during inspection",
+        )
+    return first
+
+
+def _same_file_identity(
+    descriptor: os.stat_result,
+    path_status: os.stat_result,
+) -> bool:
+    return (
+        stat.S_IFMT(descriptor.st_mode) == stat.S_IFMT(path_status.st_mode)
+        and (descriptor.st_dev, descriptor.st_ino)
+        == (path_status.st_dev, path_status.st_ino)
+    )
+
+
+def _open_snapshot_parent(deadline: ArchiveCommandDeadline) -> int:
+    parent = ARCHIVE_SNAPSHOT_PARENT
+    if (
+        not parent.is_absolute()
+        or parent == pathlib.Path("/")
+        or any(part in ("", ".", "..") for part in parent.parts[1:])
+        or not hasattr(os, "O_DIRECTORY")
+        or not hasattr(os, "O_NOFOLLOW")
+        or not hasattr(os, "O_NONBLOCK")
+    ):
+        raise OSError("archive snapshot parent is unsafe")
+    deadline.check("archive snapshot parent binding")
+    flags = (
+        os.O_RDONLY
+        | os.O_DIRECTORY
+        | os.O_NOFOLLOW
+        | os.O_NONBLOCK
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    parent_fd = os.open(parent, flags)
+    try:
+        deadline.check("archive snapshot parent binding")
+        descriptor = os.fstat(parent_fd)
+        path_status = os.stat(parent, follow_symlinks=False)
+        mode = stat.S_IMODE(descriptor.st_mode)
+        owner_private = descriptor.st_uid == os.geteuid() and mode & 0o077 == 0
+        root_sticky = (
+            descriptor.st_uid == 0
+            and bool(mode & stat.S_ISVTX)
+            and bool(mode & 0o002)
+        )
+        if (
+            not stat.S_ISDIR(descriptor.st_mode)
+            or not _same_file_identity(descriptor, path_status)
+            or not (owner_private or root_sticky)
+        ):
+            raise OSError("archive snapshot parent identity or policy is unsafe")
+        deadline.check("archive snapshot parent binding")
+        return parent_fd
+    except BaseException:
+        os.close(parent_fd)
+        raise
+
+
+def _create_private_archive_snapshot(
+    deadline: ArchiveCommandDeadline,
+) -> io.FileIO:
+    """Create one validated anonymous owner-private snapshot before any write."""
+
+    parent_fd = _open_snapshot_parent(deadline)
+    root_fd: int | None = None
+    snapshot_fd: int | None = None
+    root_name = ""
+    root_created = False
+    file_created = False
+    original_error: BaseException | None = None
+    try:
+        directory_flags = (
+            os.O_RDONLY
+            | os.O_DIRECTORY
+            | os.O_NOFOLLOW
+            | os.O_NONBLOCK
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+        for _ in range(ARCHIVE_SNAPSHOT_DIRECTORY_ATTEMPTS):
+            deadline.check("archive snapshot root creation")
+            candidate = f"cisco-archive-snapshot-{secrets.token_hex(16)}"
+            try:
+                os.mkdir(candidate, 0o700, dir_fd=parent_fd)
+            except FileExistsError:
+                continue
+            root_name = candidate
+            root_created = True
+            break
+        if not root_created:
+            raise OSError("archive snapshot directory collision limit was reached")
+        root_fd = os.open(root_name, directory_flags, dir_fd=parent_fd)
+        deadline.check("archive snapshot root validation")
+        root_descriptor = os.fstat(root_fd)
+        root_path_status = os.stat(
+            root_name,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        os.fchmod(root_fd, 0o700)
+        deadline.check("archive snapshot root validation")
+        root_descriptor = os.fstat(root_fd)
+        root_path_status = os.stat(
+            root_name,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        root_access_policy = _stable_snapshot_access_policy_binding(root_fd)
+        if (
+            not stat.S_ISDIR(root_descriptor.st_mode)
+            or not _same_file_identity(root_descriptor, root_path_status)
+            or root_descriptor.st_uid != os.geteuid()
+            or stat.S_IMODE(root_descriptor.st_mode) != 0o700
+            or root_access_policy
+            != _stable_snapshot_access_policy_binding(root_fd)
+        ):
+            raise OSError("archive snapshot root identity or policy is unsafe")
+
+        file_flags = (
+            os.O_RDWR
+            | os.O_CREAT
+            | os.O_EXCL
+            | os.O_NOFOLLOW
+            | os.O_NONBLOCK
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+        snapshot_fd = os.open(
+            ARCHIVE_SNAPSHOT_FILE_NAME,
+            file_flags,
+            0o600,
+            dir_fd=root_fd,
+        )
+        file_created = True
+        deadline.check("archive snapshot file validation")
+        os.fchmod(snapshot_fd, 0o600)
+        snapshot_descriptor = os.fstat(snapshot_fd)
+        snapshot_path_status = os.stat(
+            ARCHIVE_SNAPSHOT_FILE_NAME,
+            dir_fd=root_fd,
+            follow_symlinks=False,
+        )
+        snapshot_access_policy = _stable_snapshot_access_policy_binding(snapshot_fd)
+        if (
+            not stat.S_ISREG(snapshot_descriptor.st_mode)
+            or not _same_file_identity(snapshot_descriptor, snapshot_path_status)
+            or snapshot_descriptor.st_uid != os.geteuid()
+            or snapshot_descriptor.st_nlink != 1
+            or snapshot_descriptor.st_size != 0
+            or stat.S_IMODE(snapshot_descriptor.st_mode) != 0o600
+            or snapshot_access_policy
+            != _stable_snapshot_access_policy_binding(snapshot_fd)
+        ):
+            raise OSError("archive snapshot file identity or policy is unsafe")
+
+        deadline.check("archive snapshot descriptor publication")
+        os.unlink(ARCHIVE_SNAPSHOT_FILE_NAME, dir_fd=root_fd)
+        file_created = False
+        anonymous_status = os.fstat(snapshot_fd)
+        anonymous_access_policy = _stable_snapshot_access_policy_binding(snapshot_fd)
+        if (
+            not stat.S_ISREG(anonymous_status.st_mode)
+            or (anonymous_status.st_dev, anonymous_status.st_ino)
+            != (snapshot_descriptor.st_dev, snapshot_descriptor.st_ino)
+            or anonymous_status.st_nlink != 0
+            or anonymous_status.st_size != 0
+            or stat.S_IMODE(anonymous_status.st_mode) != 0o600
+            or anonymous_access_policy != snapshot_access_policy
+        ):
+            raise OSError("archive snapshot anonymous binding is unsafe")
+        os.rmdir(root_name, dir_fd=parent_fd)
+        root_created = False
+        deadline.check("archive snapshot descriptor publication")
+        os.close(root_fd)
+        root_fd = None
+        os.close(parent_fd)
+        parent_fd = -1
+        stream = io.FileIO(snapshot_fd, mode="r+", closefd=True)
+        snapshot_fd = None
+        return stream
+    except BaseException as error:
+        original_error = error
+        raise
+    finally:
+        cleanup_error: BaseException | None = None
+        if file_created and root_fd is not None:
+            try:
+                descriptor = os.fstat(snapshot_fd) if snapshot_fd is not None else None
+                path_status = os.stat(
+                    ARCHIVE_SNAPSHOT_FILE_NAME,
+                    dir_fd=root_fd,
+                    follow_symlinks=False,
+                )
+                if descriptor is None or not _same_file_identity(
+                    descriptor,
+                    path_status,
+                ):
+                    raise OSError("archive snapshot cleanup identity changed")
+                os.unlink(ARCHIVE_SNAPSHOT_FILE_NAME, dir_fd=root_fd)
+                file_created = False
+            except BaseException as error:
+                cleanup_error = error
+        if snapshot_fd is not None:
+            try:
+                os.close(snapshot_fd)
+            except BaseException as error:
+                cleanup_error = cleanup_error or error
+        if root_created:
+            try:
+                os.rmdir(root_name, dir_fd=parent_fd)
+                root_created = False
+            except BaseException as error:
+                cleanup_error = cleanup_error or error
+        if root_fd is not None:
+            try:
+                os.close(root_fd)
+            except BaseException as error:
+                cleanup_error = cleanup_error or error
+        if parent_fd >= 0:
+            try:
+                os.close(parent_fd)
+            except BaseException as error:
+                cleanup_error = cleanup_error or error
+        if cleanup_error is not None:
+            raise OSError("archive snapshot cleanup could not be verified") from (
+                original_error or cleanup_error
+            )
 
 
 def _digest_archive_fd(
@@ -681,7 +1091,9 @@ def _copy_archive_snapshot(
                 raise OSError("archive snapshot write made no progress")
             view = view[written:]
         source_offset += len(chunk)
+    deadline.check("archive snapshot rewind")
     os.lseek(snapshot_fd, 0, os.SEEK_SET)
+    deadline.check("archive snapshot rewind")
     return digest.digest()
 
 
@@ -703,6 +1115,9 @@ class PinnedArchiveReader(io.RawIOBase):
     def _validate_metadata(self) -> None:
         self._deadline.check("archive metadata validation")
         current = os.fstat(self._raw_stream.fileno())
+        current_access_policy = _stable_snapshot_access_policy_binding(
+            self._raw_stream.fileno()
+        )
         self._deadline.check("archive metadata validation")
         expected = (
             self._binding.device,
@@ -714,7 +1129,10 @@ class PinnedArchiveReader(io.RawIOBase):
             self._binding.size,
         )
         observed = _archive_metadata_binding(current)
-        if observed != expected:
+        if (
+            observed != expected
+            or current_access_policy != self._binding.access_policy
+        ):
             raise zipfile.BadZipFile(
                 "archive identity, access policy, link count, or size changed after open"
             )
@@ -1817,11 +2235,7 @@ def _open_pinned_archive(
                 "archive file exceeds max bytes: "
                 f"{metadata.st_size} > {max_archive_bytes}"
             )
-        snapshot_stream = tempfile.TemporaryFile(
-            mode="w+b",
-            buffering=0,
-            prefix="cisco-archive-snapshot-",
-        )
+        snapshot_stream = _create_private_archive_snapshot(command_deadline)
         snapshot_digest = _copy_archive_snapshot(
             fd,
             snapshot_stream.fileno(),
@@ -1846,11 +2260,14 @@ def _open_pinned_archive(
             raise zipfile.BadZipFile("archive changed during snapshot binding")
         snapshot_metadata = os.fstat(snapshot_stream.fileno())
         snapshot_mode = stat.S_IMODE(snapshot_metadata.st_mode)
+        snapshot_access_policy = _stable_snapshot_access_policy_binding(
+            snapshot_stream.fileno()
+        )
         if (
             not stat.S_ISREG(snapshot_metadata.st_mode)
             or snapshot_metadata.st_uid != os.geteuid()
             or snapshot_mode & 0o077
-            or snapshot_metadata.st_nlink > 1
+            or snapshot_metadata.st_nlink != 0
             or snapshot_metadata.st_size != metadata.st_size
         ):
             raise OSError("archive snapshot access policy is unsafe")
@@ -1863,6 +2280,7 @@ def _open_pinned_archive(
             link_count=snapshot_metadata.st_nlink,
             size=snapshot_metadata.st_size,
             sha256=snapshot_digest,
+            access_policy=snapshot_access_policy,
         )
         os.close(fd)
         fd = -1

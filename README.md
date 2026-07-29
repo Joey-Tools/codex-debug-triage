@@ -86,19 +86,31 @@ after each invocation and before admission. Content receipts bind the exact
 SHA-256 to descriptor/path identity plus size, `mtime_ns`, and `ctime_ns`;
 unchanged generations reuse that receipt, while any generation change forces a
 bounded reread and exact digest comparison. This avoids multiplying a large
-executable hash by the 4,096-call ceiling without treating metadata churn alone
-as a content violation or allowing source drift. All pre/post revalidation,
-child execution, and response parsing consume one monotonic absolute collection
-deadline; remaining child time is computed only after preflight revalidation,
-and an exhausted budget cannot reach `Popen`. It collects
-every API page through an explicit empty terminal page,
+executable hash by the 16,384-call ceiling without treating metadata churn
+alone as a content violation or allowing source drift. The monotonic absolute
+collection deadline starts immediately after termination-signal supervision,
+before the first runtime/config path or credential read. Configuration double
+reads, private snapshot creation, the bounded executable copy, every `fsync`,
+pre/post revalidation, child execution, and response parsing all consume that
+same deadline; it is not reset after initialization. Remaining child time is
+computed only after preflight revalidation, and an exhausted budget cannot
+reach `Popen`. Python deadline checks cannot hard-interrupt an uninterruptible
+filesystem syscall; a caller requiring a hard return must run the doctor under
+a terminate/reap-capable outer process supervisor and preserve any
+descriptor-bound cleanup recovery identity. It collects every API page through
+an explicit empty terminal page,
 and revalidates the protected snapshot before admitting the selector, pinned
 ruleset, workflow, PR head, administrator-pinned exact run ID/attempt, job, and
 check run. Pointer admission additionally requires an exact authority
 repository/workflow/run/current-attempt/artifact locator and twice-stable live
 reads of the scoped current state and active merge lease; artifact name or
-latest-run discovery is not an authority. Older or additional same-name lineage
-is allowed only when it comes from the same trusted workflow identity. Sanitized failures
+latest-run discovery is not an authority. For both the frozen PR head and its
+`pull_request_target` base, it first fully paginates check suites and then fully
+paginates the check runs of every suite, with aggregate suite/run capacities,
+unique IDs, exact head/suite linkage, stable totals, and explicit empty terminal
+pages required before same-name lineage is called complete. Older or additional
+same-name lineage is allowed only when it comes from the same trusted workflow
+identity. Sanitized failures
 retain a fixed endpoint class, HTTP status when available, and stable reason
 code without raw response bodies, headers, environment, or tokens. Until it returns
 `classification=admitted`, retirement remains `blocked_until_trusted` and the

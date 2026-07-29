@@ -144,13 +144,22 @@ signs, or hyphens and must resolve through Python's codec registry.
 
 The helper opens the source archive once and copies at most the accepted
 256 MiB extent into an owner-private, descriptor-only temporary snapshot. It
-then revalidates the source descriptor's identity, access policy, link count,
-size, and complete SHA-256 content before any parser consumes the snapshot.
-The reader exposes the snapshot's initial size as the only EOF and revalidates
-its metadata and complete digest before success. This freezes the exact bytes
-used by member selection and reading: source-path replacement, growth,
-shrinkage, and same-inode/same-size rewrites after binding cannot change the
-parser's view.
+does not consult ambient `TMPDIR`: it uses the fixed system temporary parent,
+atomically creates a unique `0700` root plus a `0600` regular file, and binds
+their descriptor/path identity, owner, mode, link count, size, and access
+policy before writing the first archive byte. On Darwin, the fixed descriptor
+ACL runtime rejects every extended allow and every inherited or inheritable
+entry on the created root or file; Linux binds the effective POSIX ACL mask
+through group mode bits forced to zero by the owner-only mode, and unsupported
+platforms fail closed. The file is then unlinked and the empty root removed,
+leaving a zero-link descriptor as the only parser input. It next revalidates
+the source descriptor's identity, access policy, link count, size, and
+complete SHA-256 content before any parser consumes the snapshot. The reader
+exposes the snapshot's initial size as the only EOF and revalidates its
+metadata, descriptor ACL binding, and complete digest before success. This
+freezes the exact bytes used by member selection and reading: source-path
+replacement, growth, shrinkage, and same-inode/same-size rewrites after
+binding cannot change the parser's view.
 
 Before constructing Python `ZipInfo` objects, it reads EOCD/ZIP64 metadata and
 sequentially counts bounded central-directory records from that same descriptor.

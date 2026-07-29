@@ -53,6 +53,7 @@ jobs:
       - name: Run Darwin ACL integration tests
         run: |
           python3 -m unittest \
+            tests.test_archive_triage.ArchiveTriageTests.test_snapshot_rejects_inherited_allow_acl_before_copy \
             tests.test_archive_triage.BugTriageDocumentationTests.test_enforcement_darwin_acl_ctypes_abi_constants_and_iteration \
             tests.test_archive_triage.BugTriageDocumentationTests.test_enforcement_gh_acl_allows_only_noninherited_deny_entries \
             tests.test_archive_triage.BugTriageDocumentationTests.test_enforcement_gh_acl_rejects_inherited_source_token_read_grant \

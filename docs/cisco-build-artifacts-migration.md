@@ -441,8 +441,8 @@ large executable; a changed generation performs the same bounded content read
 and exact digest comparison before the receipt can advance. Metadata churn is
 therefore only a rehash signal, while replacement, access-policy expansion, or
 content mutation still returns `collector-inconclusive` and discards command
-output. The 4,096-call ceiling cannot amplify unchanged executable/config
-hashing into 4,096 full reads.
+output. The 16,384-call ceiling cannot amplify unchanged executable/config
+hashing into 16,384 full reads.
 The same process:
 
 - resolves the active token locally when needed, then reads `/user` through
@@ -453,10 +453,11 @@ The same process:
   run-attempt endpoint, source workflow repository, workflow metadata, and
   pinned source commit
 - lists every effective target-repository ruleset with
-  `includes_parents=true`, every check run for both the frozen PR head and the
-  `pull_request_target` base commit with `filter=all`, every workflow run for
-  each selected-PR same-name check-suite ID, and every job for every observed
-  run attempt
+  `includes_parents=true`; fully paginates every check suite for both the frozen
+  PR head and the `pull_request_target` base commit without an app filter; then
+  fully paginates every check run for each discovered suite with `filter=all`,
+  every workflow run for each selected-PR same-name check-suite ID, and every
+  job for every observed run attempt
 - uses `per_page=100`, continues even after a short non-empty page, and stops
   only after requesting an explicit empty terminal page; object endpoints and
   page bounds are recorded in the receipt
@@ -473,7 +474,8 @@ The same process:
   are not treated as object replacement or content mutation
 
 The doctor rejects pagination totals that do not match the fully collected
-items, page/call/search caps that prevent proof of exhaustion, a missing or
+items, duplicate check-suite or check-run IDs, suite/head linkage drift,
+page/call/suite/run/search caps that prevent proof of exhaustion, a missing or
 mutable workflow binding, the wrong organization/repository/ruleset/workflow
 identity, a disabled or evaluating ruleset, any bypass actor, wrong repository
 or default-branch conditions, or any same-name `required_status_checks` rule.
@@ -522,12 +524,24 @@ runtime/object locators carry the recovery identity. An unsafe handler/mask
 restoration keeps the termination signals fenced instead of opening an
 unowned interruption window.
 
-Pre-execution snapshot revalidation and the child share one absolute monotonic
-collection deadline. Revalidation checks that deadline around each bounded
-read, recomputes remaining time afterward, and passes the absolute deadline
-into process supervision; expiration before spawn prohibits `Popen`, and
-post-execution revalidation plus JSON parsing must also finish before evidence
-can be consumed.
+One absolute monotonic collection deadline begins immediately after the
+termination-signal guard is installed and before the first runtime/config path
+or credential read. Directory and file binding, configuration double reads,
+private credential/config creation, the bounded executable copy, each
+`fchmod`/`fsync`, initialization and pre-execution snapshot revalidation, the
+child, post-execution revalidation, and JSON parsing all consume that same
+deadline; initialization never resets it. Revalidation checks the deadline
+around each bounded read, recomputes remaining time afterward, and passes the
+absolute deadline into process supervision; expiration before spawn prohibits
+`Popen`.
+
+These in-process monotonic checks do not claim to hard-interrupt NFS, FUSE,
+File Provider, uninterruptible, or automatically restarted filesystem calls.
+A caller that requires a hard return must launch the doctor as a separate
+terminate-able process under an outer TERM/KILL/reap supervisor. Deadline
+failure still runs the descriptor-bound cleanup transaction first; if cleanup
+cannot be proved, the sanitized runtime/object locator and retained process or
+descriptor identity remain the authoritative recovery evidence.
 
 The direct process is registered before deadline, buffer, or selector
 initialization. Every post-spawn error enters bounded TERM/grace/KILL with
