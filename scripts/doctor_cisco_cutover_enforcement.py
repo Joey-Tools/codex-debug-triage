@@ -1272,10 +1272,9 @@ def _api_http_status_error(
     *,
     endpoint_class: str,
     http_status: int,
-    authentication_preflight: bool = False,
     rate_limited: bool = False,
 ) -> EnforcementDoctorError:
-    if authentication_preflight or http_status == 401:
+    if http_status == 401:
         reason_code = "blocked-authentication"
         reason = "GitHub API authentication was rejected"
         failure_kind = "authentication"
@@ -4638,7 +4637,7 @@ class GitHubApiClient:
                     authentication_preflight=True,
                 )
                 self._install_authentication_header(token_output)
-            user = self.get_json("/user", authentication_preflight=True)
+            user = self.get_json("/user")
             user_object = _exact_dict(user, label="authenticated GitHub user")
             return {
                 "id": _exact_positive_integer(
@@ -4658,8 +4657,6 @@ class GitHubApiClient:
         self,
         endpoint: str,
         parameters: Optional[dict[str, object]] = None,
-        *,
-        authentication_preflight: bool = False,
     ) -> object:
         try:
             if (
@@ -4798,7 +4795,6 @@ class GitHubApiClient:
                 raise _api_http_status_error(
                     endpoint_class=endpoint_class,
                     http_status=http_status,
-                    authentication_preflight=authentication_preflight,
                     rate_limited=rate_remaining == b"0",
                 )
             parsed = _parse_json_bytes(

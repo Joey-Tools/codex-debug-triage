@@ -10996,6 +10996,223 @@ class BugTriageDocumentationTests(unittest.TestCase):
         self.assertNotIn("\0api\0", flattened)
         self.assertNotIn(SYNTHETIC_ACCESS_TOKEN, flattened)
 
+    def test_enforcement_local_token_command_failure_is_authentication(
+        self,
+    ) -> None:
+        with owner_controlled_temp_root() as temp_root:
+            trusted_gh = temp_root / "trusted-gh"
+            trusted_payload = b"#!/bin/sh\nexit 0\n"
+            trusted_gh.write_bytes(trusted_payload)
+            trusted_gh.chmod(0o700)
+            config_dir, runtime_parent = self._make_private_gh_config(
+                temp_root,
+                hosts_payload=(
+                    "github.com:\n"
+                    "    git_protocol: https\n"
+                    "    users:\n"
+                    "        fixture-admin:\n"
+                    "    user: fixture-admin\n"
+                ),
+            )
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with ENFORCEMENT_MODULE.GitHubApiClient(
+                trusted_gh,
+                hashlib.sha256(trusted_payload).hexdigest(),
+                config_dir,
+                runtime_parent=runtime_parent,
+            ) as client:
+                run_path = client._run_directory.path
+                with (
+                    mock.patch.object(
+                        ENFORCEMENT_MODULE,
+                        "_bounded_subprocess",
+                        return_value=(
+                            1,
+                            f"{SYNTHETIC_ACCESS_TOKEN}\n".encode("ascii"),
+                            (
+                                f"credential lookup failed: {SYNTHETIC_ACCESS_TOKEN}"
+                            ).encode("ascii"),
+                        ),
+                    ) as spawned,
+                    redirect_stdout(stdout),
+                    redirect_stderr(stderr),
+                    self.assertRaises(
+                        ENFORCEMENT_MODULE.EnforcementDoctorError
+                    ) as raised,
+                ):
+                    client.auth_preflight()
+
+        self.assertEqual(raised.exception.reason_code, "blocked-authentication")
+        self.assertEqual(
+            raised.exception.api_failure,
+            {
+                "endpoint_class": "authentication-preflight",
+                "failure_kind": "authentication",
+                "http_status": None,
+            },
+        )
+        self.assertNotIn(SYNTHETIC_ACCESS_TOKEN, str(raised.exception))
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertFalse(run_path.exists())
+        spawned.assert_called_once()
+        self.assertEqual(
+            spawned.call_args.args[0][1:],
+            ["auth", "token", "--hostname", "github.com"],
+        )
+
+    def test_enforcement_auth_preflight_preserves_api_failure_classification(
+        self,
+    ) -> None:
+        cases = (
+            (
+                "curl-failure",
+                1,
+                None,
+                "",
+                "api-unavailable",
+                "unclassified",
+                None,
+            ),
+            (
+                "authentication",
+                0,
+                401,
+                "",
+                "blocked-authentication",
+                "authentication",
+                401,
+            ),
+            (
+                "permission",
+                0,
+                403,
+                "",
+                "blocked-permission",
+                "permission",
+                403,
+            ),
+            (
+                "rate-limit-403",
+                0,
+                403,
+                "0",
+                "rate-limited",
+                "rate-limit",
+                403,
+            ),
+            (
+                "not-found",
+                0,
+                404,
+                "",
+                "not-found",
+                "not-found",
+                404,
+            ),
+            (
+                "rate-limit-429",
+                0,
+                429,
+                "",
+                "rate-limited",
+                "rate-limit",
+                429,
+            ),
+            (
+                "server-error",
+                0,
+                503,
+                "",
+                "api-unavailable",
+                "server-error",
+                503,
+            ),
+        )
+        for (
+            label,
+            return_code,
+            status,
+            rate_remaining,
+            reason_code,
+            failure_kind,
+            expected_status,
+        ) in cases:
+            with self.subTest(failure=label), owner_controlled_temp_root() as temp_root:
+                trusted_gh = temp_root / "trusted-gh"
+                trusted_payload = b"#!/bin/sh\nexit 0\n"
+                trusted_gh.write_bytes(trusted_payload)
+                trusted_gh.chmod(0o700)
+                config_dir, runtime_parent = self._make_private_gh_config(temp_root)
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+                if status is None:
+                    response = f"{SYNTHETIC_ACCESS_TOKEN}\n".encode("ascii")
+                else:
+                    response = self._curl_response(
+                        (f'{{"secret":"{SYNTHETIC_ACCESS_TOKEN}"}}').encode("ascii"),
+                        status,
+                        rate_remaining=rate_remaining,
+                    )
+                with ENFORCEMENT_MODULE.GitHubApiClient(
+                    trusted_gh,
+                    hashlib.sha256(trusted_payload).hexdigest(),
+                    config_dir,
+                    runtime_parent=runtime_parent,
+                ) as client:
+                    run_path = client._run_directory.path
+                    with (
+                        mock.patch.object(
+                            ENFORCEMENT_MODULE,
+                            "_bounded_subprocess",
+                            return_value=(
+                                return_code,
+                                response,
+                                (f"transport detail: {SYNTHETIC_ACCESS_TOKEN}").encode(
+                                    "ascii"
+                                ),
+                            ),
+                        ) as spawned,
+                        redirect_stdout(stdout),
+                        redirect_stderr(stderr),
+                        self.assertRaises(
+                            ENFORCEMENT_MODULE.EnforcementDoctorError
+                        ) as raised,
+                    ):
+                        client.auth_preflight()
+
+                self.assertEqual(raised.exception.reason_code, reason_code)
+                self.assertEqual(
+                    raised.exception.api_failure,
+                    {
+                        "endpoint_class": "authenticated-user",
+                        "failure_kind": failure_kind,
+                        "http_status": expected_status,
+                    },
+                )
+                rendered = json.dumps(
+                    {
+                        "reason": str(raised.exception),
+                        "api_failure": raised.exception.api_failure,
+                    },
+                    sort_keys=True,
+                )
+                self.assertNotIn(SYNTHETIC_ACCESS_TOKEN, rendered)
+                self.assertEqual(stdout.getvalue(), "")
+                self.assertEqual(stderr.getvalue(), "")
+                self.assertFalse(run_path.exists())
+                spawned.assert_called_once()
+                command = spawned.call_args.args[0]
+                self.assertEqual(
+                    command[0],
+                    str(ENFORCEMENT_MODULE.CURL_EXECUTABLE),
+                )
+                self.assertNotIn(
+                    SYNTHETIC_ACCESS_TOKEN,
+                    "\0".join(command),
+                )
+
     def test_enforcement_invalid_local_token_stops_before_network(self) -> None:
         with owner_controlled_temp_root() as temp_root:
             trusted_gh = temp_root / "trusted-gh"
