@@ -142,12 +142,15 @@ descriptor is available it returns without risking a blocking diagnostic.
 `--encoding` accepts at most 64 ASCII letters, digits, dots, underscores, plus
 signs, or hyphens and must resolve through Python's codec registry.
 
-The helper opens the archive once, records the initially accepted file size,
-and holds that file descriptor through member selection and reading. Its
-reader exposes that initial size as the only EOF and rejects later file-size
-growth or shrinkage before seeks and reads. This protects archive object identity
-against path replacement and preserves the accepted extent, but it does not
-freeze same-size content changes to the underlying object.
+The helper opens the source archive once and copies at most the accepted
+256 MiB extent into an owner-private, descriptor-only temporary snapshot. It
+then revalidates the source descriptor's identity, access policy, link count,
+size, and complete SHA-256 content before any parser consumes the snapshot.
+The reader exposes the snapshot's initial size as the only EOF and revalidates
+its metadata and complete digest before success. This freezes the exact bytes
+used by member selection and reading: source-path replacement, growth,
+shrinkage, and same-inode/same-size rewrites after binding cannot change the
+parser's view.
 
 Before constructing Python `ZipInfo` objects, it reads EOCD/ZIP64 metadata and
 sequentially counts bounded central-directory records from that same descriptor.

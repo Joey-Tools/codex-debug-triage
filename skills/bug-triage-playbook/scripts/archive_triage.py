@@ -9,6 +9,7 @@ import codecs
 import collections
 import contextlib
 import errno
+import hashlib
 import io
 import json
 import os
@@ -20,6 +21,7 @@ import stat
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import unicodedata
@@ -105,6 +107,7 @@ ZIP64_EXTRA_FIELD_ID = 0x0001
 UINT32_MAX = 0xFFFFFFFF
 UINT64_MAX = 0xFFFFFFFFFFFFFFFF
 DEFLATE_INPUT_CHUNK_BYTES = 64 * 1024
+ARCHIVE_DIGEST_CHUNK_BYTES = 1024 * 1024
 DEFAULT_MAX_REGEX_PATTERN_CHARS = 4 * 1024
 DEFAULT_REGEX_WORKER_START_TIMEOUT_SECONDS = 1.0
 DEFAULT_REGEX_MATCH_TIMEOUT_SECONDS = 0.25
@@ -594,32 +597,139 @@ class MemberPayloadLayout:
     uses_zip64_descriptor: bool
 
 
+@dataclass(frozen=True)
+class ArchiveFileBinding:
+    device: int
+    inode: int
+    uid: int
+    gid: int
+    mode: int
+    link_count: int
+    size: int
+    sha256: bytes
+
+
+def _archive_metadata_binding(metadata: os.stat_result) -> tuple[int, ...]:
+    """Bind object identity, access policy, alias policy, and accepted extent."""
+
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_uid,
+        metadata.st_gid,
+        stat.S_IMODE(metadata.st_mode),
+        metadata.st_nlink,
+        metadata.st_size,
+    )
+
+
+def _digest_archive_fd(
+    fd: int,
+    archive_size: int,
+    deadline: ArchiveCommandDeadline,
+    *,
+    phase: str,
+) -> bytes:
+    digest = hashlib.sha256()
+    offset = 0
+    while offset < archive_size:
+        deadline.check(phase)
+        chunk = os.pread(
+            fd,
+            min(ARCHIVE_DIGEST_CHUNK_BYTES, archive_size - offset),
+            offset,
+        )
+        deadline.check(phase)
+        if not chunk:
+            raise zipfile.BadZipFile(
+                "archive content became unreadable during stability validation"
+            )
+        digest.update(chunk)
+        offset += len(chunk)
+    return digest.digest()
+
+
+def _copy_archive_snapshot(
+    source_fd: int,
+    snapshot_fd: int,
+    archive_size: int,
+    deadline: ArchiveCommandDeadline,
+) -> bytes:
+    """Copy one bounded source view into a private descriptor-only snapshot."""
+
+    digest = hashlib.sha256()
+    source_offset = 0
+    while source_offset < archive_size:
+        deadline.check("archive snapshot copy")
+        chunk = os.pread(
+            source_fd,
+            min(ARCHIVE_DIGEST_CHUNK_BYTES, archive_size - source_offset),
+            source_offset,
+        )
+        deadline.check("archive snapshot copy")
+        if not chunk:
+            raise zipfile.BadZipFile(
+                "archive content became unreadable during snapshot binding"
+            )
+        digest.update(chunk)
+        view = memoryview(chunk)
+        while view:
+            deadline.check("archive snapshot write")
+            written = os.write(snapshot_fd, view)
+            deadline.check("archive snapshot write")
+            if written <= 0:
+                raise OSError("archive snapshot write made no progress")
+            view = view[written:]
+        source_offset += len(chunk)
+    os.lseek(snapshot_fd, 0, os.SEEK_SET)
+    return digest.digest()
+
+
 class PinnedArchiveReader(io.RawIOBase):
-    """Expose the initially accepted archive extent as an immutable EOF."""
+    """Expose one private descriptor-only archive snapshot as an immutable EOF."""
 
     def __init__(
         self,
         raw_stream: io.FileIO,
-        archive_size: int,
+        binding: ArchiveFileBinding,
         deadline: ArchiveCommandDeadline,
     ) -> None:
         super().__init__()
         self._raw_stream = raw_stream
-        self.archive_size = archive_size
+        self._binding = binding
+        self.archive_size = binding.size
         self._deadline = deadline
 
-    def _validate_size(self) -> None:
+    def _validate_metadata(self) -> None:
         self._deadline.check("archive metadata validation")
-        current_size = os.fstat(self._raw_stream.fileno()).st_size
+        current = os.fstat(self._raw_stream.fileno())
         self._deadline.check("archive metadata validation")
-        if current_size != self.archive_size:
+        expected = (
+            self._binding.device,
+            self._binding.inode,
+            self._binding.uid,
+            self._binding.gid,
+            self._binding.mode,
+            self._binding.link_count,
+            self._binding.size,
+        )
+        observed = _archive_metadata_binding(current)
+        if observed != expected:
             raise zipfile.BadZipFile(
-                "archive size changed after open: "
-                f"initial={self.archive_size}; current={current_size}"
+                "archive identity, access policy, link count, or size changed after open"
             )
 
     def validate_unchanged(self) -> None:
-        self._validate_size()
+        self._validate_metadata()
+        observed_digest = _digest_archive_fd(
+            self._raw_stream.fileno(),
+            self.archive_size,
+            self._deadline,
+            phase="archive final content validation",
+        )
+        self._validate_metadata()
+        if observed_digest != self._binding.sha256:
+            raise zipfile.BadZipFile("archive content changed after open")
 
     def check_deadline(self, phase: str) -> None:
         self._deadline.check(phase)
@@ -638,7 +748,7 @@ class PinnedArchiveReader(io.RawIOBase):
 
     def seek(self, offset: int, whence: int = os.SEEK_SET) -> int:
         self._deadline.check("archive seek")
-        self._validate_size()
+        self._validate_metadata()
         if whence == os.SEEK_SET:
             target = offset
         elif whence == os.SEEK_CUR:
@@ -655,7 +765,7 @@ class PinnedArchiveReader(io.RawIOBase):
 
     def readinto(self, buffer: object) -> int | None:
         self._deadline.check("archive read")
-        self._validate_size()
+        self._validate_metadata()
         position = self.tell()
         if position < 0 or position > self.archive_size:
             raise zipfile.BadZipFile(
@@ -1695,6 +1805,7 @@ def _open_pinned_archive(
     flags |= getattr(os, "O_CLOEXEC", 0)
     flags |= getattr(os, "O_NONBLOCK", 0)
     fd = os.open(path, flags)
+    snapshot_stream: io.FileIO | None = None
     try:
         command_deadline.check("archive open")
         metadata = os.fstat(fd)
@@ -1706,21 +1817,66 @@ def _open_pinned_archive(
                 "archive file exceeds max bytes: "
                 f"{metadata.st_size} > {max_archive_bytes}"
             )
-        raw_stream = os.fdopen(
-            fd,
-            "rb",
+        snapshot_stream = tempfile.TemporaryFile(
+            mode="w+b",
             buffering=0,
-            closefd=True,
+            prefix="cisco-archive-snapshot-",
         )
-        fd = -1
-        stream = PinnedArchiveReader(
-            raw_stream,
+        snapshot_digest = _copy_archive_snapshot(
+            fd,
+            snapshot_stream.fileno(),
             metadata.st_size,
             command_deadline,
         )
+        metadata_after_copy = os.fstat(fd)
+        source_digest = _digest_archive_fd(
+            fd,
+            metadata.st_size,
+            command_deadline,
+            phase="archive source content revalidation",
+        )
+        metadata_after_digest = os.fstat(fd)
+        if (
+            _archive_metadata_binding(metadata_after_copy)
+            != _archive_metadata_binding(metadata)
+            or _archive_metadata_binding(metadata_after_digest)
+            != _archive_metadata_binding(metadata)
+            or source_digest != snapshot_digest
+        ):
+            raise zipfile.BadZipFile("archive changed during snapshot binding")
+        snapshot_metadata = os.fstat(snapshot_stream.fileno())
+        snapshot_mode = stat.S_IMODE(snapshot_metadata.st_mode)
+        if (
+            not stat.S_ISREG(snapshot_metadata.st_mode)
+            or snapshot_metadata.st_uid != os.geteuid()
+            or snapshot_mode & 0o077
+            or snapshot_metadata.st_nlink > 1
+            or snapshot_metadata.st_size != metadata.st_size
+        ):
+            raise OSError("archive snapshot access policy is unsafe")
+        binding = ArchiveFileBinding(
+            device=snapshot_metadata.st_dev,
+            inode=snapshot_metadata.st_ino,
+            uid=snapshot_metadata.st_uid,
+            gid=snapshot_metadata.st_gid,
+            mode=snapshot_mode,
+            link_count=snapshot_metadata.st_nlink,
+            size=snapshot_metadata.st_size,
+            sha256=snapshot_digest,
+        )
+        os.close(fd)
+        fd = -1
+        stream = PinnedArchiveReader(
+            snapshot_stream,
+            binding,
+            command_deadline,
+        )
+        snapshot_stream = None
         with stream:
             yield stream
     finally:
+        if snapshot_stream is not None:
+            snapshot_stream.close()
         if fd >= 0:
             os.close(fd)
 

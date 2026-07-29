@@ -4866,14 +4866,20 @@ def _collect_pages(
     parameters: dict[str, object],
     item_key: Optional[str],
     result_cap: Optional[int] = None,
+    per_page: int = API_PER_PAGE,
 ) -> list[Any]:
+    if type(per_page) is not int or per_page < 1 or per_page > API_PER_PAGE:
+        raise _blocked(
+            "invalid-api-endpoint",
+            f"{label} page size is outside the collector bounds",
+        )
     items: list[Any] = []
     reported_total: Optional[int] = None
     last_nonempty_page = 0
     terminal_page = 0
     for page in range(1, MAX_API_PAGES + 1):
         page_parameters = dict(parameters)
-        page_parameters.update({"page": page, "per_page": API_PER_PAGE})
+        page_parameters.update({"page": page, "per_page": per_page})
         response = client.get_json(endpoint, page_parameters)
         if item_key is None:
             page_items = _exact_list(response, label=f"{label} page")
@@ -4895,7 +4901,7 @@ def _collect_pages(
                     "api-pagination-incomplete",
                     f"{label} total changed during pagination",
                 )
-        if len(page_items) > API_PER_PAGE:
+        if len(page_items) > per_page:
             raise _blocked(
                 "api-pagination-incomplete",
                 f"{label} page exceeds the requested page size",
@@ -4928,7 +4934,7 @@ def _collect_pages(
             "label": label,
             "last_nonempty_page": last_nonempty_page,
             "parameters": _json_copy(parameters, label=f"{label} parameters"),
-            "per_page": API_PER_PAGE,
+            "per_page": per_page,
             "phase": phase,
             "reported_total_count": reported_total,
             "terminal_empty_page": terminal_page,
@@ -5681,6 +5687,7 @@ def _collect_snapshot(
         endpoint=f"/repos/{target_name}/actions/variables",
         parameters={},
         item_key="variables",
+        per_page=30,
     )
     cutover_input_variables = _select_cutover_input_variables(
         variable_values,

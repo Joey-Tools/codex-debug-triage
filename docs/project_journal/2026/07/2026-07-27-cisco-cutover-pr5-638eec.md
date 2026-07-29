@@ -31,6 +31,8 @@ superseded_by:
 - Snapshot identity and access policy remain per-use checks. Exact content receipts are reused only while descriptor/path size, `mtime_ns`, and `ctime_ns` generations stay unchanged; generation drift forces bounded digest revalidation, avoiding 4,096 repeated full executable/config reads without allowing source or snapshot drift.
 - Preflight revalidation, child execution, postflight revalidation, and JSON parsing share one monotonic absolute collection deadline. Remaining child time is recomputed after preflight, and exhausted revalidation budget cannot reach `Popen`.
 - ZIP reread admission binds `ZipInfo` back to the preflight central-directory name, flags, extract version, compression method, CRC, compressed/uncompressed sizes, and local-header offset, so an equal-length central-directory rewrite cannot redirect later inspection.
+- Actions Variables pagination uses the endpoint's documented 30-item ceiling rather than the generic 100-item GitHub page size, and receipts record the effective bound for every page.
+- Archive inspection copies the bounded source into an owner-private descriptor-only snapshot, revalidates complete source content and access policy before parsing, and uses only that immutable snapshot afterward. Same-inode/same-size source rewrites can no longer change the parser's view.
 
 ## Next Steps
 
@@ -47,6 +49,7 @@ superseded_by:
 - Python 3.13.0 full suite: 238 tests passed.
 - System Python 3.9.6 full suite: 238 tests passed.
 - Fresh-review repair suite on Python 3.13.0: 245 tests passed, including fixed-transport redirect refusal, authentication-preflight failure classification, post-child signal injection, and equal-length ZIP metadata rewrites.
+- Current GitHub-finding repair suite on Python 3.13.0 and system Python 3.9.6: 248 tests passed, including endpoint-specific Actions Variables pagination, same-size source rewrite rejection during snapshot binding, and stable snapshot consumption after source mutation.
 - Python 3.13.0 and system Python 3.9.6 compilation passed for all CI-listed helpers and tests.
 - Ruff passed for all CI-listed Python helpers and tests.
 - The installed OpenAI skill validator passed for `bug-triage-playbook`.

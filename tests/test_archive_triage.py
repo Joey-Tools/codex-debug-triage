@@ -921,7 +921,7 @@ class ArchiveTriageTests(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertIn("central directory exceeds max bytes", stderr.getvalue())
 
-    def test_zipfile_reread_rejects_same_size_central_directory_rewrite(
+    def test_zipfile_reread_uses_snapshot_after_source_central_directory_rewrite(
         self,
     ) -> None:
         cases = (
@@ -981,12 +981,123 @@ class ArchiveTriageTests(unittest.TestCase):
 
                 self.assertEqual(constructor_calls, 1)
                 self.assertEqual(archive_path.stat().st_size, original_size)
-                self.assertEqual(rc, 1)
-                self.assertEqual(stdout.getvalue(), "")
-                self.assertIn(
-                    f"ZipInfo and preflight central-directory {field} differ",
-                    stderr.getvalue(),
+                self.assertEqual(rc, 0, field)
+                self.assertIn("logs/console.txt", stdout.getvalue())
+                self.assertEqual(stderr.getvalue(), "")
+
+    def test_pinned_snapshot_ignores_same_size_source_rewrite_after_binding(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            archive_path = self._make_archive(Path(temp_dir))
+            with zipfile.ZipFile(archive_path) as archive:
+                info = archive.infolist()[0]
+            archive_data = archive_path.read_bytes()
+            name_length, extra_length = struct.unpack_from(
+                "<HH",
+                archive_data,
+                info.header_offset + 26,
+            )
+            data_offset = (
+                info.header_offset
+                + MODULE.LOCAL_FILE_HEADER_SIZE
+                + name_length
+                + extra_length
+            )
+            original_size = len(archive_data)
+            with MODULE._open_pinned_archive(
+                archive_path,
+                MODULE.DEFAULT_MAX_ARCHIVE_BYTES,
+            ) as archive_stream:
+                with archive_path.open("r+b") as stream:
+                    stream.seek(data_offset)
+                    original = stream.read(1)
+                    self.assertEqual(len(original), 1)
+                    stream.seek(data_offset)
+                    stream.write(bytes([original[0] ^ 0xFF]))
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                archive_stream.seek(0)
+                self.assertEqual(archive_stream.read(), archive_data)
+                archive_stream.validate_unchanged()
+            final_size = archive_path.stat().st_size
+            rewritten_data = archive_path.read_bytes()
+
+        self.assertEqual(final_size, original_size)
+        self.assertNotEqual(rewritten_data, archive_data)
+
+    def test_snapshot_binding_rejects_same_size_source_rewrite(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            archive_path = self._make_archive(Path(temp_dir))
+            original_size = archive_path.stat().st_size
+            real_copy = MODULE._copy_archive_snapshot
+
+            def copy_then_rewrite(
+                source_fd: int,
+                snapshot_fd: int,
+                archive_size: int,
+                deadline: MODULE.ArchiveCommandDeadline,
+            ) -> bytes:
+                digest = real_copy(
+                    source_fd,
+                    snapshot_fd,
+                    archive_size,
+                    deadline,
                 )
+                with archive_path.open("r+b") as stream:
+                    original = stream.read(1)
+                    self.assertEqual(len(original), 1)
+                    stream.seek(0)
+                    stream.write(bytes([original[0] ^ 0xFF]))
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                return digest
+
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with mock.patch.object(
+                MODULE,
+                "_copy_archive_snapshot",
+                side_effect=copy_then_rewrite,
+            ):
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    rc = MODULE.cmd_zip_list(self._list_args(archive_path))
+            final_size = archive_path.stat().st_size
+
+        self.assertEqual(final_size, original_size)
+        self.assertEqual(rc, 1)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("archive changed during snapshot binding", stderr.getvalue())
+
+    def test_final_validation_allows_timestamp_only_churn(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            archive_path = self._make_archive(Path(temp_dir))
+            original_validate = MODULE.PinnedArchiveReader.validate_unchanged
+
+            def touch_then_validate(
+                archive_stream: MODULE.PinnedArchiveReader,
+            ) -> None:
+                current = archive_path.stat()
+                os.utime(
+                    archive_path,
+                    ns=(current.st_atime_ns, current.st_mtime_ns + 1_000_000),
+                )
+                original_validate(archive_stream)
+
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with mock.patch.object(
+                MODULE.PinnedArchiveReader,
+                "validate_unchanged",
+                autospec=True,
+                side_effect=touch_then_validate,
+            ):
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    rc = MODULE.cmd_zip_list(self._list_args(archive_path))
+
+        self.assertEqual(rc, 0)
+        self.assertNotEqual(stdout.getvalue(), "")
+        self.assertEqual(stderr.getvalue(), "")
 
     def test_zip_preflight_rejects_eocd_signature_in_comment(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1806,35 +1917,43 @@ class ArchiveTriageTests(unittest.TestCase):
                     rc = MODULE.cmd_zip_show(args)
 
         self.assertEqual(rc, 0)
-        open_call.assert_called_once()
+        source_open_calls = [
+            call
+            for call in open_call.call_args_list
+            if call.args and call.args[0] == archive_path
+        ]
+        self.assertEqual(len(source_open_calls), 1)
 
-    def test_archive_growth_after_initial_fstat_is_rejected(self) -> None:
+    def test_archive_growth_during_snapshot_binding_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             archive_path = self._make_archive(Path(temp_dir))
-            real_fstat = os.fstat
-            fstat_calls = 0
+            real_copy = MODULE._copy_archive_snapshot
 
-            def grow_after_initial_fstat(fd: int) -> os.stat_result:
-                nonlocal fstat_calls
-                fstat_calls += 1
-                if fstat_calls == 2:
-                    growth_fd = os.open(
-                        archive_path,
-                        os.O_WRONLY | os.O_APPEND,
-                    )
-                    try:
-                        os.write(growth_fd, b"concurrent-growth")
-                    finally:
-                        os.close(growth_fd)
-                return real_fstat(fd)
+            def copy_then_grow(
+                source_fd: int,
+                snapshot_fd: int,
+                archive_size: int,
+                deadline: MODULE.ArchiveCommandDeadline,
+            ) -> bytes:
+                digest = real_copy(
+                    source_fd,
+                    snapshot_fd,
+                    archive_size,
+                    deadline,
+                )
+                with archive_path.open("ab") as stream:
+                    stream.write(b"concurrent-growth")
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                return digest
 
             stdout = io.StringIO()
             stderr = io.StringIO()
             real_zipfile = zipfile.ZipFile
             with mock.patch.object(
-                MODULE.os,
-                "fstat",
-                side_effect=grow_after_initial_fstat,
+                MODULE,
+                "_copy_archive_snapshot",
+                side_effect=copy_then_grow,
             ):
                 with mock.patch.object(
                     MODULE.zipfile,
@@ -1846,9 +1965,11 @@ class ArchiveTriageTests(unittest.TestCase):
 
         self.assertEqual(rc, 1)
         constructor.assert_not_called()
-        self.assertGreaterEqual(fstat_calls, 2)
         self.assertEqual(stdout.getvalue(), "")
-        self.assertIn("archive size changed after open", stderr.getvalue())
+        self.assertIn(
+            "archive changed during snapshot binding",
+            stderr.getvalue(),
+        )
 
     def test_pinned_archive_reader_enforces_initial_eof(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -5795,7 +5916,9 @@ class BugTriageDocumentationTests(unittest.TestCase):
         self.assertIn("FIFO, socket, or terminal descriptor", recipe)
         self.assertIn("monotonic 100-millisecond poll budget", recipe)
         self.assertIn("descriptor blocking state", recipe)
-        self.assertIn("protects archive object identity", recipe)
+        self.assertIn("owner-private, descriptor-only temporary snapshot", recipe)
+        self.assertIn("complete SHA-256 content", recipe)
+        self.assertIn("same-inode/same-size rewrites", recipe)
         self.assertIn("Before constructing Python `ZipInfo` objects", recipe)
         self.assertIn("binds each central record to\none matching local record", recipe)
         self.assertIn("without gaps or unreferenced\nrecords", recipe)
@@ -6743,6 +6866,19 @@ class BugTriageDocumentationTests(unittest.TestCase):
         )
         self.assertTrue(all(value["item_count"] == 12 for value in bounds))
         self.assertTrue(all(value["terminal_empty_page"] == 3 for value in bounds))
+        self.assertTrue(all(value["per_page"] == 30 for value in bounds))
+        variable_calls = [
+            parameters
+            for endpoint, parameters in client.calls
+            if endpoint == variable_endpoint
+        ]
+        self.assertEqual(
+            [parameters["page"] for parameters in variable_calls],
+            [1, 2, 3, 1, 2, 3],
+        )
+        self.assertTrue(
+            all(parameters["per_page"] == 30 for parameters in variable_calls)
+        )
 
     def test_enforcement_live_collector_rejects_missing_or_duplicate_variables(
         self,
