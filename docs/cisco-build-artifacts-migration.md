@@ -443,6 +443,12 @@ therefore only a rehash signal, while replacement, access-policy expansion, or
 content mutation still returns `collector-inconclusive` and discards command
 output. The 16,384-call ceiling cannot amplify unchanged executable/config
 hashing into 16,384 full reads.
+Before the executable snapshot's first generation receipt is registered, its
+read-only descriptor is hashed between matching pre/post descriptor identity,
+path identity, access-policy, and content-generation checks. The retained
+digest must equal both the copied source digest and the administrator-pinned
+digest, so an initialization-window same-inode, same-size rewrite is rejected
+even if owner permissions are restored.
 The same process:
 
 - resolves the active token locally when needed, then reads `/user` through
@@ -504,8 +510,12 @@ HTTP status, and a stable reason code. `401` maps to
 ruleset `admin:org` failure) maps to `blocked-permission`; `404` maps to
 `not-found`; `429` and explicit rate-limit `403` map to `rate-limited`; `5xx`
 and malformed responses map to `api-unavailable`; and bounded command expiry
-maps to `api-timeout`. Response bodies, raw headers, command environments,
-tokens, and raw subprocess stderr are never copied into the doctor receipt.
+maps to `api-timeout`. Fixed curl exit 28 also maps to `api-timeout` when
+curl's own connect or operation timer expires before the outer process
+supervisor; other nonzero curl exits retain their prior meanings. A nonzero
+local `gh auth token` result, including exit 28, remains an authentication
+preflight failure. Response bodies, raw headers, command environments, tokens,
+and raw subprocess stderr are never copied into the doctor receipt.
 
 The termination boundary starts before the first source credential read and
 remains one client-lifecycle transaction until verified deletion.

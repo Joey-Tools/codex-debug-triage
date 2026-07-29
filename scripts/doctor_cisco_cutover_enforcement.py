@@ -66,6 +66,7 @@ GH_EXECUTABLE_ENVIRONMENT_PROFILE = "minimal-snapshotted-auth-v3"
 GH_EXECUTION_SOURCE = "owner-private-snapshot"
 GH_RUNTIME_COMPONENTS = (".codex", "cisco-cutover-doctor")
 CURL_EXECUTABLE = pathlib.Path("/usr/bin/curl")
+CURL_OPERATION_TIMED_OUT_EXIT_CODE = 28
 CURL_WRITE_OUT_FORMAT = (
     "\nCISCO_STATUS=%{http_code}\nCISCO_RATE=%header{x-ratelimit-remaining}\n"
 )
@@ -1218,6 +1219,7 @@ def _http_status_from_stderr(stderr: bytes) -> Optional[int]:
 def _api_request_error(
     *,
     endpoint_class: str,
+    return_code: int,
     stderr: bytes,
     authentication_preflight: bool,
 ) -> EnforcementDoctorError:
@@ -1233,7 +1235,11 @@ def _api_request_error(
             ),
         )
     lowered = stderr.lower()
-    if status == 401:
+    if return_code == CURL_OPERATION_TIMED_OUT_EXIT_CODE:
+        reason_code = "api-timeout"
+        reason = "GitHub API transport timed out"
+        failure_kind = "timeout"
+    elif status == 401:
         reason_code = "blocked-authentication"
         reason = "GitHub API authentication was rejected"
         failure_kind = "authentication"
@@ -3569,15 +3575,19 @@ class GitHubApiClient:
                 follow_symlinks=False,
             )
             snapshot_access_policy = _stable_fd_access_policy_binding(snapshot_write_fd)
+            snapshot_generation = _file_content_generation(snapshot_status)
+            snapshot_path_generation = _file_content_generation(snapshot_path_status)
             _check_deadline(deadline_check)
             if (
                 not stat.S_ISREG(snapshot_status.st_mode)
+                or not stat.S_ISREG(snapshot_path_status.st_mode)
                 or snapshot_status.st_size != copied
                 or snapshot_status.st_uid != os.geteuid()
                 or snapshot_status.st_nlink != 1
                 or stat.S_IMODE(snapshot_status.st_mode) != 0o500
                 or _file_status(snapshot_status) != _file_status(snapshot_path_status)
                 or snapshot_access_policy != initial_snapshot_access_policy
+                or snapshot_generation != snapshot_path_generation
             ):
                 raise _blocked(
                     "collector-unavailable",
@@ -3592,27 +3602,92 @@ class GitHubApiClient:
                 | getattr(os, "O_CLOEXEC", 0),
                 dir_fd=self._executable_snapshot_directory.fd,
             )
-            pinned_status = os.fstat(self._snapshot_fd)
-            pinned_access_policy = _stable_fd_access_policy_binding(self._snapshot_fd)
+            pinned_status_before = os.fstat(self._snapshot_fd)
+            pinned_path_status_before = os.stat(
+                "gh",
+                dir_fd=self._executable_snapshot_directory.fd,
+                follow_symlinks=False,
+            )
+            pinned_access_policy_before = _stable_fd_access_policy_binding(
+                self._snapshot_fd
+            )
+            pinned_generation_before = _file_content_generation(
+                pinned_status_before
+            )
+            pinned_path_generation_before = _file_content_generation(
+                pinned_path_status_before
+            )
             _check_deadline(deadline_check)
-            if pinned_access_policy != snapshot_access_policy:
+            # Bind a stable executable byte sequence on the same owner-private
+            # regular-file object and access policy before trusting its digest.
+            if (
+                not stat.S_ISREG(pinned_status_before.st_mode)
+                or not stat.S_ISREG(pinned_path_status_before.st_mode)
+                or _file_status(pinned_status_before) != _file_status(snapshot_status)
+                or _file_status(pinned_path_status_before)
+                != _file_status(snapshot_status)
+                or pinned_access_policy_before != snapshot_access_policy
+                or pinned_generation_before != snapshot_generation
+                or pinned_path_generation_before != snapshot_generation
+            ):
                 raise _blocked(
                     "collector-unavailable",
-                    "GitHub CLI snapshot ACL policy changed while it was pinned",
+                    "GitHub CLI snapshot changed before its digest was verified",
+                )
+            snapshot_sha256, snapshot_retained = _sha256_fd_bounded(
+                self._snapshot_fd,
+                deadline_check=deadline_check,
+            )
+            pinned_status_after = os.fstat(self._snapshot_fd)
+            pinned_path_status_after = os.stat(
+                "gh",
+                dir_fd=self._executable_snapshot_directory.fd,
+                follow_symlinks=False,
+            )
+            pinned_access_policy_after = _stable_fd_access_policy_binding(
+                self._snapshot_fd
+            )
+            pinned_generation_after = _file_content_generation(pinned_status_after)
+            pinned_path_generation_after = _file_content_generation(
+                pinned_path_status_after
+            )
+            _check_deadline(deadline_check)
+            if (
+                not stat.S_ISREG(pinned_status_after.st_mode)
+                or not stat.S_ISREG(pinned_path_status_after.st_mode)
+                or _file_status(pinned_status_after) != _file_status(snapshot_status)
+                or _file_status(pinned_path_status_after)
+                != _file_status(snapshot_status)
+                or pinned_access_policy_after != snapshot_access_policy
+                or pinned_generation_after != snapshot_generation
+                or pinned_path_generation_after != snapshot_generation
+                or snapshot_retained != copied
+            ):
+                raise _blocked(
+                    "collector-unavailable",
+                    "GitHub CLI snapshot changed while its digest was verified",
+                )
+            if (
+                snapshot_sha256 != actual_sha256
+                or snapshot_sha256 != expected_gh_sha256
+            ):
+                raise _blocked(
+                    "collector-digest-mismatch",
+                    "GitHub CLI snapshot SHA-256 differs from the expected digest",
                 )
             self._snapshot_path = snapshot_path
             self._snapshot_binding = {
-                "device": pinned_status.st_dev,
-                "gid": pinned_status.st_gid,
-                "inode": pinned_status.st_ino,
-                "links": pinned_status.st_nlink,
-                "mode": stat.S_IMODE(pinned_status.st_mode),
-                "sha256": actual_sha256,
-                "size": pinned_status.st_size,
-                "uid": pinned_status.st_uid,
+                "device": pinned_status_after.st_dev,
+                "gid": pinned_status_after.st_gid,
+                "inode": pinned_status_after.st_ino,
+                "links": pinned_status_after.st_nlink,
+                "mode": stat.S_IMODE(pinned_status_after.st_mode),
+                "sha256": snapshot_sha256,
+                "size": pinned_status_after.st_size,
+                "uid": pinned_status_after.st_uid,
             }
-            self._snapshot_access_policy_binding = pinned_access_policy
-            self._snapshot_content_generation = _file_content_generation(pinned_status)
+            self._snapshot_access_policy_binding = pinned_access_policy_after
+            self._snapshot_content_generation = pinned_generation_after
             self.executable = os.fspath(snapshot_path)
             self._source_fd = source_fd
             source_fd = None
@@ -4770,6 +4845,7 @@ class GitHubApiClient:
             if return_code != 0:
                 raise _api_request_error(
                     endpoint_class=endpoint_class,
+                    return_code=return_code,
                     stderr=stderr,
                     authentication_preflight=authentication_preflight,
                 )

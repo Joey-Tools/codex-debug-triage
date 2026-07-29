@@ -7925,6 +7925,79 @@ class BugTriageDocumentationTests(unittest.TestCase):
                         f"{SYNTHETIC_ACCESS_TOKEN}\n".encode("ascii"),
                     )
 
+    def test_enforcement_gh_pin_rejects_same_object_snapshot_rewrite(
+        self,
+    ) -> None:
+        with owner_controlled_temp_root() as temp_root:
+            trusted_gh = temp_root / "trusted-gh"
+            trusted_payload = b"#!/bin/sh\nexit 0\n"
+            changed_payload = b"#!/bin/sh\nexit 9\n"
+            self.assertEqual(len(changed_payload), len(trusted_payload))
+            trusted_gh.write_bytes(trusted_payload)
+            trusted_gh.chmod(0o700)
+            config_dir, runtime_parent = self._make_private_gh_config(temp_root)
+            real_sha256_fd_bounded = ENFORCEMENT_MODULE._sha256_fd_bounded
+            exercised = False
+
+            def rewrite_snapshot_before_readback(
+                fd: int,
+                *,
+                deadline_check: object = None,
+            ) -> tuple[str, int]:
+                nonlocal exercised
+                self.assertFalse(exercised)
+                snapshot_path = ENFORCEMENT_MODULE._verified_descriptor_path(fd)
+                self.assertIsNotNone(snapshot_path)
+                assert snapshot_path is not None
+                before = os.fstat(fd)
+                self.assertEqual(stat.S_IMODE(before.st_mode), 0o500)
+                snapshot_path.chmod(0o700)
+                try:
+                    with snapshot_path.open("r+b") as snapshot_file:
+                        snapshot_file.write(changed_payload)
+                        snapshot_file.flush()
+                        os.fsync(snapshot_file.fileno())
+                finally:
+                    snapshot_path.chmod(0o500)
+                after = os.fstat(fd)
+                self.assertEqual(
+                    (after.st_dev, after.st_ino),
+                    (before.st_dev, before.st_ino),
+                )
+                self.assertEqual(after.st_size, before.st_size)
+                self.assertEqual(stat.S_IMODE(after.st_mode), 0o500)
+                exercised = True
+                return real_sha256_fd_bounded(
+                    fd,
+                    deadline_check=deadline_check,
+                )
+
+            with (
+                mock.patch.object(
+                    ENFORCEMENT_MODULE,
+                    "_sha256_fd_bounded",
+                    side_effect=rewrite_snapshot_before_readback,
+                ),
+                mock.patch.object(
+                    ENFORCEMENT_MODULE,
+                    "_bounded_subprocess",
+                ) as spawned,
+                self.assertRaises(
+                    ENFORCEMENT_MODULE.EnforcementDoctorError
+                ) as raised,
+            ):
+                ENFORCEMENT_MODULE.GitHubApiClient(
+                    trusted_gh,
+                    hashlib.sha256(trusted_payload).hexdigest(),
+                    config_dir,
+                    runtime_parent=runtime_parent,
+                )
+
+            self.assertTrue(exercised)
+            self.assertEqual(raised.exception.reason_code, "collector-unavailable")
+            self.assertEqual(list(runtime_parent.glob("run-*")), [])
+            spawned.assert_not_called()
+
     def test_enforcement_initialization_deadline_precedes_default_path_read(
         self,
     ) -> None:
@@ -11721,7 +11794,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
                         ENFORCEMENT_MODULE,
                         "_bounded_subprocess",
                         return_value=(
-                            1,
+                            ENFORCEMENT_MODULE.CURL_OPERATION_TIMED_OUT_EXIT_CODE,
                             f"{SYNTHETIC_ACCESS_TOKEN}\n".encode("ascii"),
                             (
                                 f"credential lookup failed: {SYNTHETIC_ACCESS_TOKEN}"
@@ -11759,6 +11832,15 @@ class BugTriageDocumentationTests(unittest.TestCase):
         self,
     ) -> None:
         cases = (
+            (
+                "curl-timeout",
+                ENFORCEMENT_MODULE.CURL_OPERATION_TIMED_OUT_EXIT_CODE,
+                None,
+                "",
+                "api-timeout",
+                "timeout",
+                None,
+            ),
             (
                 "curl-failure",
                 1,
