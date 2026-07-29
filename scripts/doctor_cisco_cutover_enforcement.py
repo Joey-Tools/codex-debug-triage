@@ -2583,6 +2583,9 @@ def _create_private_child_directory(
     created = False
     child_fd: int | None = None
     created_identity: tuple[int, int] | None = None
+    created_binding: dict[str, int] | None = None
+    created_access_policy: tuple[str, int, str] | None = None
+    bound_child: _BoundDirectory | None = None
     try:
         _check_deadline(deadline_check)
         os.mkdir(name, 0o700, dir_fd=parent.fd)
@@ -2636,12 +2639,54 @@ def _create_private_child_directory(
                 "collector-unavailable",
                 f"{label} access policy could not be fixed",
             )
+        created_binding = _directory_status(descriptor)
+        created_access_policy = final_access_policy
+        parent.revalidate(deadline_check=deadline_check)
+        try:
+            bound_child = _BoundDirectory(
+                parent.path / name,
+                label=label,
+                deadline_check=deadline_check,
+            )
+            retained_descriptor = os.fstat(child_fd)
+            rebound_descriptor = os.fstat(bound_child.fd)
+            rebound_path = os.stat(
+                name,
+                dir_fd=parent.fd,
+                follow_symlinks=False,
+            )
+            retained_access_policy = _stable_fd_access_policy_binding(child_fd)
+            rebound_access_policy = _stable_fd_access_policy_binding(bound_child.fd)
+            _check_deadline(deadline_check)
+        except EnforcementDoctorError:
+            raise
+        except OSError as error:
+            raise _blocked(
+                "collector-inconclusive",
+                f"{label} rebound object could not be revalidated",
+            ) from error
+        if (
+            _directory_status(retained_descriptor) != created_binding
+            or _directory_status(rebound_descriptor) != created_binding
+            or _directory_status(rebound_path) != created_binding
+            or retained_access_policy != created_access_policy
+            or rebound_access_policy != created_access_policy
+        ):
+            raise _blocked(
+                "collector-inconclusive",
+                f"{label} object identity or access policy changed while binding",
+            )
+        parent.revalidate(deadline_check=deadline_check)
+        bound_child.revalidate(deadline_check=deadline_check)
+        return bound_child
     except FileExistsError as error:
         raise _blocked(
             "collector-unavailable",
             f"{label} already exists",
         ) from error
     except BaseException as error:
+        if bound_child is not None:
+            bound_child.close()
         if created:
             try:
                 _remove_created_private_child_directory(
@@ -2676,33 +2721,6 @@ def _create_private_child_directory(
                 os.close(child_fd)
             except OSError:
                 pass
-    parent.revalidate(deadline_check=deadline_check)
-    try:
-        return _BoundDirectory(
-            parent.path / name,
-            label=label,
-            deadline_check=deadline_check,
-        )
-    except BaseException:
-        try:
-            _remove_created_private_child_directory(
-                parent,
-                name,
-                label=label,
-                expected_identity=created_identity,
-            )
-        except BaseException as cleanup_error:
-            raise _blocked(
-                "collector-inconclusive",
-                f"{label} binding failed and cleanup could not be proven",
-                cleanup_failure=_created_private_child_cleanup_failure(
-                    parent,
-                    name,
-                    label=label,
-                    expected_identity=created_identity,
-                ),
-            ) from cleanup_error
-        raise
 
 
 def _create_private_regular_file(
@@ -2724,7 +2742,7 @@ def _create_private_regular_file(
         )
     parent.revalidate(deadline_check=deadline_check)
     flags = (
-        os.O_WRONLY
+        os.O_RDWR
         | os.O_CREAT
         | os.O_EXCL
         | os.O_NOFOLLOW
@@ -2734,6 +2752,7 @@ def _create_private_regular_file(
     fd: Optional[int] = None
     cleanup_anchor: Optional[dict[str, Any]] = None
     cleanup_anchor_registered = False
+    bound_file: Optional[_BoundRegularFile] = None
     try:
         _check_deadline(deadline_check)
         fd = os.open(name, flags, mode, dir_fd=parent.fd)
@@ -2769,42 +2788,126 @@ def _create_private_regular_file(
         _check_deadline(deadline_check)
         os.fsync(fd)
         _check_deadline(deadline_check)
-        descriptor = os.fstat(fd)
-        path_status = os.stat(
+        descriptor_before = os.fstat(fd)
+        path_before = os.stat(
             name,
             dir_fd=parent.fd,
             follow_symlinks=False,
         )
         final_access_policy = _stable_fd_access_policy_binding(fd)
+        first_payload = _read_fd_payload_bounded(
+            fd,
+            label=label,
+            limit=max_bytes,
+            deadline_check=deadline_check,
+        )
+        second_payload = _read_fd_payload_bounded(
+            fd,
+            label=label,
+            limit=max_bytes,
+            deadline_check=deadline_check,
+        )
+        descriptor_after = os.fstat(fd)
+        path_after = os.stat(
+            name,
+            dir_fd=parent.fd,
+            follow_symlinks=False,
+        )
         _check_deadline(deadline_check)
         if (
-            _file_status(descriptor) != _file_status(path_status)
-            or descriptor.st_size != len(payload)
-            or stat.S_IMODE(descriptor.st_mode) != mode
+            _file_status(descriptor_before) != _file_status(path_before)
+            or _file_status(descriptor_before) != _file_status(descriptor_after)
+            or _file_status(descriptor_before) != _file_status(path_after)
+            or descriptor_before.st_size != len(payload)
+            or stat.S_IMODE(descriptor_before.st_mode) != mode
             or final_access_policy != initial_access_policy
+            or first_payload != payload
+            or second_payload != payload
         ):
             raise _blocked(
                 "collector-unavailable",
                 f"{label} could not be bound after creation",
             )
+        created_binding = _file_status(descriptor_before)
+        created_sha256 = hashlib.sha256(payload).hexdigest()
         parent.revalidate(deadline_check=deadline_check)
-        bound_file = _BoundRegularFile(
-            parent,
-            name,
-            label=label,
-            max_bytes=max_bytes,
-            deadline_check=deadline_check,
-        )
+        try:
+            bound_file = _BoundRegularFile(
+                parent,
+                name,
+                label=label,
+                max_bytes=max_bytes,
+                deadline_check=deadline_check,
+            )
+            if bound_file.fd is None:
+                raise _blocked(
+                    "collector-inconclusive",
+                    f"{label} rebound descriptor is unavailable",
+                )
+            rebound_fd = bound_file.fd
+            retained_descriptor = os.fstat(fd)
+            rebound_descriptor = os.fstat(rebound_fd)
+            rebound_path = os.stat(
+                name,
+                dir_fd=parent.fd,
+                follow_symlinks=False,
+            )
+            retained_access_policy = _stable_fd_access_policy_binding(fd)
+            rebound_access_policy = _stable_fd_access_policy_binding(rebound_fd)
+            retained_first = _read_fd_payload_bounded(
+                fd,
+                label=label,
+                limit=max_bytes,
+                deadline_check=deadline_check,
+            )
+            retained_second = _read_fd_payload_bounded(
+                fd,
+                label=label,
+                limit=max_bytes,
+                deadline_check=deadline_check,
+            )
+            _check_deadline(deadline_check)
+        except EnforcementDoctorError:
+            raise
+        except OSError as error:
+            raise _blocked(
+                "collector-inconclusive",
+                f"{label} rebound object could not be revalidated",
+            ) from error
+        if (
+            _file_status(retained_descriptor) != created_binding
+            or _file_status(rebound_descriptor) != created_binding
+            or _file_status(rebound_path) != created_binding
+            or retained_access_policy != final_access_policy
+            or rebound_access_policy != final_access_policy
+            or retained_first != payload
+            or retained_second != payload
+            or bound_file.payload != payload
+            or bound_file.sha256 != created_sha256
+        ):
+            raise _blocked(
+                "collector-inconclusive",
+                f"{label} object identity or content changed while binding",
+            )
+        bound_file.revalidate(deadline_check=deadline_check)
         cleanup_anchors.remove(cleanup_anchor)
         cleanup_anchor_registered = False
         return bound_file
     except EnforcementDoctorError:
+        if bound_file is not None:
+            bound_file.close()
         raise
     except OSError as error:
+        if bound_file is not None:
+            bound_file.close()
         raise _blocked(
             "collector-unavailable",
             f"{label} could not be created safely",
         ) from error
+    except BaseException:
+        if bound_file is not None:
+            bound_file.close()
+        raise
     finally:
         if fd is not None and not cleanup_anchor_registered:
             try:

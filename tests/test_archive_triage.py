@@ -30,7 +30,7 @@ from contextlib import (
     redirect_stdout,
 )
 from pathlib import Path
-from typing import Iterator
+from typing import Any, Iterator
 from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -6609,6 +6609,188 @@ class BugTriageDocumentationTests(unittest.TestCase):
                 self.assertTrue((parent_path / "candidate").is_dir())
                 self.assertTrue((parent_path / "retained-original").is_dir())
             finally:
+                parent.close()
+
+    def test_private_child_creation_rejects_replacement_during_rebind(
+        self,
+    ) -> None:
+        with owner_controlled_temp_root() as parent_path:
+            parent = ENFORCEMENT_MODULE._BoundDirectory(
+                parent_path,
+                label="test runtime parent",
+            )
+            original_bound_directory = ENFORCEMENT_MODULE._BoundDirectory
+
+            def replace_before_rebind(
+                path: Path,
+                **kwargs: Any,
+            ) -> object:
+                os.rename(
+                    parent_path / "candidate",
+                    parent_path / "retained-original",
+                )
+                (parent_path / "candidate").mkdir(mode=0o700)
+                return original_bound_directory(path, **kwargs)
+
+            try:
+                with mock.patch.object(
+                    ENFORCEMENT_MODULE,
+                    "_BoundDirectory",
+                    side_effect=replace_before_rebind,
+                ):
+                    with self.assertRaises(
+                        ENFORCEMENT_MODULE.EnforcementDoctorError
+                    ) as raised:
+                        ENFORCEMENT_MODULE._create_private_child_directory(
+                            parent,
+                            "candidate",
+                            label="test run directory",
+                        )
+                self.assertEqual(
+                    raised.exception.reason_code,
+                    "collector-inconclusive",
+                )
+                self.assertIn(
+                    "cleanup could not be proven",
+                    str(raised.exception),
+                )
+                self.assertTrue((parent_path / "candidate").is_dir())
+                self.assertTrue((parent_path / "retained-original").is_dir())
+                parent.revalidate()
+            finally:
+                parent.close()
+
+    def test_private_file_creation_rejects_replacement_during_rebind(
+        self,
+    ) -> None:
+        payload = b"safe-token\n"
+        with owner_controlled_temp_root() as parent_path:
+            parent = ENFORCEMENT_MODULE._BoundDirectory(
+                parent_path,
+                label="test runtime parent",
+            )
+            original_bound_file = ENFORCEMENT_MODULE._BoundRegularFile
+            cleanup_anchors: list[dict[str, Any]] = []
+
+            def replace_before_rebind(
+                bound_parent: object,
+                name: str,
+                **kwargs: Any,
+            ) -> object:
+                os.rename(
+                    parent_path / name,
+                    parent_path / "retained-original",
+                )
+                replacement = parent_path / name
+                replacement.write_bytes(payload)
+                replacement.chmod(0o600)
+                return original_bound_file(bound_parent, name, **kwargs)
+
+            try:
+                with mock.patch.object(
+                    ENFORCEMENT_MODULE,
+                    "_BoundRegularFile",
+                    side_effect=replace_before_rebind,
+                ):
+                    with self.assertRaises(
+                        ENFORCEMENT_MODULE.EnforcementDoctorError
+                    ) as raised:
+                        ENFORCEMENT_MODULE._create_private_regular_file(
+                            parent,
+                            "candidate",
+                            payload,
+                            cleanup_anchors=cleanup_anchors,
+                            label="test private file",
+                            mode=0o600,
+                            max_bytes=1024,
+                        )
+                self.assertEqual(
+                    raised.exception.reason_code,
+                    "collector-inconclusive",
+                )
+                self.assertIn(
+                    "object identity or content changed",
+                    str(raised.exception),
+                )
+                self.assertEqual(len(cleanup_anchors), 1)
+                retained = (parent_path / "retained-original").stat()
+                anchor_status = os.fstat(cleanup_anchors[0]["fd"])
+                self.assertEqual(
+                    (anchor_status.st_dev, anchor_status.st_ino),
+                    (retained.st_dev, retained.st_ino),
+                )
+                self.assertEqual((parent_path / "candidate").read_bytes(), payload)
+                parent.revalidate()
+            finally:
+                for anchor in cleanup_anchors:
+                    os.close(anchor["fd"])
+                parent.close()
+
+    def test_private_file_creation_rejects_content_mutation_during_rebind(
+        self,
+    ) -> None:
+        payload = b"safe-token\n"
+        mutated_payload = b"evil-token\n"
+        self.assertEqual(len(payload), len(mutated_payload))
+        with owner_controlled_temp_root() as parent_path:
+            parent = ENFORCEMENT_MODULE._BoundDirectory(
+                parent_path,
+                label="test runtime parent",
+            )
+            original_bound_file = ENFORCEMENT_MODULE._BoundRegularFile
+            cleanup_anchors: list[dict[str, Any]] = []
+
+            def mutate_before_rebind(
+                bound_parent: object,
+                name: str,
+                **kwargs: Any,
+            ) -> object:
+                candidate = parent_path / name
+                candidate.write_bytes(mutated_payload)
+                candidate.chmod(0o600)
+                return original_bound_file(bound_parent, name, **kwargs)
+
+            try:
+                with mock.patch.object(
+                    ENFORCEMENT_MODULE,
+                    "_BoundRegularFile",
+                    side_effect=mutate_before_rebind,
+                ):
+                    with self.assertRaises(
+                        ENFORCEMENT_MODULE.EnforcementDoctorError
+                    ) as raised:
+                        ENFORCEMENT_MODULE._create_private_regular_file(
+                            parent,
+                            "candidate",
+                            payload,
+                            cleanup_anchors=cleanup_anchors,
+                            label="test private file",
+                            mode=0o600,
+                            max_bytes=1024,
+                        )
+                self.assertEqual(
+                    raised.exception.reason_code,
+                    "collector-inconclusive",
+                )
+                self.assertIn(
+                    "object identity or content changed",
+                    str(raised.exception),
+                )
+                self.assertEqual(len(cleanup_anchors), 1)
+                anchor_status = os.fstat(cleanup_anchors[0]["fd"])
+                candidate_status = (parent_path / "candidate").stat()
+                self.assertEqual(
+                    (anchor_status.st_dev, anchor_status.st_ino),
+                    (candidate_status.st_dev, candidate_status.st_ino),
+                )
+                self.assertEqual(
+                    (parent_path / "candidate").read_bytes(),
+                    mutated_payload,
+                )
+                parent.revalidate()
+            finally:
+                for anchor in cleanup_anchors:
+                    os.close(anchor["fd"])
                 parent.close()
 
     def test_trusted_cutover_selector_routes_target_and_non_target_prs(
