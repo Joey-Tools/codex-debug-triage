@@ -139,6 +139,9 @@ a monotonic 100-millisecond poll budget, and restores the caller's original
 descriptor blocking state under a separate bounded cleanup budget. Interrupted
 `fcntl` setup and restoration cannot retry indefinitely; when no safe
 descriptor is available it returns without risking a blocking diagnostic.
+The same timerless path applies whenever regex-worker cleanup or startup has
+not returned to `IDLE`, including a retained startup signal fence: a blocked
+`SIGALRM` can never authorize an ordinary diagnostic write or flush.
 `--encoding` accepts at most 64 ASCII letters, digits, dots, underscores, plus
 signs, or hyphens and must resolve through Python's codec registry.
 

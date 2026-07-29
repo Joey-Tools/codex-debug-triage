@@ -363,7 +363,13 @@ class ArchiveCommandDeadline:
     def timer_backed_diagnostics_safe(self) -> bool:
         """Return whether an ordinary stream write still has timer protection."""
 
-        return self._diagnostic_timer_safe and self._armed and not self._closing
+        return (
+            self._diagnostic_timer_safe
+            and self._armed
+            and not self._closing
+            and self._regex_cleanup_state == REGEX_CLEANUP_IDLE
+            and self._regex_spawn_state == REGEX_SPAWN_IDLE
+        )
 
     def _transition_regex_cleanup(
         self,

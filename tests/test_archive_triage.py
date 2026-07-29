@@ -2762,6 +2762,148 @@ class ArchiveTriageTests(unittest.TestCase):
 
     @unittest.skipUnless(
         os.name == "posix"
+        and MODULE.fcntl is not None
+        and hasattr(os, "O_NONBLOCK")
+        and hasattr(signal, "pthread_sigmask"),
+        "timerless fenced diagnostics require POSIX fcntl and signal masks",
+    )
+    def test_regex_spawn_recovery_failure_bounds_full_pipe_diagnostic(
+        self,
+    ) -> None:
+        launcher = "\n".join(
+            (
+                "import contextlib",
+                "import importlib.util",
+                "import os",
+                "import pathlib",
+                "import signal",
+                "import sys",
+                "from unittest import mock",
+                "path = pathlib.Path(sys.argv[1])",
+                (
+                    "spec = importlib.util.spec_from_file_location("
+                    "'archive_triage_fenced_diagnostic_test', path)"
+                ),
+                "module = importlib.util.module_from_spec(spec)",
+                "sys.modules[spec.name] = module",
+                "spec.loader.exec_module(module)",
+                "fd = sys.stderr.fileno()",
+                "original_flags = module._fcntl_get_flags(fd)",
+                (
+                    "module._fcntl_set_flags("
+                    "fd, original_flags | os.O_NONBLOCK)"
+                ),
+                "try:",
+                "    while True:",
+                "        os.write(fd, b'x' * 4096)",
+                "except BlockingIOError:",
+                "    pass",
+                "finally:",
+                "    module._fcntl_set_flags(fd, original_flags)",
+                "deadline = module.ArchiveCommandDeadline()",
+                "deadline._armed = True",
+                "deadline._diagnostic_timer_safe = True",
+                "matcher = module.IsolatedRegexMatcher(",
+                "    'safe',",
+                "    ignore_case=False,",
+                "    budget=module.RegexMatchBudget(),",
+                "    command_deadline=deadline,",
+                ")",
+                "process = mock.Mock()",
+                "process.pid = 4242",
+                "process.stdin = mock.Mock()",
+                "process.stdout = mock.Mock()",
+                "process.poll.return_value = None",
+                "cleanup_error = module.RegexWorkerCleanupError(",
+                "    process,",
+                "    cleanup_stage='kill-wait',",
+                "    process_group_id=4242,",
+                ")",
+                "def change_mask(operation, _signals):",
+                "    if operation == signal.SIG_SETMASK:",
+                (
+                    "        raise AssertionError("
+                    "'unproven worker restored SIGALRM mask')"
+                ),
+                "    return set()",
+                "patches = (",
+                "    mock.patch.object(deadline, '_require_signal_support'),",
+                (
+                    "    mock.patch.object("
+                    "module.signal, 'pthread_sigmask', side_effect=change_mask),"
+                ),
+                (
+                    "    mock.patch.object("
+                    "module.subprocess, 'Popen', return_value=process),"
+                ),
+                "    mock.patch.object(module.os, 'set_blocking'),",
+                (
+                    "    mock.patch.object("
+                    "matcher, '_request', "
+                    "side_effect=RuntimeError('injected setup failure')),"
+                ),
+                (
+                    "    mock.patch.object("
+                    "matcher, '_terminate_worker', side_effect=cleanup_error),"
+                ),
+                ")",
+                "with contextlib.ExitStack() as patch_stack:",
+                "    for patcher in patches:",
+                "        patch_stack.enter_context(patcher)",
+                "    try:",
+                "        with module.contextlib.ExitStack() as workers:",
+                "            deadline.enter_regex_worker(workers, matcher)",
+                "    except module.RegexWorkerCleanupError as error:",
+                "        captured_error = error",
+                "    else:",
+                (
+                    "        raise AssertionError("
+                    "'worker recovery failure was not raised')"
+                ),
+                (
+                    "assert deadline._regex_spawn_state "
+                    "== module.REGEX_SPAWN_FENCED"
+                ),
+                "module._emit_error(captured_error, deadline=deadline)",
+                "assert not deadline.timer_backed_diagnostics_safe()",
+                (
+                    "assert bool(module._fcntl_get_flags(fd) & os.O_NONBLOCK) "
+                    "== bool(original_flags & os.O_NONBLOCK)"
+                ),
+            )
+        )
+        started = time.monotonic()
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                "-I",
+                "-B",
+                "-c",
+                launcher,
+                str(SCRIPT_PATH),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.communicate(timeout=2)
+            self.fail("fenced diagnostic blocked on a full stderr pipe")
+        stdout, stderr = process.communicate(timeout=2)
+        elapsed = time.monotonic() - started
+
+        self.assertEqual(
+            process.returncode,
+            0,
+            stderr[-512:].decode("utf-8", errors="replace"),
+        )
+        self.assertEqual(stdout, b"")
+        self.assertLess(elapsed, 1.0)
+
+    @unittest.skipUnless(
+        os.name == "posix"
         and hasattr(os, "killpg")
         and all(
             hasattr(signal, name)
@@ -4228,6 +4370,14 @@ class ArchiveTriageTests(unittest.TestCase):
 
         deadline._armed = True
         deadline._diagnostic_timer_safe = False
+        self.assertFalse(deadline.timer_backed_diagnostics_safe())
+
+        deadline._diagnostic_timer_safe = True
+        deadline._regex_cleanup_state = MODULE.REGEX_CLEANUP_MASKED
+        self.assertFalse(deadline.timer_backed_diagnostics_safe())
+
+        deadline._regex_cleanup_state = MODULE.REGEX_CLEANUP_IDLE
+        deadline._regex_spawn_state = MODULE.REGEX_SPAWN_FENCED
         self.assertFalse(deadline.timer_backed_diagnostics_safe())
 
     def test_deadline_cleanup_failures_disable_timer_backed_diagnostics(
