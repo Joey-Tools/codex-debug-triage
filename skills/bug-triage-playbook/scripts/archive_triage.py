@@ -2547,16 +2547,31 @@ def _validated_members(
 
     members = []
     for info, identity in zip(infos, directory.identities):
-        if info.orig_filename != identity.decoded_name:
-            raise zipfile.BadZipFile(
-                "ZipInfo and central-directory names differ: "
-                f"ordinal={identity.ordinal}"
-            )
-        if info.flag_bits != identity.flag_bits:
-            raise zipfile.BadZipFile(
-                "ZipInfo and central-directory flags differ: "
-                f"ordinal={identity.ordinal}"
-            )
+        fields = (
+            ("name", info.orig_filename, identity.decoded_name),
+            ("decoded name", info.filename, identity.decoded_name),
+            ("flags", info.flag_bits, identity.flag_bits),
+            ("extract version", info.extract_version, identity.extract_version),
+            (
+                "compression method",
+                info.compress_type,
+                identity.compression_method,
+            ),
+            ("CRC", info.CRC, identity.crc),
+            ("compressed size", info.compress_size, identity.compress_size),
+            ("uncompressed size", info.file_size, identity.file_size),
+            (
+                "local-header offset",
+                info.header_offset,
+                identity.local_header_offset,
+            ),
+        )
+        for field, actual, expected in fields:
+            if actual != expected:
+                raise zipfile.BadZipFile(
+                    f"ZipInfo and preflight central-directory {field} differ: "
+                    f"ordinal={identity.ordinal}"
+                )
         members.append(
             ArchiveMember(
                 info=info,
@@ -3095,7 +3110,7 @@ def cmd_zip_list(args: argparse.Namespace) -> int:
                         ignore_case=args.ignore_case,
                         budget=regex_budget,
                         command_deadline=deadline,
-                    )
+                    ),
                 )
                 if args.match
                 else None
@@ -3252,7 +3267,7 @@ def cmd_zip_show(args: argparse.Namespace) -> int:
                         ignore_case=args.ignore_case,
                         budget=regex_budget,
                         command_deadline=deadline,
-                    )
+                    ),
                 )
                 if args.regex
                 else None
@@ -3265,7 +3280,7 @@ def cmd_zip_show(args: argparse.Namespace) -> int:
                         ignore_case=args.ignore_case,
                         budget=regex_budget,
                         command_deadline=deadline,
-                    )
+                    ),
                 )
                 if args.grep
                 else None

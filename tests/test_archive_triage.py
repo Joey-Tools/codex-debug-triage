@@ -14,6 +14,7 @@ import os
 import shutil
 import shlex
 import signal
+import stat
 import struct
 import subprocess
 import sys
@@ -919,6 +920,73 @@ class ArchiveTriageTests(unittest.TestCase):
 
         self.assertEqual(rc, 1)
         self.assertIn("central directory exceeds max bytes", stderr.getvalue())
+
+    def test_zipfile_reread_rejects_same_size_central_directory_rewrite(
+        self,
+    ) -> None:
+        cases = (
+            ("CRC", 16, "<L", lambda value: value ^ MODULE.UINT32_MAX),
+            (
+                "compression method",
+                10,
+                "<H",
+                lambda value: (
+                    zipfile.ZIP_DEFLATED
+                    if value == zipfile.ZIP_STORED
+                    else zipfile.ZIP_STORED
+                ),
+            ),
+            ("compressed size", 20, "<L", lambda value: value + 1),
+            ("uncompressed size", 24, "<L", lambda value: value + 1),
+            ("local-header offset", 42, "<L", lambda value: value + 1),
+        )
+        for field, field_offset, field_format, replacement in cases:
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as temp_dir:
+                archive_path = self._make_archive(Path(temp_dir))
+                original_size = archive_path.stat().st_size
+                archive_data = archive_path.read_bytes()
+                central_offset = self._central_directory_records(archive_data)[0][0]
+                original_value = struct.unpack_from(
+                    field_format,
+                    archive_data,
+                    central_offset + field_offset,
+                )[0]
+                replacement_value = replacement(original_value)
+                real_zipfile = zipfile.ZipFile
+                constructor_calls = 0
+
+                def mutate_before_zipfile_reread(
+                    file: object,
+                    *args: object,
+                    **kwargs: object,
+                ) -> zipfile.ZipFile:
+                    nonlocal constructor_calls
+                    constructor_calls += 1
+                    with archive_path.open("r+b") as stream:
+                        stream.seek(central_offset + field_offset)
+                        stream.write(struct.pack(field_format, replacement_value))
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                    return real_zipfile(file, *args, **kwargs)
+
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+                with mock.patch.object(
+                    MODULE.zipfile,
+                    "ZipFile",
+                    side_effect=mutate_before_zipfile_reread,
+                ):
+                    with redirect_stdout(stdout), redirect_stderr(stderr):
+                        rc = MODULE.cmd_zip_list(self._list_args(archive_path))
+
+                self.assertEqual(constructor_calls, 1)
+                self.assertEqual(archive_path.stat().st_size, original_size)
+                self.assertEqual(rc, 1)
+                self.assertEqual(stdout.getvalue(), "")
+                self.assertIn(
+                    f"ZipInfo and preflight central-directory {field} differ",
+                    stderr.getvalue(),
+                )
 
     def test_zip_preflight_rejects_eocd_signature_in_comment(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -5576,7 +5644,9 @@ class BugTriageDocumentationTests(unittest.TestCase):
                 "    git_protocol: https\n"
                 "    users:\n"
                 "        fixture-admin:\n"
+                f"            oauth_token: {SYNTHETIC_ACCESS_TOKEN}\n"
                 "    user: fixture-admin\n"
+                f"    oauth_token: {SYNTHETIC_ACCESS_TOKEN}\n"
             ),
             encoding="utf-8",
         )
@@ -5591,6 +5661,24 @@ class BugTriageDocumentationTests(unittest.TestCase):
         )
         config_path.chmod(0o600)
         return config_dir, resolved_root / "fixed-gh-runtime"
+
+    @staticmethod
+    def _prime_github_api_transport(client: object) -> None:
+        client._install_authentication_header(
+            f"{SYNTHETIC_ACCESS_TOKEN}\n".encode("ascii")
+        )
+
+    @staticmethod
+    def _curl_response(
+        body: bytes,
+        status: int = 200,
+        *,
+        rate_remaining: str = "",
+    ) -> bytes:
+        trailer = (f"\nCISCO_STATUS={status}\nCISCO_RATE={rate_remaining}\n").encode(
+            "ascii"
+        )
+        return body + trailer
 
     @staticmethod
     def _set_darwin_acl(path: Path, entry: str) -> None:
@@ -7225,7 +7313,11 @@ class BugTriageDocumentationTests(unittest.TestCase):
             ) -> tuple[int, bytes, bytes]:
                 observed["command"] = command
                 observed["environment"] = kwargs["environment"]
-                return 0, b'{"id":1,"login":"fixture"}', b""
+                return (
+                    0,
+                    self._curl_response(b'{"id":1,"login":"fixture"}'),
+                    b"",
+                )
 
             ambient = {
                 "PATH": str(malicious_dir),
@@ -7260,10 +7352,24 @@ class BugTriageDocumentationTests(unittest.TestCase):
                         response = client.get_json("/user")
 
                     self.assertEqual(response["login"], "fixture")
-                    self.assertEqual(observed["command"][0], client.executable)
+                    self.assertEqual(
+                        observed["command"][0],
+                        str(ENFORCEMENT_MODULE.CURL_EXECUTABLE),
+                    )
+                    self.assertEqual(observed["command"][1], "--disable")
                     self.assertNotEqual(observed["command"][0], str(malicious_gh))
                     self.assertFalse(
                         Path(observed["command"][0]).is_relative_to(malicious_dir)
+                    )
+                    self.assertNotIn("--location", observed["command"])
+                    self.assertNotIn("--location-trusted", observed["command"])
+                    self.assertEqual(
+                        observed["command"][observed["command"].index("--url") + 1],
+                        "https://api.github.com/user",
+                    )
+                    self.assertNotIn(
+                        SYNTHETIC_ACCESS_TOKEN,
+                        "\0".join(observed["command"]),
                     )
                     snapshot_config_dir = Path(observed["environment"]["GH_CONFIG_DIR"])
                     self.assertNotEqual(snapshot_config_dir, config_dir)
@@ -7287,7 +7393,11 @@ class BugTriageDocumentationTests(unittest.TestCase):
                     )
                     self.assertEqual(
                         client.environment_profile,
-                        "minimal-snapshotted-config-v2",
+                        "minimal-snapshotted-auth-v3",
+                    )
+                    self.assertEqual(
+                        client.transport_profile,
+                        "fixed-curl-no-redirect-v1",
                     )
 
                     def attempt_execution_window_replacement(
@@ -7305,17 +7415,30 @@ class BugTriageDocumentationTests(unittest.TestCase):
                             )
                         except PermissionError:
                             observed["execution_window_replacement_blocked"] = True
-                        return 0, b'{"id":1,"login":"fixture"}', b""
+                        return 0, f"{SYNTHETIC_ACCESS_TOKEN}\n".encode("ascii"), b""
 
                     with mock.patch.object(
                         ENFORCEMENT_MODULE,
                         "_bounded_subprocess",
                         side_effect=attempt_execution_window_replacement,
                     ):
-                        client.get_json("/user")
+                        token_output = client._run(
+                            [
+                                client.executable,
+                                "auth",
+                                "token",
+                                "--hostname",
+                                ENFORCEMENT_MODULE.AUTH_HOST,
+                            ],
+                            endpoint_class="authentication-preflight",
+                            stdout_limit=2_049,
+                            authentication_preflight=True,
+                        )
                     self.assertTrue(observed["execution_window_replacement_blocked"])
-                    actual_response = client.get_json("/user")
-                    self.assertEqual(actual_response["login"], "fixture")
+                    self.assertEqual(
+                        token_output,
+                        f"{SYNTHETIC_ACCESS_TOKEN}\n".encode("ascii"),
+                    )
 
     def test_enforcement_subprocess_registers_before_deadline_initialization(
         self,
@@ -7708,7 +7831,15 @@ class BugTriageDocumentationTests(unittest.TestCase):
     def test_enforcement_client_lifecycle_covers_request_gaps_and_parsing(
         self,
     ) -> None:
-        for phase in ("request-gap", "json-parse", "snapshot-revalidation"):
+        for phase in (
+            "request-gap",
+            "endpoint-validation",
+            "run-call-limit",
+            "json-parse",
+            "snapshot-revalidation",
+            "transport-postvalidation",
+            "trailer-parse",
+        ):
             with self.subTest(phase=phase):
                 with owner_controlled_temp_root() as temp_root:
                     trusted_gh = temp_root / "trusted-gh"
@@ -7749,7 +7880,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
                         "_bounded_subprocess",
                         return_value=(
                             0,
-                            b'{"id":1,"login":"fixture"}',
+                            self._curl_response(b'{"id":1,"login":"fixture"}'),
                             b"",
                         ),
                     )
@@ -7775,6 +7906,60 @@ class BugTriageDocumentationTests(unittest.TestCase):
                         )
                         self.fail("termination signal did not interrupt JSON parsing")
 
+                    def interrupt_endpoint_validation(
+                        *_args: object,
+                        **_kwargs: object,
+                    ) -> object:
+                        client._termination_signal_guard._handle_signal(
+                            signal.SIGTERM,
+                            None,
+                        )
+                        self.fail(
+                            "termination signal did not interrupt endpoint validation"
+                        )
+
+                    class InterruptingCallCount:
+                        def __ge__(self, _other: object) -> bool:
+                            client._termination_signal_guard._handle_signal(
+                                signal.SIGTERM,
+                                None,
+                            )
+                            raise AssertionError(
+                                "termination signal did not interrupt call-limit check"
+                            )
+
+                    original_transport_binding = (
+                        ENFORCEMENT_MODULE._fixed_curl_trust_binding
+                    )
+                    transport_binding_calls = 0
+
+                    def interrupt_transport_postvalidation(
+                        *_args: object,
+                        **_kwargs: object,
+                    ) -> object:
+                        nonlocal transport_binding_calls
+                        result = original_transport_binding()
+                        transport_binding_calls += 1
+                        if transport_binding_calls == 2:
+                            client._termination_signal_guard._handle_signal(
+                                signal.SIGTERM,
+                                None,
+                            )
+                        return result
+
+                    trailer_pattern = mock.Mock()
+
+                    def interrupt_trailer_parse(*_args: object) -> object:
+                        client._termination_signal_guard._handle_signal(
+                            signal.SIGTERM,
+                            None,
+                        )
+                        self.fail(
+                            "termination signal did not interrupt trailer parsing"
+                        )
+
+                    trailer_pattern.search.side_effect = interrupt_trailer_parse
+
                     try:
                         with (
                             mock.patch.object(
@@ -7791,6 +7976,21 @@ class BugTriageDocumentationTests(unittest.TestCase):
                                         signal.SIGTERM,
                                         None,
                                     )
+                                elif phase == "endpoint-validation":
+                                    with mock.patch.object(
+                                        ENFORCEMENT_MODULE.re,
+                                        "fullmatch",
+                                        side_effect=interrupt_endpoint_validation,
+                                    ):
+                                        client.get_json("/user")
+                                elif phase == "run-call-limit":
+                                    client.calls = InterruptingCallCount()
+                                    client._run(
+                                        ["/fixed/gh", "auth", "token"],
+                                        endpoint_class="authentication-preflight",
+                                        stdout_limit=2_049,
+                                        authentication_preflight=True,
+                                    )
                                 elif phase == "json-parse":
                                     with mock.patch.object(
                                         ENFORCEMENT_MODULE,
@@ -7799,11 +7999,27 @@ class BugTriageDocumentationTests(unittest.TestCase):
                                     ):
                                         client.get_json("/user")
                                 else:
-                                    with mock.patch.object(
-                                        client,
-                                        "_revalidate_snapshot",
-                                        side_effect=interrupt_revalidation,
-                                    ):
+                                    if phase == "snapshot-revalidation":
+                                        patch_target = mock.patch.object(
+                                            client,
+                                            "_revalidate_snapshot",
+                                            side_effect=interrupt_revalidation,
+                                        )
+                                    elif phase == "transport-postvalidation":
+                                        patch_target = mock.patch.object(
+                                            ENFORCEMENT_MODULE,
+                                            "_fixed_curl_trust_binding",
+                                            side_effect=(
+                                                interrupt_transport_postvalidation
+                                            ),
+                                        )
+                                    else:
+                                        patch_target = mock.patch.object(
+                                            ENFORCEMENT_MODULE,
+                                            "CURL_TRAILER_PATTERN",
+                                            trailer_pattern,
+                                        )
+                                    with patch_target:
                                         client.get_json("/user")
                     finally:
                         if not client._closed:
@@ -7816,6 +8032,104 @@ class BugTriageDocumentationTests(unittest.TestCase):
                     self.assertIsNone(raised.exception.secondary_error)
                     self.assertTrue(client._closed)
                     self.assertFalse(run_path.exists())
+
+    @unittest.skipUnless(
+        os.name == "posix"
+        and all(
+            hasattr(signal, name)
+            for name in (
+                "SIGTERM",
+                "pthread_sigmask",
+                "sigpending",
+                "sigwait",
+                "SIG_BLOCK",
+                "SIG_SETMASK",
+            )
+        ),
+        "client lifecycle transaction requires POSIX signal controls",
+    )
+    def test_enforcement_client_closes_on_second_request_revalidation_signal(
+        self,
+    ) -> None:
+        with owner_controlled_temp_root() as temp_root:
+            trusted_gh = temp_root / "trusted-gh"
+            trusted_payload = b"#!/bin/sh\nexit 0\n"
+            trusted_gh.write_bytes(trusted_payload)
+            trusted_gh.chmod(0o700)
+            config_dir, runtime_parent = self._make_private_gh_config(temp_root)
+            client = ENFORCEMENT_MODULE.GitHubApiClient(
+                trusted_gh,
+                hashlib.sha256(trusted_payload).hexdigest(),
+                config_dir,
+                runtime_parent=runtime_parent,
+            )
+            run_path = client._run_directory.path
+            original_revalidate = client._revalidate_snapshot
+            revalidation_calls = 0
+
+            def interrupt_second_revalidation(**kwargs: object) -> None:
+                nonlocal revalidation_calls
+                original_revalidate(**kwargs)
+                if kwargs.get("absolute_deadline") is None:
+                    return
+                revalidation_calls += 1
+                if revalidation_calls == 2:
+                    client._termination_signal_guard._handle_signal(
+                        signal.SIGTERM,
+                        None,
+                    )
+
+            def forward_signal(
+                forwarded: int,
+                secondary_error: BaseException | None,
+            ) -> None:
+                raise _ForwardedFixtureSignal(
+                    forwarded,
+                    secondary_error,
+                )
+
+            try:
+                with (
+                    mock.patch.object(
+                        client,
+                        "_revalidate_snapshot",
+                        side_effect=interrupt_second_revalidation,
+                    ),
+                    mock.patch.object(
+                        ENFORCEMENT_MODULE,
+                        "_bounded_subprocess",
+                        return_value=(
+                            0,
+                            self._curl_response(b'{"id":1,"login":"fixture"}'),
+                            b"",
+                        ),
+                    ),
+                    mock.patch.object(
+                        ENFORCEMENT_MODULE,
+                        "_forward_deferred_termination_signal",
+                        side_effect=forward_signal,
+                    ),
+                    self.assertRaises(_ForwardedFixtureSignal) as raised,
+                ):
+                    client.get_json("/user")
+            finally:
+                if not client._closed:
+                    with mock.patch.object(
+                        ENFORCEMENT_MODULE,
+                        "_forward_deferred_termination_signal",
+                        side_effect=forward_signal,
+                    ):
+                        try:
+                            client.close()
+                        except _ForwardedFixtureSignal:
+                            pass
+
+        self.assertEqual(raised.exception.signal_number, signal.SIGTERM)
+        self.assertIsNone(raised.exception.secondary_error)
+        self.assertEqual(revalidation_calls, 2)
+        self.assertTrue(client._closed)
+        self.assertFalse(run_path.exists())
+        self.assertEqual(client.total_bytes, 0)
 
     @unittest.skipUnless(
         os.name == "posix"
@@ -8014,7 +8328,11 @@ class BugTriageDocumentationTests(unittest.TestCase):
                 )
                 self.assertTrue(run_path.exists())
             finally:
-                for directory in (run_path / "config", run_path / "bin"):
+                for directory in (
+                    run_path / "config",
+                    run_path / "bin",
+                    run_path / "transport",
+                ):
                     if directory.exists():
                         directory.chmod(0o700)
                 if run_path.exists():
@@ -9006,7 +9324,11 @@ class BugTriageDocumentationTests(unittest.TestCase):
                 )
                 self.assertTrue(run_path.exists())
             finally:
-                for directory in (run_path / "config", run_path / "bin"):
+                for directory in (
+                    run_path / "config",
+                    run_path / "bin",
+                    run_path / "transport",
+                ):
                     if directory.exists():
                         directory.chmod(0o700)
                 if run_path.exists():
@@ -9780,7 +10102,9 @@ class BugTriageDocumentationTests(unittest.TestCase):
                             "_bounded_subprocess",
                             return_value=(
                                 0,
-                                b'{"id":1,"login":"linux-fixture"}',
+                                self._curl_response(
+                                    b'{"id":1,"login":"linux-fixture"}'
+                                ),
                                 b"",
                             ),
                         ) as spawned:
@@ -9863,7 +10187,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
                 with mock.patch.object(
                     ENFORCEMENT_MODULE,
                     "_bounded_subprocess",
-                    return_value=(0, b'{"id":1}', b""),
+                    return_value=(0, self._curl_response(b'{"id":1}'), b""),
                 ) as spawned:
                     with self.assertRaises(
                         ENFORCEMENT_MODULE.EnforcementDoctorError
@@ -9922,7 +10246,13 @@ class BugTriageDocumentationTests(unittest.TestCase):
                             **kwargs: object,
                         ) -> tuple[int, bytes, bytes]:
                             mutate(client, temp_root)
-                            return 0, b'{"id":1,"login":"must-not-be-used"}', b""
+                            return (
+                                0,
+                                self._curl_response(
+                                    b'{"id":1,"login":"must-not-be-used"}'
+                                ),
+                                b"",
+                            )
 
                         with mock.patch.object(
                             ENFORCEMENT_MODULE,
@@ -10035,7 +10365,9 @@ class BugTriageDocumentationTests(unittest.TestCase):
                             mutate(client)
                             return (
                                 0,
-                                b'{"id":1,"login":"must-not-be-used"}',
+                                self._curl_response(
+                                    b'{"id":1,"login":"must-not-be-used"}'
+                                ),
                                 b"",
                             )
 
@@ -10082,7 +10414,11 @@ class BugTriageDocumentationTests(unittest.TestCase):
                         client._runtime_parent.path,
                         "everyone deny readextattr",
                     )
-                    return 0, b'{"id":1,"login":"fixture"}', b""
+                    return (
+                        0,
+                        self._curl_response(b'{"id":1,"login":"fixture"}'),
+                        b"",
+                    )
 
                 with mock.patch.object(
                     ENFORCEMENT_MODULE,
@@ -10285,6 +10621,104 @@ class BugTriageDocumentationTests(unittest.TestCase):
                         "collector-unavailable",
                     )
 
+    def test_enforcement_api_transport_refuses_every_redirect_without_egress(
+        self,
+    ) -> None:
+        cases = (
+            (301, "https://attacker.invalid/credential"),
+            (302, "http://api.github.com/downgrade"),
+            (303, "https://api.github.com:444/non-default-port"),
+            (307, "https://first.github.com/first-hop"),
+            (308, "https://first.github.com/second-hop"),
+        )
+        with owner_controlled_temp_root() as temp_root:
+            trusted_gh = temp_root / "trusted-gh"
+            trusted_payload = b"#!/bin/sh\nexit 0\n"
+            trusted_gh.write_bytes(trusted_payload)
+            trusted_gh.chmod(0o700)
+            config_dir, runtime_parent = self._make_private_gh_config(temp_root)
+            observed_commands: list[list[str]] = []
+            responses = iter(cases)
+
+            def redirect_response(
+                command: list[str],
+                **_kwargs: object,
+            ) -> tuple[int, bytes, bytes]:
+                observed_commands.append(command)
+                status, location = next(responses)
+                return (
+                    0,
+                    self._curl_response(
+                        f"server redirect body: {location}".encode("ascii"),
+                        status,
+                    ),
+                    b"",
+                )
+
+            with ENFORCEMENT_MODULE.GitHubApiClient(
+                trusted_gh,
+                hashlib.sha256(trusted_payload).hexdigest(),
+                config_dir,
+                runtime_parent=runtime_parent,
+            ) as client:
+                header_path = client._transport_directory.path / "authorization.headers"
+                self.assertEqual(
+                    stat.S_IMODE(header_path.stat().st_mode),
+                    0o400,
+                )
+                self.assertIn(
+                    SYNTHETIC_ACCESS_TOKEN.encode("ascii"),
+                    header_path.read_bytes(),
+                )
+                with mock.patch.object(
+                    ENFORCEMENT_MODULE,
+                    "_bounded_subprocess",
+                    side_effect=redirect_response,
+                ):
+                    for status, location in cases:
+                        with self.subTest(status=status, location=location):
+                            with self.assertRaises(
+                                ENFORCEMENT_MODULE.EnforcementDoctorError
+                            ) as raised:
+                                client.get_json("/user")
+                            self.assertEqual(
+                                raised.exception.api_failure,
+                                {
+                                    "endpoint_class": "authenticated-user",
+                                    "failure_kind": "redirect-refused",
+                                    "http_status": status,
+                                },
+                            )
+                            self.assertNotIn(location, str(raised.exception))
+                            self.assertNotIn(
+                                SYNTHETIC_ACCESS_TOKEN,
+                                str(raised.exception),
+                            )
+
+        self.assertEqual(len(observed_commands), len(cases))
+        for command in observed_commands:
+            self.assertEqual(command[0], str(ENFORCEMENT_MODULE.CURL_EXECUTABLE))
+            self.assertEqual(command[1], "--disable")
+            self.assertNotIn("api", command[:4])
+            self.assertNotIn("--location", command)
+            self.assertNotIn("--location-trusted", command)
+            self.assertEqual(
+                command[command.index("--max-redirs") + 1],
+                "0",
+            )
+            self.assertEqual(
+                command[command.index("--url") + 1],
+                "https://api.github.com/user",
+            )
+            self.assertEqual(
+                command[command.index("--proxy") + 1],
+                "",
+            )
+            self.assertNotIn(
+                SYNTHETIC_ACCESS_TOKEN,
+                "\0".join(command),
+            )
+
     def test_enforcement_gh_config_drift_discards_command_output(self) -> None:
         mutations = {
             "source-config-content": lambda client, temp_root: (
@@ -10346,7 +10780,13 @@ class BugTriageDocumentationTests(unittest.TestCase):
                             if label == "snapshot-hosts":
                                 client._config_snapshot_directory.set_owner_mode(0o700)
                             mutate(client, temp_root)
-                            return 0, b'{"id":1,"login":"must-not-be-used"}', b""
+                            return (
+                                0,
+                                self._curl_response(
+                                    b'{"id":1,"login":"must-not-be-used"}'
+                                ),
+                                b"",
+                            )
 
                         with mock.patch.object(
                             ENFORCEMENT_MODULE,
@@ -10418,7 +10858,11 @@ class BugTriageDocumentationTests(unittest.TestCase):
                 **kwargs: object,
             ) -> tuple[int, bytes, bytes]:
                 observed_commands.append(command)
-                return 0, b'{"id":1,"login":"fixture"}', b""
+                return (
+                    0,
+                    self._curl_response(b'{"id":1,"login":"fixture"}'),
+                    b"",
+                )
 
             with ENFORCEMENT_MODULE.GitHubApiClient(
                 trusted_gh,
@@ -10426,6 +10870,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
                 config_dir,
                 runtime_parent=runtime_parent,
             ) as client:
+                self._prime_github_api_transport(client)
                 snapshot_hosts = (
                     client._config_snapshot_directory.path / "hosts.yml"
                 ).read_text(encoding="utf-8")
@@ -10453,12 +10898,148 @@ class BugTriageDocumentationTests(unittest.TestCase):
                                 client.get_json(endpoint)
 
             self.assertEqual(len(observed_commands), 1)
-            self.assertIn("--hostname", observed_commands[0])
             self.assertEqual(
-                observed_commands[0][observed_commands[0].index("--hostname") + 1],
-                "github.com",
+                observed_commands[0][0],
+                str(ENFORCEMENT_MODULE.CURL_EXECUTABLE),
+            )
+            self.assertEqual(
+                observed_commands[0][observed_commands[0].index("--url") + 1],
+                "https://api.github.com/user",
             )
             self.assertNotIn("attacker.invalid", " ".join(observed_commands[0]))
+
+    def test_enforcement_auth_preflight_uses_only_local_gh_token_command(
+        self,
+    ) -> None:
+        with owner_controlled_temp_root() as temp_root:
+            trusted_gh = temp_root / "trusted-gh"
+            trusted_payload = b"#!/bin/sh\nexit 0\n"
+            trusted_gh.write_bytes(trusted_payload)
+            trusted_gh.chmod(0o700)
+            config_dir, runtime_parent = self._make_private_gh_config(
+                temp_root,
+                hosts_payload=(
+                    "github.com:\n"
+                    "    git_protocol: https\n"
+                    "    users:\n"
+                    "        fixture-admin:\n"
+                    "    user: fixture-admin\n"
+                ),
+            )
+            observed_commands: list[list[str]] = []
+
+            def authentication_then_api(
+                command: list[str],
+                **_kwargs: object,
+            ) -> tuple[int, bytes, bytes]:
+                observed_commands.append(command)
+                if len(observed_commands) == 1:
+                    return (
+                        0,
+                        f"{SYNTHETIC_ACCESS_TOKEN}\n".encode("ascii"),
+                        b"",
+                    )
+                return (
+                    0,
+                    self._curl_response(b'{"id":123,"login":"fixture-admin"}'),
+                    b"",
+                )
+
+            with ENFORCEMENT_MODULE.GitHubApiClient(
+                trusted_gh,
+                hashlib.sha256(trusted_payload).hexdigest(),
+                config_dir,
+                runtime_parent=runtime_parent,
+            ) as client:
+                self.assertIsNone(client._snapshot_auth_header_file)
+                with mock.patch.object(
+                    ENFORCEMENT_MODULE,
+                    "_bounded_subprocess",
+                    side_effect=authentication_then_api,
+                ):
+                    authenticated = client.auth_preflight()
+                header_path = client._transport_directory.path / "authorization.headers"
+                self.assertEqual(
+                    stat.S_IMODE(header_path.stat().st_mode),
+                    0o400,
+                )
+
+        self.assertEqual(
+            authenticated,
+            {
+                "id": 123,
+                "login": "fixture-admin",
+            },
+        )
+        self.assertEqual(
+            observed_commands[0][1:],
+            [
+                "auth",
+                "token",
+                "--hostname",
+                "github.com",
+            ],
+        )
+        self.assertEqual(observed_commands[0][0], client.executable)
+        self.assertNotEqual(
+            observed_commands[0][0],
+            str(ENFORCEMENT_MODULE.CURL_EXECUTABLE),
+        )
+        self.assertEqual(
+            observed_commands[1][0],
+            str(ENFORCEMENT_MODULE.CURL_EXECUTABLE),
+        )
+        flattened = "\0".join(
+            argument for command in observed_commands for argument in command
+        )
+        self.assertNotIn("auth\0status", flattened)
+        self.assertNotIn("\0api\0", flattened)
+        self.assertNotIn(SYNTHETIC_ACCESS_TOKEN, flattened)
+
+    def test_enforcement_invalid_local_token_stops_before_network(self) -> None:
+        with owner_controlled_temp_root() as temp_root:
+            trusted_gh = temp_root / "trusted-gh"
+            trusted_payload = b"#!/bin/sh\nexit 0\n"
+            trusted_gh.write_bytes(trusted_payload)
+            trusted_gh.chmod(0o700)
+            config_dir, runtime_parent = self._make_private_gh_config(
+                temp_root,
+                hosts_payload=(
+                    "github.com:\n"
+                    "    git_protocol: https\n"
+                    "    users:\n"
+                    "        fixture-admin:\n"
+                    "    user: fixture-admin\n"
+                ),
+            )
+            with ENFORCEMENT_MODULE.GitHubApiClient(
+                trusted_gh,
+                hashlib.sha256(trusted_payload).hexdigest(),
+                config_dir,
+                runtime_parent=runtime_parent,
+            ) as client:
+                with (
+                    mock.patch.object(
+                        ENFORCEMENT_MODULE,
+                        "_bounded_subprocess",
+                        return_value=(
+                            0,
+                            b"invalid token with spaces\n",
+                            b"",
+                        ),
+                    ) as spawned,
+                    self.assertRaises(
+                        ENFORCEMENT_MODULE.EnforcementDoctorError
+                    ) as raised,
+                ):
+                    client.auth_preflight()
+
+        self.assertEqual(raised.exception.reason_code, "blocked-authentication")
+        spawned.assert_called_once()
+        self.assertNotEqual(
+            spawned.call_args.args[0][0],
+            str(ENFORCEMENT_MODULE.CURL_EXECUTABLE),
+        )
 
     def test_enforcement_api_failures_are_sanitized_and_actionable(
         self,
@@ -10473,93 +11054,106 @@ class BugTriageDocumentationTests(unittest.TestCase):
             ("server-503", 503, "api-unavailable", "server-error"),
         )
         endpoint = "/orgs/Joey-Tools/rulesets/97531"
-        for label, status, reason_code, failure_kind in cases:
-            with self.subTest(failure=label):
-                client = object.__new__(ENFORCEMENT_MODULE.GitHubApiClient)
-                client.executable = "/fixed/gh"
-                client.calls = 0
-                client.total_bytes = 0
-                client.deadline = time.monotonic() + 30
-                client._active_processes = {}
-                client._environment = {}
-                client._execution_cwd = tempfile.gettempdir()
-                client._revalidate_snapshot = mock.Mock()
-                detail = (
-                    "rate limit exceeded"
-                    if label == "rate-limit-403"
-                    else "sanitized fixture failure"
-                )
-                stderr = (
-                    f"gh: {detail} (HTTP {status}) Authorization: token super-secret"
-                ).encode("utf-8")
-                with mock.patch.object(
-                    ENFORCEMENT_MODULE,
-                    "_bounded_subprocess",
-                    return_value=(1, b'{"secret":"response-body"}', stderr),
-                ):
-                    with self.assertRaises(
-                        ENFORCEMENT_MODULE.EnforcementDoctorError
-                    ) as raised:
-                        client.get_json(endpoint)
+        with owner_controlled_temp_root() as temp_root:
+            trusted_gh = temp_root / "trusted-gh"
+            trusted_payload = b"#!/bin/sh\nexit 0\n"
+            trusted_gh.write_bytes(trusted_payload)
+            trusted_gh.chmod(0o700)
+            config_dir, runtime_parent = self._make_private_gh_config(temp_root)
+            with ENFORCEMENT_MODULE.GitHubApiClient(
+                trusted_gh,
+                hashlib.sha256(trusted_payload).hexdigest(),
+                config_dir,
+                runtime_parent=runtime_parent,
+            ) as client:
+                for label, status, reason_code, failure_kind in cases:
+                    with self.subTest(failure=label):
+                        response = self._curl_response(
+                            b'{"secret":"response-body"}',
+                            status,
+                            rate_remaining=("0" if label == "rate-limit-403" else ""),
+                        )
+                        with mock.patch.object(
+                            ENFORCEMENT_MODULE,
+                            "_bounded_subprocess",
+                            return_value=(
+                                0,
+                                response,
+                                b"Authorization: token super-secret",
+                            ),
+                        ):
+                            with self.assertRaises(
+                                ENFORCEMENT_MODULE.EnforcementDoctorError
+                            ) as raised:
+                                client.get_json(endpoint)
 
-                error = raised.exception
-                self.assertEqual(error.reason_code, reason_code)
-                self.assertEqual(
-                    error.api_failure,
-                    {
-                        "endpoint_class": "organization-ruleset",
-                        "failure_kind": failure_kind,
-                        "http_status": status,
-                    },
-                )
-                rendered = json.dumps(
-                    {
-                        "reason": str(error),
-                        "api_failure": error.api_failure,
-                    },
-                    sort_keys=True,
-                )
-                self.assertNotIn("super-secret", rendered)
-                self.assertNotIn("response-body", rendered)
-                self.assertNotIn("Authorization", rendered)
+                        error = raised.exception
+                        self.assertEqual(error.reason_code, reason_code)
+                        self.assertEqual(
+                            error.api_failure,
+                            {
+                                "endpoint_class": "organization-ruleset",
+                                "failure_kind": failure_kind,
+                                "http_status": status,
+                            },
+                        )
+                        rendered = json.dumps(
+                            {
+                                "reason": str(error),
+                                "api_failure": error.api_failure,
+                            },
+                            sort_keys=True,
+                        )
+                        self.assertNotIn("super-secret", rendered)
+                        self.assertNotIn("response-body", rendered)
+                        self.assertNotIn("Authorization", rendered)
 
     def test_enforcement_api_malformed_and_timeout_failures_are_sanitized(
         self,
     ) -> None:
         endpoint = "/orgs/Joey-Tools/rulesets/97531"
-        client = object.__new__(ENFORCEMENT_MODULE.GitHubApiClient)
-        client.executable = "/fixed/gh"
-        client.calls = 0
-        client.total_bytes = 0
-        client.deadline = time.monotonic() + 30
-        client._active_processes = {}
-        client._environment = {}
-        client._execution_cwd = tempfile.gettempdir()
-        client._revalidate_snapshot = mock.Mock()
-        with mock.patch.object(
-            ENFORCEMENT_MODULE,
-            "_bounded_subprocess",
-            return_value=(0, b"{malformed", b"token super-secret"),
-        ):
-            with self.assertRaises(
-                ENFORCEMENT_MODULE.EnforcementDoctorError
-            ) as malformed:
-                client.get_json(endpoint)
+        with owner_controlled_temp_root() as temp_root:
+            trusted_gh = temp_root / "trusted-gh"
+            trusted_payload = b"#!/bin/sh\nexit 0\n"
+            trusted_gh.write_bytes(trusted_payload)
+            trusted_gh.chmod(0o700)
+            config_dir, runtime_parent = self._make_private_gh_config(temp_root)
+            with ENFORCEMENT_MODULE.GitHubApiClient(
+                trusted_gh,
+                hashlib.sha256(trusted_payload).hexdigest(),
+                config_dir,
+                runtime_parent=runtime_parent,
+            ) as client:
+                with mock.patch.object(
+                    ENFORCEMENT_MODULE,
+                    "_bounded_subprocess",
+                    return_value=(
+                        0,
+                        self._curl_response(b"{malformed"),
+                        b"token super-secret",
+                    ),
+                ):
+                    with self.assertRaises(
+                        ENFORCEMENT_MODULE.EnforcementDoctorError
+                    ) as malformed:
+                        client.get_json(endpoint)
 
-        self.assertEqual(malformed.exception.reason_code, "api-unavailable")
-        self.assertEqual(
-            malformed.exception.api_failure,
-            {
-                "endpoint_class": "organization-ruleset",
-                "failure_kind": "malformed-json",
-                "http_status": 200,
-            },
-        )
-        self.assertNotIn("super-secret", str(malformed.exception))
+                self.assertEqual(malformed.exception.reason_code, "api-unavailable")
+                self.assertEqual(
+                    malformed.exception.api_failure,
+                    {
+                        "endpoint_class": "organization-ruleset",
+                        "failure_kind": "malformed-json",
+                        "http_status": 200,
+                    },
+                )
+                self.assertNotIn("super-secret", str(malformed.exception))
 
-        client.deadline = time.monotonic() - 1
-        with self.assertRaises(ENFORCEMENT_MODULE.EnforcementDoctorError) as timed_out:
-            client.get_json(endpoint)
+                client.deadline = time.monotonic() - 1
+                with self.assertRaises(
+                    ENFORCEMENT_MODULE.EnforcementDoctorError
+                ) as timed_out:
+                    client.get_json(endpoint)
 
         self.assertEqual(timed_out.exception.reason_code, "api-timeout")
         self.assertEqual(

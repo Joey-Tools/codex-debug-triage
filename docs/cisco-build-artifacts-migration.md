@@ -312,12 +312,12 @@ The base verifier compares `CISCO_CUTOVER_EXPECTED_CANONICAL_COMMIT` against
 the exact event head SHA, so a valid old receipt and stale repository variable
 cannot admit a different candidate. Missing, empty, recognizable placeholder,
 all-zero, malformed, stale, or mismatched values keep the trusted workflow red.
-The doctor must read all twelve variables through exact pinned `gh api`
-arguments and require every variable's `updated_at` to be strictly earlier
-than the selected workflow attempt's `run_started_at`. Equality is not an
-ordering proof. The administrator-pinned run ID and attempt remain exact
-inputs; do not select a run, attempt, or proof artifact by name, recency, or a
-`latest` alias.
+The doctor must read all twelve variables through fixed, no-redirect REST
+`GET` requests to the exact `https://api.github.com` origin and require every
+variable's `updated_at` to be strictly earlier than the selected workflow
+attempt's `run_started_at`. Equality is not an ordering proof. The
+administrator-pinned run ID and attempt remain exact inputs; do not select a
+run, attempt, or proof artifact by name, recency, or a `latest` alias.
 
 Before retirement, run `scripts/doctor_cisco_cutover_enforcement.py` in the
 trusted administrator environment. It deliberately accepts no `--evidence`
@@ -414,23 +414,40 @@ The generated files are `0400` and their configuration directory becomes
 uses only `LC_ALL=C`, `GH_PROMPT_DISABLED=1`,
 `GH_NO_UPDATE_NOTIFIER=1`, and the generated snapshot `GH_CONFIG_DIR`; ambient
 `PATH`, `HOME`, `TMPDIR`, token, loader, proxy, CA, and other `GH_*` variables
-are absent. API commands use only relative endpoints plus exact
-`--hostname github.com`, so the snapshot supplies no authentication source for
-a non-GitHub host. The source executable/config and snapshot path/descriptor
-identities, sizes, owners, groups, links, modes, and access-policy bindings are
-revalidated before and after every invocation and once more before any
-admission. Each exact content digest is cached only with a descriptor/path
-generation receipt bound to size, `mtime_ns`, and `ctime_ns`. An unchanged
-generation avoids rereading a large executable; a changed generation performs
-the same bounded content read and exact digest comparison before the receipt
-can advance. Metadata churn is therefore only a rehash signal, while
-replacement, access-policy expansion, or content mutation still returns `collector-inconclusive`
-and discards command output. The 4,096-call ceiling cannot
-amplify unchanged executable/config hashing into 4,096 full reads.
+are absent. `gh` is not the HTTP transport. A token already present in the
+admitted active `github.com` mapping is copied directly into an owner-private
+`0400` header file; a keyring-only token is obtained with the sole fixed local
+command `gh auth token --hostname github.com`. The token never enters the API
+argv or environment.
+
+Every REST read uses the fixed root-owned `/usr/bin/curl` OS trust root and an
+exact URL built from `https://api.github.com` plus a validated relative
+endpoint and typed query. The argv starts with `--disable`, disables proxy use,
+admits only HTTPS, contains neither `--location` nor `--location-trusted`, and
+sets `--max-redirs 0`. Therefore every `300` through `399` response is terminal:
+the doctor neither parses nor follows `Location`, regardless of same-host,
+cross-host, scheme, port, or multi-hop shape. The curl executable and each
+root-owned, non-writable ancestor are rebound before and after the request;
+the authorization-header file is included in the same descriptor-safe
+pre/post revalidation and verified cleanup transaction as the generated
+configuration.
+
+The source executable/config and snapshot path/descriptor identities, sizes,
+owners, groups, links, modes, and access-policy bindings are revalidated before
+and after every invocation and once more before any admission. Each exact
+content digest is cached only with a descriptor/path generation receipt bound
+to size, `mtime_ns`, and `ctime_ns`. An unchanged generation avoids rereading a
+large executable; a changed generation performs the same bounded content read
+and exact digest comparison before the receipt can advance. Metadata churn is
+therefore only a rehash signal, while replacement, access-policy expansion, or
+content mutation still returns `collector-inconclusive` and discards command
+output. The 4,096-call ceiling cannot amplify unchanged executable/config
+hashing into 4,096 full reads.
 The same process:
 
-- runs `gh auth status --hostname github.com` without printing its output, then
-  reads `/user` to prove the active authenticated API path
+- resolves the active token locally when needed, then reads `/user` through
+  the fixed no-redirect transport to prove both token validity and the exact
+  authenticated account without printing credential output
 - reads the exact organization, target repository, selected PR, organization
   ruleset, all twelve cutover-input repository variables, the exact selected
   run-attempt endpoint, source workflow repository, workflow metadata, and
@@ -470,21 +487,23 @@ to the trusted workflow identity, and only the pinned lineage's run, job, and
 check must be complete and successful. A later attempt supersedes an older
 attempt of the same run.
 
-The live preflight is read-only. It invokes only `gh auth status` and fixed
-GitHub REST `GET` endpoints; it does not create, update, evaluate, disable, or
-delete a ruleset, rerun a workflow, post a comment, or mutate the PR. The active
-credential needs read access to the repository, Actions, checks, and
-organization ruleset metadata. Authentication, permission, pagination, and
-API-limit failures remain `blocked_until_trusted`.
+The live preflight is read-only. It invokes only the local `gh auth token`
+credential lookup when the admitted config has no inline token and fixed
+GitHub REST `GET` endpoints through the no-redirect curl profile; it does not
+create, update, evaluate, disable, or delete a ruleset, rerun a workflow, post
+a comment, or mutate the PR. The active credential needs read access to the
+repository, Actions, checks, and organization ruleset metadata.
+Authentication, permission, pagination, and API-limit failures remain
+`blocked_until_trusted`.
 
-API failures retain only a fixed endpoint class, a parsed HTTP status when `gh`
-provides one, and a stable reason code. `401` maps to
+API failures retain only a fixed endpoint class, the curl trailer's parsed
+HTTP status, and a stable reason code. `401` maps to
 `blocked-authentication`; ordinary `403` (including the current organization
 ruleset `admin:org` failure) maps to `blocked-permission`; `404` maps to
 `not-found`; `429` and explicit rate-limit `403` map to `rate-limited`; `5xx`
 and malformed responses map to `api-unavailable`; and bounded command expiry
 maps to `api-timeout`. Response bodies, raw headers, command environments,
-tokens, and raw `gh` stderr are never copied into the doctor receipt.
+tokens, and raw subprocess stderr are never copied into the doctor receipt.
 
 The termination boundary starts before the first source credential read and
 remains one client-lifecycle transaction until verified deletion.

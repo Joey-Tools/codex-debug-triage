@@ -21,14 +21,16 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
 CONTRACT_SCHEMA_VERSION = 4
 COLLECTOR_SCHEMA_VERSION = 3
 DOCTOR_SCHEMA_VERSION = 5
-API_HOST = "github.com"
-API_ROOT = "https://api.github.com"
+AUTH_HOST = "github.com"
+API_ORIGIN_HOST = "api.github.com"
+API_ROOT = f"https://{API_ORIGIN_HOST}"
 API_VERSION = "2026-03-10"
 API_ACCEPT = "application/vnd.github+json"
 API_PER_PAGE = 100
@@ -58,9 +60,16 @@ GH_PROCESS_DRAIN_CHUNKS_PER_TICK = 16
 GH_TERMINATION_SIGNAL_NAMES = ("SIGHUP", "SIGINT", "SIGQUIT", "SIGTERM")
 MAX_DARWIN_ACL_BYTES = 64 * 1024
 MAX_DARWIN_ACL_ENTRIES = 128
-GH_EXECUTABLE_ENVIRONMENT_PROFILE = "minimal-snapshotted-config-v2"
+GH_EXECUTABLE_ENVIRONMENT_PROFILE = "minimal-snapshotted-auth-v3"
 GH_EXECUTION_SOURCE = "owner-private-snapshot"
 GH_RUNTIME_COMPONENTS = (".codex", "cisco-cutover-doctor")
+CURL_EXECUTABLE = pathlib.Path("/usr/bin/curl")
+CURL_WRITE_OUT_FORMAT = (
+    "\nCISCO_STATUS=%{http_code}\nCISCO_RATE=%header{x-ratelimit-remaining}\n"
+)
+CURL_TRAILER_PATTERN = re.compile(
+    rb"\nCISCO_STATUS=([0-9]{3})\nCISCO_RATE=([0-9]*)\n\Z"
+)
 DARWIN_LIBSYSTEM_PATH = "/usr/lib/libSystem.B.dylib"
 DARWIN_ACL_TYPE_EXTENDED = 0x00000100
 DARWIN_ACL_EXTENDED_ALLOW = 1
@@ -1259,6 +1268,52 @@ def _api_request_error(
     )
 
 
+def _api_http_status_error(
+    *,
+    endpoint_class: str,
+    http_status: int,
+    authentication_preflight: bool = False,
+    rate_limited: bool = False,
+) -> EnforcementDoctorError:
+    if authentication_preflight or http_status == 401:
+        reason_code = "blocked-authentication"
+        reason = "GitHub API authentication was rejected"
+        failure_kind = "authentication"
+    elif http_status == 403 and rate_limited:
+        reason_code = "rate-limited"
+        reason = "GitHub API rate limit blocked the read"
+        failure_kind = "rate-limit"
+    elif http_status == 403:
+        reason_code = "blocked-permission"
+        reason = "GitHub API permission blocked the read"
+        failure_kind = "permission"
+    elif http_status == 404:
+        reason_code = "not-found"
+        reason = "GitHub API object was not found or is not visible"
+        failure_kind = "not-found"
+    elif http_status == 429:
+        reason_code = "rate-limited"
+        reason = "GitHub API rate limit blocked the read"
+        failure_kind = "rate-limit"
+    elif 500 <= http_status <= 599:
+        reason_code = "api-unavailable"
+        reason = "GitHub API service failed the read"
+        failure_kind = "server-error"
+    else:
+        reason_code = "api-unavailable"
+        reason = "GitHub API request failed"
+        failure_kind = "http-error"
+    return _blocked(
+        reason_code,
+        reason,
+        api_failure=_api_failure(
+            endpoint_class,
+            http_status=http_status,
+            failure_kind=failure_kind,
+        ),
+    )
+
+
 def _sha256_fd_bounded(
     fd: int,
     *,
@@ -1356,6 +1411,62 @@ def _file_status(status_value: os.stat_result) -> dict[str, int]:
         "size": status_value.st_size,
         "uid": status_value.st_uid,
     }
+
+
+def _fixed_curl_trust_binding() -> tuple[dict[str, int], tuple[str, int, str]]:
+    for directory in (
+        pathlib.Path("/"),
+        pathlib.Path("/usr"),
+        CURL_EXECUTABLE.parent,
+    ):
+        try:
+            directory_status = os.lstat(directory)
+        except OSError as error:
+            raise _blocked(
+                "collector-unavailable",
+                "fixed curl trust-root directory is unavailable",
+            ) from error
+        if (
+            stat.S_ISLNK(directory_status.st_mode)
+            or not stat.S_ISDIR(directory_status.st_mode)
+            or directory_status.st_uid != 0
+            or stat.S_IMODE(directory_status.st_mode) & 0o022
+        ):
+            raise _blocked(
+                "collector-unavailable",
+                "fixed curl trust-root directory is replaceable",
+            )
+
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(CURL_EXECUTABLE, flags)
+        descriptor_status = os.fstat(descriptor)
+        path_status = os.lstat(CURL_EXECUTABLE)
+        access_policy = _stable_fd_access_policy_binding(descriptor)
+    except EnforcementDoctorError:
+        raise
+    except OSError as error:
+        raise _blocked(
+            "collector-unavailable",
+            "fixed curl transport is unavailable",
+        ) from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    if (
+        not stat.S_ISREG(descriptor_status.st_mode)
+        or not stat.S_ISREG(path_status.st_mode)
+        or descriptor_status.st_uid != 0
+        or stat.S_IMODE(descriptor_status.st_mode) & 0o022
+        or stat.S_IMODE(descriptor_status.st_mode) & 0o111 == 0
+        or _file_status(descriptor_status) != _file_status(path_status)
+    ):
+        raise _blocked(
+            "collector-unavailable",
+            "fixed curl transport identity or access policy is invalid",
+        )
+    return _file_status(descriptor_status), access_policy
 
 
 def _object_identity(status_value: os.stat_result) -> tuple[int, int]:
@@ -2107,7 +2218,7 @@ def _validate_no_transport_redirects(payload: bytes) -> None:
             )
 
 
-def _minimal_github_hosts(payload: bytes) -> bytes:
+def _minimal_github_hosts(payload: bytes) -> tuple[bytes, bytes | None]:
     decoded = _validate_config_text(payload, label="GitHub CLI hosts.yml")
     github_sections = 0
     in_github = False
@@ -2124,7 +2235,7 @@ def _minimal_github_hosts(payload: bytes) -> bytes:
                     "collector-unavailable",
                     "GitHub CLI hosts.yml has an unsupported root entry",
                 )
-            in_github = root.group(1) == API_HOST
+            in_github = root.group(1) == AUTH_HOST
             if in_github:
                 github_sections += 1
             continue
@@ -2250,7 +2361,7 @@ def _minimal_github_hosts(payload: bytes) -> bytes:
             "GitHub CLI active github.com token is not a safe scalar",
         )
     output = [
-        f"{API_HOST}:\n",
+        f"{AUTH_HOST}:\n",
         f"    git_protocol: {protocol}\n",
         "    users:\n",
         f"        {active_user}:\n",
@@ -2260,7 +2371,10 @@ def _minimal_github_hosts(payload: bytes) -> bytes:
     output.append(f"    user: {active_user}\n")
     if active_token is not None:
         output.append(f"    oauth_token: {active_token}\n")
-    return "".join(output).encode("utf-8")
+    return (
+        "".join(output).encode("utf-8"),
+        None if active_token is None else active_token.encode("ascii"),
+    )
 
 
 def _create_private_child_directory(
@@ -2866,11 +2980,13 @@ class GitHubApiClient:
         self._run_directory: Optional[_BoundDirectory] = None
         self._executable_snapshot_directory: Optional[_BoundDirectory] = None
         self._config_snapshot_directory: Optional[_BoundDirectory] = None
+        self._transport_directory: Optional[_BoundDirectory] = None
         self._source_config_directory: Optional[_BoundDirectory] = None
         self._source_hosts_file: Optional[_BoundRegularFile] = None
         self._source_global_config_file: Optional[_BoundRegularFile] = None
         self._snapshot_hosts_file: Optional[_BoundRegularFile] = None
         self._snapshot_global_config_file: Optional[_BoundRegularFile] = None
+        self._snapshot_auth_header_file: Optional[_BoundRegularFile] = None
         self._provisional_cleanup_objects: list[dict[str, Any]] = []
         self._active_processes: dict[int, _ManagedProcess] = {}
         self._source_fd: Optional[int] = None
@@ -2891,6 +3007,8 @@ class GitHubApiClient:
         self.executable_sha256 = expected_gh_sha256
         self.execution_source = GH_EXECUTION_SOURCE
         self.environment_profile = GH_EXECUTABLE_ENVIRONMENT_PROFILE
+        self.transport_executable = os.fspath(CURL_EXECUTABLE)
+        self.transport_profile = "fixed-curl-no-redirect-v1"
         if SHA256_PATTERN.fullmatch(expected_gh_sha256) is None or set(
             expected_gh_sha256
         ) == {"0"}:
@@ -2914,6 +3032,16 @@ class GitHubApiClient:
                 create_final=True,
             )
             self._create_run_directory()
+            if self._run_directory is None:
+                raise _blocked(
+                    "collector-unavailable",
+                    "GitHub CLI private run directory is unavailable",
+                )
+            self._transport_directory = _create_private_child_directory(
+                self._run_directory,
+                "transport",
+                label="GitHub API private transport directory",
+            )
             self._snapshot_configuration(gh_config_dir)
             if self._run_directory is None:
                 raise _blocked(
@@ -2926,8 +3054,11 @@ class GitHubApiClient:
                 label="GitHub CLI private executable snapshot directory",
             )
             self._pin_executable(gh_executable, expected_gh_sha256)
+            self._curl_trust_binding = _fixed_curl_trust_binding()
             self._config_snapshot_directory.set_owner_mode(0o500)
             self._executable_snapshot_directory.set_owner_mode(0o500)
+            if self._snapshot_auth_header_file is not None:
+                self._transport_directory.set_owner_mode(0o500)
             self._revalidate_snapshot()
             self.calls = 0
             self.total_bytes = 0
@@ -3006,7 +3137,9 @@ class GitHubApiClient:
                 max_bytes=MAX_GH_CONFIG_BYTES,
             )
             _validate_no_transport_redirects(self._source_global_config_file.payload)
-        minimal_hosts = _minimal_github_hosts(self._source_hosts_file.payload)
+        minimal_hosts, configured_token = _minimal_github_hosts(
+            self._source_hosts_file.payload
+        )
         self._source_hosts_file.payload = b""
         if self._source_global_config_file is not None:
             self._source_global_config_file.payload = b""
@@ -3040,6 +3173,22 @@ class GitHubApiClient:
         )
         self._snapshot_hosts_file.payload = b""
         self._snapshot_global_config_file.payload = b""
+        if configured_token is not None:
+            if self._transport_directory is None:
+                raise _blocked(
+                    "collector-unavailable",
+                    "GitHub API private transport directory is unavailable",
+                )
+            self._snapshot_auth_header_file = _create_private_regular_file(
+                self._transport_directory,
+                "authorization.headers",
+                b"Authorization: Bearer " + configured_token + b"\n",
+                cleanup_anchors=self._provisional_cleanup_objects,
+                label="GitHub API private authorization header",
+                mode=0o400,
+                max_bytes=MAX_GH_CONFIG_BYTES,
+            )
+            self._snapshot_auth_header_file.payload = b""
         self.config_snapshot_sha256 = hashlib.sha256(
             b"hosts.yml\0" + minimal_hosts + b"\0config.yml\0" + GH_SNAPSHOT_CONFIG
         ).hexdigest()
@@ -3353,6 +3502,7 @@ class GitHubApiClient:
             or self._run_directory is None
             or self._executable_snapshot_directory is None
             or self._config_snapshot_directory is None
+            or self._transport_directory is None
             or self._source_config_directory is None
             or self._source_hosts_file is None
             or self._snapshot_hosts_file is None
@@ -3377,6 +3527,8 @@ class GitHubApiClient:
             check_deadline()
             self._config_snapshot_directory.revalidate()
             check_deadline()
+            self._transport_directory.revalidate()
+            check_deadline()
             self._source_config_directory.revalidate()
             self._source_hosts_file.revalidate(deadline_check=check_deadline)
             if self._source_global_config_file is not None:
@@ -3385,6 +3537,10 @@ class GitHubApiClient:
                 )
             self._snapshot_hosts_file.revalidate(deadline_check=check_deadline)
             self._snapshot_global_config_file.revalidate(deadline_check=check_deadline)
+            if self._snapshot_auth_header_file is not None:
+                self._snapshot_auth_header_file.revalidate(
+                    deadline_check=check_deadline
+                )
             check_deadline()
             source_descriptor_before = os.fstat(self._source_fd)
             source_path_before = os.lstat(self._source_path)
@@ -3866,6 +4022,17 @@ class GitHubApiClient:
             ),
             (
                 None
+                if self._snapshot_auth_header_file is None
+                else self._snapshot_auth_header_file.fd,
+                "GitHub API private authorization header",
+                (
+                    run_path / "transport" / "authorization.headers"
+                    if self._transport_directory is None
+                    else self._transport_directory.path / "authorization.headers"
+                ),
+            ),
+            (
+                None
                 if self._config_snapshot_directory is None
                 else self._config_snapshot_directory.fd,
                 "GitHub CLI private config snapshot directory",
@@ -3884,6 +4051,17 @@ class GitHubApiClient:
                     run_path / "bin"
                     if self._executable_snapshot_directory is None
                     else self._executable_snapshot_directory.path
+                ),
+            ),
+            (
+                None
+                if self._transport_directory is None
+                else self._transport_directory.fd,
+                "GitHub API private transport directory",
+                (
+                    run_path / "transport"
+                    if self._transport_directory is None
+                    else self._transport_directory.path
                 ),
             ),
             (
@@ -4003,6 +4181,28 @@ class GitHubApiClient:
                     proof_required=True,
                 )
 
+        if not process_cleanup_unproven and self._transport_directory is not None:
+            attempt(
+                "transport-directory-owner-mode",
+                lambda: self._prepare_directory_for_cleanup(self._transport_directory),
+                proof_required=True,
+            )
+            bound_fd, expected_binding = self._cleanup_file_binding(
+                self._snapshot_auth_header_file,
+                self._transport_directory.path / "authorization.headers",
+            )
+            attempt(
+                "unlink-authorization.headers",
+                lambda: self._unlink_cleanup_file(
+                    self._transport_directory,
+                    "authorization.headers",
+                    label="GitHub API private authorization header",
+                    bound_fd=bound_fd,
+                    expected_binding=expected_binding,
+                ),
+                proof_required=True,
+            )
+
         if (
             not process_cleanup_unproven
             and self._executable_snapshot_directory is not None
@@ -4049,6 +4249,28 @@ class GitHubApiClient:
                         "config",
                         label="GitHub CLI private config snapshot directory",
                         child=self._config_snapshot_directory,
+                    ),
+                    proof_required=True,
+                )
+            if self._transport_directory is None:
+                attempt(
+                    "remove-transport-directory",
+                    lambda: self._remove_cleanup_directory(
+                        self._run_directory,
+                        "transport",
+                        label="GitHub API private transport directory",
+                        child=None,
+                    ),
+                    proof_required=True,
+                )
+            else:
+                attempt(
+                    "remove-transport-directory",
+                    lambda: self._remove_cleanup_directory(
+                        self._run_directory,
+                        "transport",
+                        label="GitHub API private transport directory",
+                        child=self._transport_directory,
                     ),
                     proof_required=True,
                 )
@@ -4113,6 +4335,7 @@ class GitHubApiClient:
             self._source_global_config_file,
             self._snapshot_hosts_file,
             self._snapshot_global_config_file,
+            self._snapshot_auth_header_file,
         ):
             if bound_file is not None:
                 bound_file.close()
@@ -4139,6 +4362,9 @@ class GitHubApiClient:
         if self._executable_snapshot_directory is not None:
             self._executable_snapshot_directory.close()
             self._executable_snapshot_directory = None
+        if self._transport_directory is not None:
+            self._transport_directory.close()
+            self._transport_directory = None
         if self._run_directory is not None:
             self._run_directory.close()
             self._run_directory = None
@@ -4279,92 +4505,140 @@ class GitHubApiClient:
         authentication_preflight: bool = False,
     ) -> bytes:
         self._activate_termination_transaction()
-        if self.calls >= MAX_API_CALLS:
-            raise _blocked(
-                "api-call-limit",
-                "GitHub collector exceeded its API call ceiling",
-                api_failure=_api_failure(
-                    endpoint_class,
-                    http_status=None,
-                    failure_kind="call-limit",
-                ),
-            )
         try:
-            self._require_deadline_remaining(self.deadline, endpoint_class)
+            if self.calls >= MAX_API_CALLS:
+                raise _blocked(
+                    "api-call-limit",
+                    "GitHub collector exceeded its API call ceiling",
+                    api_failure=_api_failure(
+                        endpoint_class,
+                        http_status=None,
+                        failure_kind="call-limit",
+                    ),
+                )
+            try:
+                self._require_deadline_remaining(self.deadline, endpoint_class)
+                self._revalidate_snapshot(
+                    absolute_deadline=self.deadline,
+                    endpoint_class=endpoint_class,
+                )
+                remaining = self._require_deadline_remaining(
+                    self.deadline,
+                    endpoint_class,
+                )
+                self.calls += 1
+                process_result = _bounded_subprocess(
+                    command,
+                    environment=dict(self._environment),
+                    execution_cwd=self._execution_cwd,
+                    endpoint_class=endpoint_class,
+                    process_registry=self._active_processes,
+                    timeout_seconds=min(float(MAX_API_SECONDS), remaining),
+                    stdout_limit=stdout_limit,
+                    stderr_limit=MAX_API_STDERR_BYTES,
+                    termination_cleanup=self.close,
+                    lifecycle_signal_guard=getattr(
+                        self,
+                        "_termination_signal_guard",
+                        None,
+                    ),
+                    absolute_deadline=self.deadline,
+                )
+            except BaseException as error:
+                self._close_after_termination(error)
+                if getattr(self, "_closed", False):
+                    raise
+                self._revalidate_snapshot(
+                    absolute_deadline=self.deadline,
+                    endpoint_class=endpoint_class,
+                )
+                raise
+
             self._revalidate_snapshot(
                 absolute_deadline=self.deadline,
                 endpoint_class=endpoint_class,
             )
-            remaining = self._require_deadline_remaining(
-                self.deadline,
-                endpoint_class,
-            )
-            self.calls += 1
-            process_result = _bounded_subprocess(
-                command,
-                environment=dict(self._environment),
-                execution_cwd=self._execution_cwd,
-                endpoint_class=endpoint_class,
-                process_registry=self._active_processes,
-                timeout_seconds=min(float(MAX_API_SECONDS), remaining),
-                stdout_limit=stdout_limit,
-                stderr_limit=MAX_API_STDERR_BYTES,
-                termination_cleanup=self.close,
-                lifecycle_signal_guard=getattr(
-                    self,
-                    "_termination_signal_guard",
-                    None,
-                ),
-                absolute_deadline=self.deadline,
-            )
+            return_code, stdout, stderr = process_result
+            if return_code != 0:
+                raise _api_request_error(
+                    endpoint_class=endpoint_class,
+                    stderr=stderr,
+                    authentication_preflight=authentication_preflight,
+                )
+            self.total_bytes += len(stdout) + len(stderr)
+            if self.total_bytes > MAX_API_TOTAL_BYTES:
+                raise _blocked(
+                    "api-response-too-large",
+                    "GitHub collector exceeded its aggregate response ceiling",
+                    api_failure=_api_failure(
+                        endpoint_class,
+                        http_status=None,
+                        failure_kind="response-too-large",
+                    ),
+                )
+            return stdout
         except BaseException as error:
             self._close_after_termination(error)
-            if getattr(self, "_closed", False):
-                raise
-            self._revalidate_snapshot(
-                absolute_deadline=self.deadline,
-                endpoint_class=endpoint_class,
-            )
             raise
-        self._revalidate_snapshot(
-            absolute_deadline=self.deadline,
-            endpoint_class=endpoint_class,
-        )
-        return_code, stdout, stderr = process_result
-        if return_code != 0:
-            raise _api_request_error(
-                endpoint_class=endpoint_class,
-                stderr=stderr,
-                authentication_preflight=authentication_preflight,
-            )
-        self.total_bytes += len(stdout) + len(stderr)
-        if self.total_bytes > MAX_API_TOTAL_BYTES:
+
+    def _install_authentication_header(self, token_output: bytes) -> None:
+        if self._snapshot_auth_header_file is not None:
+            return
+        if self._transport_directory is None:
             raise _blocked(
-                "api-response-too-large",
-                "GitHub collector exceeded its aggregate response ceiling",
+                "collector-unavailable",
+                "GitHub API private transport directory is unavailable",
+            )
+        token = token_output[:-1] if token_output.endswith(b"\n") else token_output
+        if (
+            not token
+            or b"\r" in token_output
+            or b"\n" in token
+            or re.fullmatch(rb"[A-Za-z0-9_.-]{1,2048}", token) is None
+        ):
+            raise _blocked(
+                "blocked-authentication",
+                "GitHub authentication token output is invalid",
                 api_failure=_api_failure(
-                    endpoint_class,
+                    "authentication-preflight",
                     http_status=None,
-                    failure_kind="response-too-large",
+                    failure_kind="authentication",
                 ),
             )
-        return stdout
+        header_payload = b"Authorization: Bearer " + token + b"\n"
+        self._snapshot_auth_header_file = _create_private_regular_file(
+            self._transport_directory,
+            "authorization.headers",
+            header_payload,
+            cleanup_anchors=self._provisional_cleanup_objects,
+            label="GitHub API private authorization header",
+            mode=0o400,
+            max_bytes=MAX_GH_CONFIG_BYTES,
+        )
+        self._snapshot_auth_header_file.payload = b""
+        self._transport_directory.set_owner_mode(0o500)
+        self._revalidate_snapshot(
+            absolute_deadline=self.deadline,
+            endpoint_class="authentication-preflight",
+        )
 
     def auth_preflight(self) -> dict[str, Any]:
         try:
-            self._run(
-                [
-                    self.executable,
-                    "auth",
-                    "status",
-                    "--hostname",
-                    API_HOST,
-                ],
-                endpoint_class="authentication-preflight",
-                stdout_limit=MAX_API_STDERR_BYTES,
-                authentication_preflight=True,
-            )
-            user = self.get_json("/user")
+            if self._snapshot_auth_header_file is None:
+                token_output = self._run(
+                    [
+                        self.executable,
+                        "auth",
+                        "token",
+                        "--hostname",
+                        AUTH_HOST,
+                    ],
+                    endpoint_class="authentication-preflight",
+                    stdout_limit=2_049,
+                    authentication_preflight=True,
+                )
+                self._install_authentication_header(token_output)
+            user = self.get_json("/user", authentication_preflight=True)
             user_object = _exact_dict(user, label="authenticated GitHub user")
             return {
                 "id": _exact_positive_integer(
@@ -4384,48 +4658,149 @@ class GitHubApiClient:
         self,
         endpoint: str,
         parameters: Optional[dict[str, object]] = None,
+        *,
+        authentication_preflight: bool = False,
     ) -> object:
-        if (
-            re.fullmatch(r"/[A-Za-z0-9._~/-]+", endpoint) is None
-            or endpoint.startswith("//")
-            or "//" in endpoint
-            or "/../" in f"{endpoint}/"
-            or "/./" in f"{endpoint}/"
-        ):
-            raise _blocked("invalid-api-endpoint", "collector endpoint is not fixed")
-        command = [
-            self.executable,
-            "api",
-            "--hostname",
-            API_HOST,
-            "--method",
-            "GET",
-            "-H",
-            f"Accept: {API_ACCEPT}",
-            "-H",
-            f"X-GitHub-Api-Version: {API_VERSION}",
-            endpoint,
-        ]
-        for key, value in sorted((parameters or {}).items()):
-            if not re.fullmatch(r"[a-z_]+", key):
-                raise _blocked(
-                    "invalid-api-endpoint",
-                    "collector query parameter name is not fixed",
-                )
-            if type(value) not in (str, int, bool):
-                raise _blocked(
-                    "invalid-api-endpoint",
-                    "collector query parameter value is invalid",
-                )
-            rendered = str(value).lower() if type(value) is bool else str(value)
-            command.extend(["-f", f"{key}={rendered}"])
-        endpoint_class = _api_endpoint_class(endpoint)
-        payload = self._run(
-            command,
-            endpoint_class=endpoint_class,
-            stdout_limit=MAX_API_RESPONSE_BYTES,
-        )
         try:
+            if (
+                re.fullmatch(r"/[A-Za-z0-9._~/-]+", endpoint) is None
+                or endpoint.startswith("//")
+                or "//" in endpoint
+                or "/../" in f"{endpoint}/"
+                or "/./" in f"{endpoint}/"
+            ):
+                raise _blocked(
+                    "invalid-api-endpoint",
+                    "collector endpoint is not fixed",
+                )
+            if self._snapshot_auth_header_file is None:
+                raise _blocked(
+                    "blocked-authentication",
+                    "GitHub API authentication preflight has not completed",
+                    api_failure=_api_failure(
+                        "authentication-preflight",
+                        http_status=None,
+                        failure_kind="authentication",
+                    ),
+                )
+            query: list[tuple[str, str]] = []
+            for key, value in sorted((parameters or {}).items()):
+                if not re.fullmatch(r"[a-z_]+", key):
+                    raise _blocked(
+                        "invalid-api-endpoint",
+                        "collector query parameter name is not fixed",
+                    )
+                if type(value) not in (str, int, bool):
+                    raise _blocked(
+                        "invalid-api-endpoint",
+                        "collector query parameter value is invalid",
+                    )
+                rendered = str(value).lower() if type(value) is bool else str(value)
+                query.append((key, rendered))
+            endpoint_class = _api_endpoint_class(endpoint)
+            query_string = urllib.parse.urlencode(query)
+            request_url = f"{API_ROOT}{endpoint}"
+            if query_string:
+                request_url = f"{request_url}?{query_string}"
+            remaining = self._require_deadline_remaining(
+                self.deadline,
+                endpoint_class,
+            )
+            curl_binding_before = _fixed_curl_trust_binding()
+            if curl_binding_before != self._curl_trust_binding:
+                raise _blocked(
+                    "collector-inconclusive",
+                    "fixed curl transport identity or access policy changed",
+                )
+            header_path = (
+                self._transport_directory.path / "authorization.headers"
+                if self._transport_directory is not None
+                else pathlib.Path()
+            )
+            command = [
+                os.fspath(CURL_EXECUTABLE),
+                "--disable",
+                "--silent",
+                "--show-error",
+                "--request",
+                "GET",
+                "--proto",
+                "=https",
+                "--proto-redir",
+                "=https",
+                "--max-redirs",
+                "0",
+                "--proxy",
+                "",
+                "--noproxy",
+                "*",
+                "--connect-timeout",
+                str(max(1, min(MAX_API_SECONDS, int(remaining)))),
+                "--max-time",
+                str(max(1, min(MAX_API_SECONDS, int(remaining)))),
+                "--header",
+                f"@{header_path}",
+                "--header",
+                f"Accept: {API_ACCEPT}",
+                "--header",
+                f"X-GitHub-Api-Version: {API_VERSION}",
+                "--write-out",
+                CURL_WRITE_OUT_FORMAT,
+                "--url",
+                request_url,
+            ]
+            payload = self._run(
+                command,
+                endpoint_class=endpoint_class,
+                stdout_limit=MAX_API_RESPONSE_BYTES + 128,
+            )
+            curl_binding_after = _fixed_curl_trust_binding()
+            if curl_binding_after != curl_binding_before:
+                raise _blocked(
+                    "collector-inconclusive",
+                    "fixed curl transport identity or access policy changed",
+                )
+            trailer = CURL_TRAILER_PATTERN.search(payload)
+            if trailer is None:
+                raise _blocked(
+                    "api-unavailable",
+                    "fixed curl transport omitted the HTTP status",
+                    api_failure=_api_failure(
+                        endpoint_class,
+                        http_status=None,
+                        failure_kind="transport-contract",
+                    ),
+                )
+            http_status = int(trailer.group(1), 10)
+            rate_remaining = trailer.group(2)
+            payload = payload[: trailer.start()]
+            if len(payload) > MAX_API_RESPONSE_BYTES:
+                raise _blocked(
+                    "api-response-too-large",
+                    "GitHub API response exceeded its byte ceiling",
+                    api_failure=_api_failure(
+                        endpoint_class,
+                        http_status=http_status,
+                        failure_kind="response-too-large",
+                    ),
+                )
+            if 300 <= http_status <= 399:
+                raise _blocked(
+                    "api-unavailable",
+                    "GitHub API redirect was refused",
+                    api_failure=_api_failure(
+                        endpoint_class,
+                        http_status=http_status,
+                        failure_kind="redirect-refused",
+                    ),
+                )
+            if http_status != 200:
+                raise _api_http_status_error(
+                    endpoint_class=endpoint_class,
+                    http_status=http_status,
+                    authentication_preflight=authentication_preflight,
+                    rate_limited=rate_remaining == b"0",
+                )
             parsed = _parse_json_bytes(
                 payload,
                 label=f"GitHub API {endpoint_class}",
@@ -6179,8 +6554,10 @@ def _collect_and_validate_static(
         )
     completed_at = _utc_now()
     collector_receipt = {
-        "api_host": API_HOST,
+        "api_host": API_ORIGIN_HOST,
+        "api_origin": API_ROOT,
         "api_version": API_VERSION,
+        "authentication_host": AUTH_HOST,
         "authenticated_user": authenticated_user,
         "completed_at": completed_at,
         "gh_executable": {
@@ -6197,6 +6574,18 @@ def _collect_and_validate_static(
         "page_bounds": trace["page_bounds"],
         "schema_version": COLLECTOR_SCHEMA_VERSION,
         "started_at": started_at,
+        "transport": {
+            "executable": getattr(
+                client,
+                "transport_executable",
+                os.fspath(CURL_EXECUTABLE),
+            ),
+            "profile": getattr(
+                client,
+                "transport_profile",
+                "test-double",
+            ),
+        },
     }
     evidence = {
         "collector": collector_receipt,
