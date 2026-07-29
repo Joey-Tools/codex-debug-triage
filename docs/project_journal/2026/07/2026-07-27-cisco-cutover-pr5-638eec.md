@@ -3,7 +3,7 @@ id: 20260727-638eec
 title: Cisco Cutover Admission Hardening
 status: blocked
 created: 2026-07-27
-updated: 2026-07-29
+updated: 2026-07-30
 branch: codex/retire-active-generic-triage
 pr: https://github.com/Joey-Tools/codex-debug-triage/pull/5
 supersedes: []
@@ -39,6 +39,9 @@ superseded_by:
 - ZIP reread admission binds `ZipInfo` back to the preflight central-directory name, flags, extract version, compression method, CRC, compressed/uncompressed sizes, and local-header offset, so an equal-length central-directory rewrite cannot redirect later inspection.
 - Actions Variables pagination uses the endpoint's documented 30-item ceiling rather than the generic 100-item GitHub page size, and receipts record the effective bound for every page.
 - Archive inspection ignores ambient `TMPDIR`, creates a random `0700` root and `0600` file under the fixed system temporary parent, validates descriptor/path identity and Darwin ACL or Linux mode-mask policy before the first archive byte, then unlinks the file and removes the root. Parsing uses only the resulting zero-link descriptor, after complete source content and access-policy revalidation.
+- A private child directory that fails descriptor, mode, or ACL validation is removed only while its retained descriptor, parent-relative name, object identity, and parent access policy still match; replacement or unproved cleanup remains `collector-inconclusive` instead of deleting an unbound object.
+- The required-workflow selector is explicitly neutral when both administrator selector variables are absent, while partial, malformed, or placeholder configuration remains blocked. This prevents unrelated PRs from being held by an intentionally unconfigured cutover without weakening the selected target binding.
+- The schema-3 private-overlay receipt validator and schema-4 live-enforcement doctor remain distinct contract profiles. Passing the enforcement contract to the receipt validator now returns a profile-routing error that names the correct doctor instead of a generic schema mismatch.
 
 ## Next Steps
 
@@ -57,6 +60,8 @@ superseded_by:
 - Fresh-review repair suite on Python 3.13.0: 245 tests passed, including fixed-transport redirect refusal, authentication-preflight failure classification, post-child signal injection, and equal-length ZIP metadata rewrites.
 - Current fresh-review repair suite on Python 3.13.0 and system Python 3.9.6: 261 tests passed, including complete `filter=all` suite/run lineage, suite-first enumeration beyond 1,000 suites, duplicate/cap/pagination refusal, owner-private anonymous archive snapshots, initialization-deadline cleanup, curl exit-28 classification, executable-snapshot readback mutation refusal, and bounded fenced diagnostics on a full pipe.
 - Latest fresh-review repair suite on Python 3.13.0 and system Python 3.9.6: 264 tests passed, including fixed Keychain-helper lookup with ambient-`PATH` exclusion, fixed GraphQL workflow-file collection, exact ruleset-SHA acceptance/stale-definition rejection, and rerun-attempt binding.
+- Current-head GitHub-review repair suite on Python 3.13.0 and system Python 3.9.6: 269 tests passed, including descriptor-bound failed-directory cleanup, replacement-safe retained-object evidence, neutral unconfigured selectors, blocked partial selectors, and explicit schema-3/schema-4 profile routing.
+- Focused current-head repair selection: 11 tests passed; the hosted macOS ACL integration selection passed all 7 tests.
 - Darwin repair selection on Python 3.13.0: 10 tests passed, including inherited snapshot ACL refusal before copy, existing descriptor-ACL integration, initialization deadlines, and suite-first lineage.
 - Python 3.13.0 and system Python 3.9.6 compilation passed for all CI-listed helpers and tests.
 - Ruff passed for all CI-listed Python helpers and tests.

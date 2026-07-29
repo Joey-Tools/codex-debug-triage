@@ -13,8 +13,8 @@ import time
 from datetime import datetime, timezone
 from typing import Any
 
-CONTRACT_SCHEMA_VERSION = 3
-RECEIPT_SCHEMA_VERSION = 3
+MIGRATION_CONTRACT_SCHEMA_VERSION = 3
+PRIVATE_RELEASE_RECEIPT_SCHEMA_VERSION = 3
 DEFAULT_MAX_JSON_BYTES = 64 * 1024
 MAX_RECEIPT_BYTES = 35 * 1024
 JSON_READ_TIMEOUT_SECONDS = 1.0
@@ -527,6 +527,19 @@ def _pointer_state_sha256(
 
 
 def _validate_contract(contract: dict[str, Any]) -> dict[str, Any]:
+    if contract.get("schema_version") == 4 and {
+        "source_organization",
+        "target_repository",
+        "ruleset",
+        "required_workflow",
+        "applicability_selector",
+    }.issubset(contract):
+        raise ReceiptAdmissionError(
+            "contract profile differs: this validator requires the schema-3 "
+            "private-overlay migration receipt contract; use "
+            "doctor_cisco_cutover_enforcement.py for the schema-4 enforcement "
+            "contract"
+        )
     contract = _require_exact_keys(
         contract,
         {
@@ -546,7 +559,7 @@ def _validate_contract(contract: dict[str, Any]) -> dict[str, Any]:
     )
     _require_exact_json(
         contract["schema_version"],
-        CONTRACT_SCHEMA_VERSION,
+        MIGRATION_CONTRACT_SCHEMA_VERSION,
         label="contract schema_version",
     )
     _require_exact_json(
@@ -613,7 +626,7 @@ def _validate_contract(contract: dict[str, Any]) -> dict[str, Any]:
     expected_admission = {
         "status_without_receipt": "blocked_until_trusted",
         "validator": VALIDATOR_PATH,
-        "receipt_schema_version": RECEIPT_SCHEMA_VERSION,
+        "receipt_schema_version": PRIVATE_RELEASE_RECEIPT_SCHEMA_VERSION,
         "receipt_max_bytes": MAX_RECEIPT_BYTES,
         "producer_workflow": ".github/workflows/release.yml",
         "pointer_name": "current",
@@ -662,7 +675,7 @@ def _validate_receipt(
     )
     _require_exact_json(
         receipt["schema_version"],
-        RECEIPT_SCHEMA_VERSION,
+        PRIVATE_RELEASE_RECEIPT_SCHEMA_VERSION,
         label="receipt schema_version",
     )
     _require_exact_json(
@@ -1021,7 +1034,15 @@ def _parser() -> argparse.ArgumentParser:
             "release/pointer receipt."
         )
     )
-    parser.add_argument("--contract", required=True)
+    parser.add_argument(
+        "--contract",
+        required=True,
+        help=(
+            "schema-3 private-overlay migration receipt contract; the "
+            "schema-4 enforcement contract belongs to "
+            "doctor_cisco_cutover_enforcement.py"
+        ),
+    )
     parser.add_argument("--receipt")
     parser.add_argument("--expected-canonical-commit")
     parser.add_argument("--expected-pull-request-number")

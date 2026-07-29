@@ -54,7 +54,9 @@ Because the organization rule applies to every default-branch PR, the workflow
 uses administrator-owned exact PR-number/head selector variables. The one
 frozen retirement PR runs `cisco-cutover-admission`; concurrent and future PRs
 run the explicit `cisco-cutover-neutral` path without receiving target receipt
-evidence. A target-head change fails closed. The satisfiable rollout order is:
+evidence. When neither selector variable is configured, all PRs are explicitly
+neutral; a partial selector configuration or target-head change fails closed.
+The satisfiable rollout order is:
 merge the bootstrap workflow, create and freeze the retirement PR, publish a
 receipt bound to that repo/PR/head/workflow contract, configure variables and
 the ruleset, observe the target run, obtain a fresh doctor admission, and only

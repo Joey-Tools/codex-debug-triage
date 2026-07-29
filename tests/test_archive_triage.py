@@ -6524,6 +6524,93 @@ class BugTriageDocumentationTests(unittest.TestCase):
             with self.subTest(test=test_name):
                 self.assertIn(test_name, workflow)
 
+    def test_private_child_creation_removes_directory_after_fchmod_failure(
+        self,
+    ) -> None:
+        with owner_controlled_temp_root() as parent_path:
+            parent = ENFORCEMENT_MODULE._BoundDirectory(
+                parent_path,
+                label="test runtime parent",
+            )
+            try:
+                with mock.patch.object(
+                    ENFORCEMENT_MODULE.os,
+                    "fchmod",
+                    side_effect=PermissionError("injected fchmod failure"),
+                ):
+                    with self.assertRaises(
+                        ENFORCEMENT_MODULE.EnforcementDoctorError
+                    ) as raised:
+                        ENFORCEMENT_MODULE._create_private_child_directory(
+                            parent,
+                            "candidate",
+                            label="test run directory",
+                        )
+                self.assertEqual(
+                    raised.exception.reason_code,
+                    "collector-unavailable",
+                )
+                self.assertFalse((parent_path / "candidate").exists())
+                parent.revalidate()
+            finally:
+                parent.close()
+
+    def test_private_child_creation_does_not_remove_replacement(self) -> None:
+        with owner_controlled_temp_root() as parent_path:
+            parent = ENFORCEMENT_MODULE._BoundDirectory(
+                parent_path,
+                label="test runtime parent",
+            )
+            original_fchmod = ENFORCEMENT_MODULE.os.fchmod
+
+            def replace_before_failure(fd: int, mode: int) -> None:
+                original_fchmod(fd, mode)
+                os.rename(
+                    parent_path / "candidate",
+                    parent_path / "retained-original",
+                )
+                (parent_path / "candidate").mkdir(mode=0o700)
+                raise PermissionError("injected post-replacement failure")
+
+            try:
+                with mock.patch.object(
+                    ENFORCEMENT_MODULE.os,
+                    "fchmod",
+                    side_effect=replace_before_failure,
+                ):
+                    with self.assertRaises(
+                        ENFORCEMENT_MODULE.EnforcementDoctorError
+                    ) as raised:
+                        ENFORCEMENT_MODULE._create_private_child_directory(
+                            parent,
+                            "candidate",
+                            label="test run directory",
+                        )
+                self.assertEqual(
+                    raised.exception.reason_code,
+                    "collector-inconclusive",
+                )
+                cleanup = raised.exception.cleanup_failure
+                self.assertEqual(cleanup["cleanup_proof"], "inconclusive")
+                self.assertEqual(
+                    cleanup["failed_operations"],
+                    ["remove-created-directory"],
+                )
+                self.assertEqual(len(cleanup["retained_objects"]), 1)
+                locator = cleanup["retained_objects"][0]
+                retained_original = (parent_path / "retained-original").stat()
+                self.assertEqual(locator["device"], retained_original.st_dev)
+                self.assertEqual(locator["inode"], retained_original.st_ino)
+                self.assertEqual(locator["path_binding"], "unverified")
+                self.assertEqual(
+                    locator["last_known_path"],
+                    str(parent_path / "candidate"),
+                )
+                self.assertTrue((parent_path / "candidate").is_dir())
+                self.assertTrue((parent_path / "retained-original").is_dir())
+            finally:
+                parent.close()
+
     def test_trusted_cutover_selector_routes_target_and_non_target_prs(
         self,
     ) -> None:
@@ -6604,6 +6691,59 @@ class BugTriageDocumentationTests(unittest.TestCase):
         outcome = json.loads(result.stdout)
         self.assertEqual(outcome["classification"], "blocked_until_trusted")
         self.assertIn("head changed", outcome["reason"])
+
+    def test_trusted_cutover_selector_is_neutral_when_unconfigured(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            output_path = temp_root / "selector.output"
+            environment = self._selector_workflow_environment(
+                output_path=output_path,
+            )
+            environment.pop("CISCO_CUTOVER_TARGET_PR_NUMBER")
+            environment.pop("CISCO_CUTOVER_TARGET_HEAD_SHA")
+            result = self._run_selector_workflow_program(
+                environment=environment,
+                cwd=temp_root,
+            )
+            output = output_path.read_text(encoding="utf-8")
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        outcome = json.loads(result.stdout)
+        self.assertEqual(outcome["classification"], "not_applicable")
+        self.assertIsNone(outcome["target_pr_number"])
+        self.assertIsNone(outcome["target_head_sha"])
+        self.assertEqual(
+            output,
+            "applicable=false\ntarget-head-sha=\ntarget-pr-number=\n",
+        )
+
+    def test_trusted_cutover_selector_blocks_partial_configuration(self) -> None:
+        for missing_name in (
+            "CISCO_CUTOVER_TARGET_PR_NUMBER",
+            "CISCO_CUTOVER_TARGET_HEAD_SHA",
+        ):
+            with self.subTest(missing=missing_name):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    temp_root = Path(temp_dir)
+                    environment = self._selector_workflow_environment(
+                        output_path=temp_root / "selector.output",
+                    )
+                    environment.pop(missing_name)
+                    result = self._run_selector_workflow_program(
+                        environment=environment,
+                        cwd=temp_root,
+                    )
+
+                self.assertEqual(result.returncode, 1, result.stderr)
+                outcome = json.loads(result.stdout)
+                self.assertEqual(
+                    outcome["classification"],
+                    "blocked_until_trusted",
+                )
+                self.assertIn(
+                    "must be configured together",
+                    outcome["reason"],
+                )
 
     def test_trusted_cutover_selector_blocks_target_fork(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -14012,6 +14152,20 @@ class BugTriageDocumentationTests(unittest.TestCase):
         outcome = json.loads(result.stdout)
         self.assertEqual(outcome["classification"], "blocked_until_trusted")
         self.assertIn("activation.atomic", outcome["reason"])
+
+    def test_cutover_validator_routes_enforcement_contract_to_doctor(self) -> None:
+        result = self._run_cutover_validator(
+            contract_path=CUTOVER_ENFORCEMENT_CONTRACT_PATH,
+        )
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        outcome = json.loads(result.stdout)
+        self.assertEqual(outcome["classification"], "blocked_until_trusted")
+        self.assertIn("contract profile differs", outcome["reason"])
+        self.assertIn(
+            "doctor_cisco_cutover_enforcement.py",
+            outcome["reason"],
+        )
 
     def test_cutover_validator_requires_exact_contract_scalar_types(self) -> None:
         fixture = json.loads(MIGRATION_FIXTURE_PATH.read_text(encoding="utf-8"))

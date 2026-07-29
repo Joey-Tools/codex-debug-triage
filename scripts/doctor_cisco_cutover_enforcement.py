@@ -2465,6 +2465,100 @@ def _minimal_github_hosts(payload: bytes) -> tuple[bytes, bytes | None]:
     )
 
 
+def _remove_created_private_child_directory(
+    parent: _BoundDirectory,
+    name: str,
+    *,
+    label: str,
+    expected_identity: tuple[int, int] | None,
+    retained_fd: int | None = None,
+) -> None:
+    if expected_identity is None:
+        raise _blocked(
+            "collector-inconclusive",
+            f"{label} cleanup identity was never established",
+        )
+    parent.revalidate()
+    cleanup_fd: int | None = None
+    try:
+        if retained_fd is None:
+            flags = (
+                os.O_RDONLY
+                | os.O_DIRECTORY
+                | os.O_NOFOLLOW
+                | os.O_NONBLOCK
+                | getattr(os, "O_CLOEXEC", 0)
+            )
+            cleanup_fd = os.open(name, flags, dir_fd=parent.fd)
+        else:
+            cleanup_fd = retained_fd
+        descriptor = os.fstat(cleanup_fd)
+        path_status = os.stat(
+            name,
+            dir_fd=parent.fd,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISDIR(descriptor.st_mode)
+            or not stat.S_ISDIR(path_status.st_mode)
+            or _object_identity(descriptor) != expected_identity
+            or _object_identity(path_status) != expected_identity
+        ):
+            raise _blocked(
+                "collector-inconclusive",
+                f"{label} cleanup identity changed",
+            )
+        os.rmdir(name, dir_fd=parent.fd)
+        try:
+            os.stat(
+                name,
+                dir_fd=parent.fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            pass
+        else:
+            raise _blocked(
+                "collector-inconclusive",
+                f"{label} name was repopulated during cleanup",
+            )
+        parent.revalidate()
+    except EnforcementDoctorError:
+        raise
+    except OSError as error:
+        raise _blocked(
+            "collector-inconclusive",
+            f"{label} cleanup could not be proven",
+        ) from error
+    finally:
+        if retained_fd is None and cleanup_fd is not None:
+            try:
+                os.close(cleanup_fd)
+            except OSError:
+                pass
+
+
+def _created_private_child_cleanup_failure(
+    parent: _BoundDirectory,
+    name: str,
+    *,
+    label: str,
+    expected_identity: tuple[int, int] | None,
+) -> dict[str, Any]:
+    locator: dict[str, Any] = {
+        "label": label,
+        "last_known_path": os.fspath(parent.path / name),
+        "path_binding": "unverified",
+    }
+    if expected_identity is not None:
+        locator["device"], locator["inode"] = expected_identity
+    return {
+        "cleanup_proof": "inconclusive",
+        "failed_operations": ["remove-created-directory"],
+        "retained_objects": [locator],
+    }
+
+
 def _create_private_child_directory(
     parent: _BoundDirectory,
     name: str,
@@ -2486,9 +2580,13 @@ def _create_private_child_directory(
             f"{label} component is invalid",
         )
     parent.revalidate(deadline_check=deadline_check)
+    created = False
+    child_fd: int | None = None
+    created_identity: tuple[int, int] | None = None
     try:
         _check_deadline(deadline_check)
         os.mkdir(name, 0o700, dir_fd=parent.fd)
+        created = True
         flags = (
             os.O_RDONLY
             | os.O_DIRECTORY
@@ -2497,60 +2595,87 @@ def _create_private_child_directory(
             | getattr(os, "O_CLOEXEC", 0)
         )
         child_fd = os.open(name, flags, dir_fd=parent.fd)
-        try:
-            _check_deadline(deadline_check)
-            descriptor = os.fstat(child_fd)
-            path_status = os.stat(
-                name,
-                dir_fd=parent.fd,
-                follow_symlinks=False,
+        _check_deadline(deadline_check)
+        descriptor = os.fstat(child_fd)
+        created_identity = _object_identity(descriptor)
+        path_status = os.stat(
+            name,
+            dir_fd=parent.fd,
+            follow_symlinks=False,
+        )
+        initial_access_policy = _stable_fd_access_policy_binding(child_fd)
+        _check_deadline(deadline_check)
+        if (
+            not stat.S_ISDIR(descriptor.st_mode)
+            or descriptor.st_uid != os.geteuid()
+            or stat.S_IMODE(descriptor.st_mode) & 0o077
+            or _directory_status(descriptor) != _directory_status(path_status)
+            or initial_access_policy != _stable_fd_access_policy_binding(child_fd)
+        ):
+            raise _blocked(
+                "collector-unavailable",
+                f"{label} initial object is unsafe",
             )
-            initial_access_policy = _stable_fd_access_policy_binding(child_fd)
-            _check_deadline(deadline_check)
-            if (
-                not stat.S_ISDIR(descriptor.st_mode)
-                or descriptor.st_uid != os.geteuid()
-                or stat.S_IMODE(descriptor.st_mode) & 0o077
-                or _directory_status(descriptor) != _directory_status(path_status)
-                or initial_access_policy != _stable_fd_access_policy_binding(child_fd)
-            ):
-                raise _blocked(
-                    "collector-unavailable",
-                    f"{label} initial object is unsafe",
-                )
-            os.fchmod(child_fd, 0o700)
-            _check_deadline(deadline_check)
-            descriptor = os.fstat(child_fd)
-            path_status = os.stat(
-                name,
-                dir_fd=parent.fd,
-                follow_symlinks=False,
+        os.fchmod(child_fd, 0o700)
+        _check_deadline(deadline_check)
+        descriptor = os.fstat(child_fd)
+        path_status = os.stat(
+            name,
+            dir_fd=parent.fd,
+            follow_symlinks=False,
+        )
+        final_access_policy = _stable_fd_access_policy_binding(child_fd)
+        _check_deadline(deadline_check)
+        if (
+            _object_identity(descriptor) != created_identity
+            or _directory_status(descriptor) != _directory_status(path_status)
+            or stat.S_IMODE(descriptor.st_mode) != 0o700
+            or final_access_policy != initial_access_policy
+        ):
+            raise _blocked(
+                "collector-unavailable",
+                f"{label} access policy could not be fixed",
             )
-            final_access_policy = _stable_fd_access_policy_binding(child_fd)
-            _check_deadline(deadline_check)
-            if (
-                _directory_status(descriptor) != _directory_status(path_status)
-                or stat.S_IMODE(descriptor.st_mode) != 0o700
-                or final_access_policy != initial_access_policy
-            ):
-                raise _blocked(
-                    "collector-unavailable",
-                    f"{label} access policy could not be fixed",
-                )
-        finally:
-            os.close(child_fd)
     except FileExistsError as error:
         raise _blocked(
             "collector-unavailable",
             f"{label} already exists",
         ) from error
-    except EnforcementDoctorError:
+    except BaseException as error:
+        if created:
+            try:
+                _remove_created_private_child_directory(
+                    parent,
+                    name,
+                    label=label,
+                    expected_identity=created_identity,
+                    retained_fd=child_fd,
+                )
+            except BaseException as cleanup_error:
+                raise _blocked(
+                    "collector-inconclusive",
+                    f"{label} creation failed and cleanup could not be proven",
+                    cleanup_failure=_created_private_child_cleanup_failure(
+                        parent,
+                        name,
+                        label=label,
+                        expected_identity=created_identity,
+                    ),
+                ) from cleanup_error
+        if isinstance(error, EnforcementDoctorError):
+            raise
+        if isinstance(error, OSError):
+            raise _blocked(
+                "collector-unavailable",
+                f"{label} could not be created safely",
+            ) from error
         raise
-    except OSError as error:
-        raise _blocked(
-            "collector-unavailable",
-            f"{label} could not be created safely",
-        ) from error
+    finally:
+        if child_fd is not None:
+            try:
+                os.close(child_fd)
+            except OSError:
+                pass
     parent.revalidate(deadline_check=deadline_check)
     try:
         return _BoundDirectory(
@@ -2560,9 +2685,23 @@ def _create_private_child_directory(
         )
     except BaseException:
         try:
-            os.rmdir(name, dir_fd=parent.fd)
-        except OSError:
-            pass
+            _remove_created_private_child_directory(
+                parent,
+                name,
+                label=label,
+                expected_identity=created_identity,
+            )
+        except BaseException as cleanup_error:
+            raise _blocked(
+                "collector-inconclusive",
+                f"{label} binding failed and cleanup could not be proven",
+                cleanup_failure=_created_private_child_cleanup_failure(
+                    parent,
+                    name,
+                    label=label,
+                    expected_identity=created_identity,
+                ),
+            ) from cleanup_error
         raise
 
 

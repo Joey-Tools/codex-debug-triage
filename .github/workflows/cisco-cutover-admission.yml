@@ -57,6 +57,13 @@ jobs:
               return value.strip()
 
 
+          def optional_environment(name):
+              value = os.environ.get(name)
+              if value is None or not value.strip():
+                  return None
+              return value.strip()
+
+
           def require_sha(value, label):
               if SHA1_PATTERN.fullmatch(value) is None or set(value) == {"0"}:
                   raise SelectorError(f"{label} must be exact nonzero lowercase SHA-1")
@@ -71,10 +78,12 @@ jobs:
 
           def emit(classification, *, applicable, current_pr, target_pr, target_head):
               output_path = required_environment("GITHUB_OUTPUT")
+              target_pr_output = "" if target_pr is None else str(target_pr)
+              target_head_output = "" if target_head is None else target_head
               with open(output_path, "a", encoding="utf-8") as output:
                   output.write(f"applicable={'true' if applicable else 'false'}\n")
-                  output.write(f"target-head-sha={target_head}\n")
-                  output.write(f"target-pr-number={target_pr}\n")
+                  output.write(f"target-head-sha={target_head_output}\n")
+                  output.write(f"target-pr-number={target_pr_output}\n")
               print(
                   json.dumps(
                       {
@@ -106,12 +115,31 @@ jobs:
                   required_environment("PR_HEAD_SHA"),
                   "pull-request head",
               )
+              target_pr_input = optional_environment(
+                  "CISCO_CUTOVER_TARGET_PR_NUMBER"
+              )
+              target_head_input = optional_environment(
+                  "CISCO_CUTOVER_TARGET_HEAD_SHA"
+              )
+              if target_pr_input is None and target_head_input is None:
+                  emit(
+                      "not_applicable",
+                      applicable=False,
+                      current_pr=current_pr,
+                      target_pr=None,
+                      target_head=None,
+                  )
+                  raise SystemExit(0)
+              if target_pr_input is None or target_head_input is None:
+                  raise SelectorError(
+                      "cutover target selector variables must be configured together"
+                  )
               target_pr = require_pr_number(
-                  required_environment("CISCO_CUTOVER_TARGET_PR_NUMBER"),
+                  target_pr_input,
                   "target pull-request number",
               )
               target_head = require_sha(
-                  required_environment("CISCO_CUTOVER_TARGET_HEAD_SHA"),
+                  target_head_input,
                   "target pull-request head",
               )
               if current_pr == target_pr:

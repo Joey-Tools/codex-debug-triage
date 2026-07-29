@@ -104,8 +104,15 @@ machine-verifiable, static receipt-equivalence check without adding Cisco
 behavior to the installed generic skill. Because a pull request can modify this
 script and its tests, running it from a candidate checkout is never a merge or
 release admission. The independently trusted base workflow described below
-embeds its own static verifier. Both verifiers require ten expectations from an
-independent trusted source, not copied from the receipt:
+embeds its own static verifier. This receipt validator intentionally accepts
+only the schema-3
+`tests/fixtures/cisco-build-artifacts-migration.json` profile. The structurally
+different schema-4 `docs/cisco-cutover-enforcement-contract.json` profile is
+validated by `scripts/doctor_cisco_cutover_enforcement.py`; passing it to the
+receipt validator fails with a profile-routing error rather than silently
+weakening either contract.
+
+Both verifiers require ten expectations from an independent trusted source, not copied from the receipt:
 
 - the exact canonical candidate commit
 - the exact retirement pull-request number
@@ -226,7 +233,10 @@ enables `cisco-cutover-admission`. Every other PR, including a fork PR, routes
 to `cisco-cutover-neutral`, returns
 `classification=not_applicable`, and never receives or reads the receipt or any
 target evidence variable. Missing, malformed, or placeholder selector state
-fails closed.
+fails closed except for the one intentionally unconfigured state: when both
+selector variables are absent, no retirement PR is selected, so every PR takes
+the explicit `not_applicable` neutral path. Configuring exactly one selector
+variable remains `blocked_until_trusted`.
 
 This split matters because the organization required-workflow rule applies to
 every PR targeting the default branch. A concurrent PR and a future PR after
