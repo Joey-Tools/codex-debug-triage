@@ -5,6 +5,7 @@ on:
     branches:
       - master
     types:
+      - edited
       - opened
       - reopened
       - ready_for_review
@@ -20,6 +21,7 @@ jobs:
     timeout-minutes: 1
     outputs:
       applicable: ${{ steps.select.outputs.applicable }}
+      target-base-sha: ${{ steps.select.outputs.target-base-sha }}
       target-head-sha: ${{ steps.select.outputs.target-head-sha }}
       target-pr-number: ${{ steps.select.outputs.target-pr-number }}
     steps:
@@ -29,9 +31,11 @@ jobs:
         env:
           EVENT_REPOSITORY: ${{ github.event.repository.full_name }}
           PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           PR_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          CISCO_CUTOVER_TARGET_BASE_SHA: ${{ vars.CISCO_CUTOVER_TARGET_BASE_SHA }}
           CISCO_CUTOVER_TARGET_HEAD_SHA: ${{ vars.CISCO_CUTOVER_TARGET_HEAD_SHA }}
           CISCO_CUTOVER_TARGET_PR_NUMBER: ${{ vars.CISCO_CUTOVER_TARGET_PR_NUMBER }}
         run: |
@@ -76,12 +80,22 @@ jobs:
               return int(value, 10)
 
 
-          def emit(classification, *, applicable, current_pr, target_pr, target_head):
+          def emit(
+              classification,
+              *,
+              applicable,
+              current_pr,
+              target_pr,
+              target_head,
+              target_base,
+          ):
               output_path = required_environment("GITHUB_OUTPUT")
               target_pr_output = "" if target_pr is None else str(target_pr)
               target_head_output = "" if target_head is None else target_head
+              target_base_output = "" if target_base is None else target_base
               with open(output_path, "a", encoding="utf-8") as output:
                   output.write(f"applicable={'true' if applicable else 'false'}\n")
+                  output.write(f"target-base-sha={target_base_output}\n")
                   output.write(f"target-head-sha={target_head_output}\n")
                   output.write(f"target-pr-number={target_pr_output}\n")
               print(
@@ -89,6 +103,7 @@ jobs:
                       {
                           "classification": classification,
                           "current_pr_number": current_pr,
+                          "target_base_sha": target_base,
                           "target_head_sha": target_head,
                           "target_pr_number": target_pr,
                       },
@@ -115,22 +130,38 @@ jobs:
                   required_environment("PR_HEAD_SHA"),
                   "pull-request head",
               )
+              current_base = require_sha(
+                  required_environment("PR_BASE_SHA"),
+                  "pull-request base",
+              )
               target_pr_input = optional_environment(
                   "CISCO_CUTOVER_TARGET_PR_NUMBER"
               )
               target_head_input = optional_environment(
                   "CISCO_CUTOVER_TARGET_HEAD_SHA"
               )
-              if target_pr_input is None and target_head_input is None:
+              target_base_input = optional_environment(
+                  "CISCO_CUTOVER_TARGET_BASE_SHA"
+              )
+              if (
+                  target_pr_input is None
+                  and target_head_input is None
+                  and target_base_input is None
+              ):
                   emit(
                       "not_applicable",
                       applicable=False,
                       current_pr=current_pr,
                       target_pr=None,
                       target_head=None,
+                      target_base=None,
                   )
                   raise SystemExit(0)
-              if target_pr_input is None or target_head_input is None:
+              if (
+                  target_pr_input is None
+                  or target_head_input is None
+                  or target_base_input is None
+              ):
                   raise SelectorError(
                       "cutover target selector variables must be configured together"
                   )
@@ -142,11 +173,17 @@ jobs:
                   target_head_input,
                   "target pull-request head",
               )
+              target_base = require_sha(
+                  target_base_input,
+                  "target pull-request base",
+              )
               if current_pr == target_pr:
                   if current_head_repository != EXPECTED_REPOSITORY:
                       raise SelectorError("target pull-request head repository differs")
                   if current_head != target_head:
                       raise SelectorError("target pull-request head changed")
+                  if current_base != target_base:
+                      raise SelectorError("target pull-request base changed")
           except SelectorError as error:
               print(
                   json.dumps(
@@ -167,6 +204,7 @@ jobs:
               current_pr=current_pr,
               target_pr=target_pr,
               target_head=target_head,
+              target_base=target_base,
           )
           SELECTOR_PY
 
@@ -182,11 +220,14 @@ jobs:
         env:
           EVENT_REPOSITORY: ${{ github.event.repository.full_name }}
           PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           PR_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          SELECTED_TARGET_BASE_SHA: ${{ needs.cisco-cutover-selector.outputs.target-base-sha }}
           SELECTED_TARGET_HEAD_SHA: ${{ needs.cisco-cutover-selector.outputs.target-head-sha }}
           SELECTED_TARGET_PR_NUMBER: ${{ needs.cisco-cutover-selector.outputs.target-pr-number }}
+          CISCO_CUTOVER_TARGET_BASE_SHA: ${{ vars.CISCO_CUTOVER_TARGET_BASE_SHA }}
           CISCO_CUTOVER_RECEIPT_BASE64: ${{ vars.CISCO_CUTOVER_RECEIPT_BASE64 }}
           CISCO_CUTOVER_EXPECTED_CANONICAL_COMMIT: ${{ vars.CISCO_CUTOVER_EXPECTED_CANONICAL_COMMIT }}
           CISCO_CUTOVER_EXPECTED_PRIVATE_RELEASE_COMMIT: ${{ vars.CISCO_CUTOVER_EXPECTED_PRIVATE_RELEASE_COMMIT }}
@@ -241,6 +282,22 @@ jobs:
               "slug": "github-actions",
           }
           POINTER_STATE_HASH_DOMAIN = "cisco-installed-pointer-state-v1"
+          ADMISSION_PRECONDITIONS_UNAVAILABLE_REASON = (
+              "admission-preconditions-unavailable"
+          )
+          BASE_CHANGE_ENFORCEMENT = {
+              "status": "unavailable",
+              "reason": (
+                  "ruleset-workflow-default-activities-exclude-edited"
+              ),
+              "event": "pull_request_target",
+              "required_activity": "edited",
+              "ruleset_dispatch_activities": [
+                  "opened",
+                  "synchronize",
+                  "reopened",
+              ],
+          }
           POINTER_PROOF_UNAVAILABLE_REASON = "pointer-proof-unavailable"
           POINTER_AUTHORITY_REASON = "private-live-authority-not-configured"
           PLACEHOLDERS = frozenset(
@@ -313,6 +370,23 @@ jobs:
                   )
               )
               return 1
+
+
+          def admission_blockers():
+              return [
+                  {
+                      "name": "base-change-enforcement",
+                      "priority": 1,
+                      **BASE_CHANGE_ENFORCEMENT,
+                  },
+                  {
+                      "authority_reason": POINTER_AUTHORITY_REASON,
+                      "name": "pointer-proof",
+                      "priority": 2,
+                      "reason": POINTER_PROOF_UNAVAILABLE_REASON,
+                      "status": "unavailable",
+                  },
+              ]
 
 
           def required_environment(name):
@@ -577,6 +651,7 @@ jobs:
                       "number": expected["pull_request_number"],
                       "head_sha": expected["canonical_commit"],
                       "base_ref": EXPECTED_BASE_REF,
+                      "base_sha": expected["base_sha"],
                   },
                   "required_workflow": {
                       "id": expected["workflow_id"],
@@ -775,6 +850,7 @@ jobs:
                       "target_repository_id",
                       "pull_request_number",
                       "pull_request_head_sha",
+                      "pull_request_base_sha",
                       "installation_scope_id",
                       "pointer_generation",
                       "acquired_at",
@@ -806,6 +882,15 @@ jobs:
               ):
                   raise AdmissionError(
                       "installed pointer merge lease head differs"
+                  )
+              lease_base_sha = require_sha(
+                  merge_lease["pull_request_base_sha"],
+                  SHA1_PATTERN,
+                  "installed pointer merge lease base SHA",
+              )
+              if lease_base_sha != expected["base_sha"]:
+                  raise AdmissionError(
+                      "installed pointer merge lease base differs"
                   )
               if merge_lease["installation_scope_id"] != installation_scope_id:
                   raise AdmissionError(
@@ -850,6 +935,11 @@ jobs:
                   raise AdmissionError("pull-request head repository differs")
               if required_environment("PR_BASE_REF") != EXPECTED_BASE_REF:
                   raise AdmissionError("pull-request base branch differs")
+              base_sha = require_sha(
+                  required_environment("PR_BASE_SHA"),
+                  SHA1_PATTERN,
+                  "pull-request base SHA",
+              )
               head_sha = require_sha(
                   required_environment("PR_HEAD_SHA"),
                   SHA1_PATTERN,
@@ -864,11 +954,21 @@ jobs:
                   SHA1_PATTERN,
                   "selected target head",
               )
+              selected_target_base = require_sha(
+                  required_environment("SELECTED_TARGET_BASE_SHA"),
+                  SHA1_PATTERN,
+                  "selected target base",
+              )
               selected_target_pr = require_positive_integer(
                   required_environment("SELECTED_TARGET_PR_NUMBER"),
                   "selected target pull-request number",
               )
               expected = {
+                  "base_sha": require_sha(
+                      required_environment("CISCO_CUTOVER_TARGET_BASE_SHA"),
+                      SHA1_PATTERN,
+                      "expected pull-request base SHA",
+                  ),
                   "canonical_commit": require_sha(
                       required_environment(
                           "CISCO_CUTOVER_EXPECTED_CANONICAL_COMMIT"
@@ -930,8 +1030,13 @@ jobs:
               if (
                   selected_target_pr != pull_request_number
                   or selected_target_head != head_sha
+                  or selected_target_base != base_sha
               ):
                   raise AdmissionError("selector output differs from target event")
+              if expected["base_sha"] != base_sha:
+                  raise AdmissionError(
+                      "trusted base expectation differs from PR base"
+                  )
               if expected["canonical_commit"] != head_sha:
                   raise AdmissionError(
                       "trusted canonical expectation differs from PR head"
@@ -952,10 +1057,13 @@ jobs:
 
           raise SystemExit(
               blocked(
-                  POINTER_PROOF_UNAVAILABLE_REASON,
+                  ADMISSION_PRECONDITIONS_UNAVAILABLE_REASON,
                   {
+                      "blockers": admission_blockers(),
                       "canonical_commit": expected["canonical_commit"],
+                      "expected_base_sha": expected["base_sha"],
                       "installation_scope_id": pointer["installation_scope_id"],
+                      "provider_observed_base_sha": base_sha,
                       "pointer_authority_reason": POINTER_AUTHORITY_REASON,
                       "pointer_authority_status": "unavailable",
                       "pointer_generation": pointer["generation"],

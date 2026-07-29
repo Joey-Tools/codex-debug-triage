@@ -41,13 +41,17 @@ superseded_by:
 - Archive inspection keeps the private snapshot's no-grant ACL predicate separate from the source archive's exact descriptor ACL binding. Darwin hashes the bounded external ACL representation; Linux hashes the bounded raw `system.posix_acl_access` value alongside the separately bound mode mask. Source policy is sampled before snapshot creation, immediately before copy, after copy, and after the final digest, so named or extended ACL drift under an unchanged mode is rejected while unsupported and unreadable ACL queries retain their distinct failure classification.
 - A private child directory that fails descriptor, mode, or ACL validation is removed only while its retained descriptor, parent-relative name, object identity, and parent access policy still match; replacement or unproved cleanup remains `collector-inconclusive` instead of deleting an unbound object.
 - Successful private directory and regular-file creation now retains the original descriptor through the pathname rebind and compares the original descriptor, rebound descriptor, and parent-relative path. Regular files additionally bind the exact generated payload digest, so a same-EUID replacement or same-inode content rewrite cannot become the object later consumed by `gh` or `curl`.
-- The required-workflow selector is explicitly neutral when both administrator selector variables are absent, while partial, malformed, or placeholder configuration remains blocked. This prevents unrelated PRs from being held by an intentionally unconfigured cutover without weakening the selected target binding.
+- The required-workflow selector is explicitly neutral when all three administrator selector variables are absent, while partial, malformed, or placeholder configuration remains blocked. This prevents unrelated PRs from being held by an intentionally unconfigured cutover without weakening the selected target binding.
 - The schema-3 private-overlay receipt validator and schema-4 live-enforcement doctor remain distinct contract profiles. Passing the enforcement contract to the receipt validator now returns a profile-routing error that names the correct doctor instead of a generic schema mismatch.
+- The cutover protected identity is now the exact frozen `{pull-request number, head SHA, base SHA}` range. The selector compares the administrator-pinned base against provider event evidence; the schema-3 receipt and active merge lease carry the same base; and the schema-4 doctor compares its independent `--expected-base-sha` input against the repository variable and both provider API snapshots before accepting run/job/check lineage. A dispatched run rejects a base-only retarget or stale receipt, but the organization required-workflow rule does not guarantee that dispatch because its default activity set excludes `edited`.
+- The workflow now declares `edited` as ordinary dispatch defense-in-depth. Both machine-readable contracts record `base_change_enforcement` as unavailable with reason `ruleset-workflow-default-activities-exclude-edited`, event `pull_request_target`, required activity `edited`, and exact ruleset dispatch activities `[opened,synchronize,reopened]`; workflow, local receipt validator, and doctor return an ordered admission-blocker list after static equivalence so the independent pointer-proof blocker remains visible. Activation cannot proceed until a merge queue or independent provider guarantees base-change reevaluation.
+- Doctor output schema 6 names the administrator-pinned expected base and provider-observed base separately. The unpublished schema-3 receipt profile is intentionally tightened in place while pointer authority remains unavailable; the external `codex-private-workflows` release producer must emit both new base fields before cutover variables can be configured.
 
 ## Next Steps
 
 - Configure the trusted live pointer authority and collect fresh live evidence before attempting cutover admission.
-- Preserve the exact workflow, ruleset, run-attempt, and candidate-head bindings when refreshing evidence.
+- Supply and independently validate merge-queue or provider enforcement for the required `edited`-equivalent base-change reevaluation before activating the ruleset.
+- Preserve the exact workflow, ruleset, run-attempt, and candidate head/base bindings when refreshing evidence.
 
 ## Evidence
 
@@ -68,6 +72,9 @@ superseded_by:
 - Darwin repair selection on Python 3.13.0: 10 tests passed, including inherited snapshot ACL refusal before copy, existing descriptor-ACL integration, initialization deadlines, and suite-first lineage.
 - Python 3.13.0 and system Python 3.9.6 compilation passed for all CI-listed helpers and tests.
 - Ruff passed for all CI-listed Python helpers and tests.
-- The installed OpenAI skill validator passed for `bug-triage-playbook`.
-- Bundled project-journal validation passed.
+- Exact-base binding focused selection: 18 tests passed, covering dispatched base-only event/API drift, stale receipt reuse, receipt/lease base binding, malformed or missing pins, schema contracts, and distinct pinned/provider doctor output.
+- Base-change-enforcement focused selection: 12 tests passed, covering the `edited` source declaration, exact five-field preconditions, ordered independent blockers, contract drift, and refusal to admit when pointer proof is test-doubled available.
+- Python 3.13.0 and system Python 3.9.6 full suites: 293 tests passed on each runtime.
+- Python 3.13.0 and system Python 3.9.6 compilation passed for all CI-listed helpers and tests; Ruff lint passed for all CI-listed Python files, Ruff format passed for the three changed Python files, and `actionlint` passed for all three workflows.
+- The installed OpenAI skill validator and bundled project-journal validator passed after the exact-base and base-change-enforcement updates.
 - Direct Claude review was waived by Joey through 2026-08-01 00:00 Asia/Shanghai; the lane was not run and is not classified as completed.

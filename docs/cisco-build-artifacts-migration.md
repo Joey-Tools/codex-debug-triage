@@ -111,10 +111,21 @@ different schema-4 `docs/cisco-cutover-enforcement-contract.json` profile is
 validated by `scripts/doctor_cisco_cutover_enforcement.py`; passing it to the
 receipt validator fails with a profile-routing error rather than silently
 weakening either contract.
+This pre-activation correction deliberately tightens the unpublished schema-3
+receipt profile in place: the checked-in contract still has no live pointer
+authority, so no schema-3 receipt can currently be admitted. Every prior
+receipt lacking `cutover.pull_request.base_sha` or
+`installed_pointer.merge_lease.pull_request_base_sha` now fails exact-key
+validation. Before configuring cutover variables, the external
+`Joey-Tools/codex-private-workflows` release producer must emit both fields;
+this repository does not contain or update that producer. The schema-4
+enforcement contract remains a separate profile and is not accepted as a
+private release receipt.
 
-Both verifiers require ten expectations from an independent trusted source, not copied from the receipt:
+Both verifiers require eleven expectations from an independent trusted source, not copied from the receipt:
 
 - the exact canonical candidate commit
+- the exact retirement pull-request base SHA
 - the exact retirement pull-request number
 - the exact private release commit
 - the exact private release-manifest SHA-256
@@ -132,6 +143,7 @@ python3 scripts/validate_cisco_cutover_receipt.py \
   --contract tests/fixtures/cisco-build-artifacts-migration.json \
   --receipt <trusted-receipt.json> \
   --expected-canonical-commit <40-lowercase-hex> \
+  --expected-base-sha <40-lowercase-hex> \
   --expected-pull-request-number <positive-decimal> \
   --expected-private-release-commit <40-lowercase-hex> \
   --expected-release-manifest-sha256 <64-lowercase-hex> \
@@ -153,7 +165,7 @@ limits integers to 64 digits, nesting to 64 containers, total containers to
 1,024, and parsed structure to 4,096 nodes. The receipt ceiling keeps its
 canonical Base64 value at 47,788 bytes or less, below GitHub's documented
 [48 KB per-configuration-variable limit](https://docs.github.com/en/actions/reference/workflows-and-actions/variables#limits-for-configuration-variables).
-The receipt plus the eleven short identity/digest variables also stays below the
+The receipt plus the twelve short identity/digest variables also stays below the
 repository aggregate; an oversized producer receipt must fail before
 publication. Schema comparisons require exact JSON scalar and container types,
 so a Boolean never substitutes for an integer and an integer never substitutes
@@ -163,8 +175,8 @@ missing fields:
 1. schema version 3, the exact canonical/private repositories and commits, and
    the exact release-manifest digest
 2. the exact target repository ID/name/default branch, retirement PR
-   number/head/base, and base-owned workflow ID/repository/path/ref/SHA/event/
-   check-name contract
+   number/head SHA/base ref/base SHA, and base-owned workflow
+   ID/repository/path/ref/SHA/event/check-name contract
 3. the complete aggregate activation object from the public contract
 4. every trust gate, in contract order, with `status=passed` and the same exact
    private release commit and manifest digest
@@ -182,8 +194,8 @@ missing fields:
    ID/current attempt, GitHub Actions provider ID/slug, and proof-artifact
    ID/SHA-256
 10. an active, unexpired merge lease whose exact lease ID, target repository
-    ID, retirement PR number/head, installation scope, and pointer generation
-    agree with the independently pinned receipt state
+    ID, retirement PR number/head/base SHA, installation scope, and pointer
+    generation agree with the independently pinned receipt state
 
 The pointer-state digest is exactly
 `SHA256("cisco-installed-pointer-state-v1\0" || canonical_json(state))`.
@@ -201,11 +213,21 @@ gate set, pointer/lease mismatch, expired proof, malformed JSON, or any schema
 difference exits 1 with `classification=blocked_until_trusted` and a
 discriminating reason. After every static field succeeds, the checked-in
 validator still exits 1 with
-`validation_scope=static-equivalence-only,reason=pointer-proof-unavailable`.
+`validation_scope=static-equivalence-only,
+reason=admission-preconditions-unavailable`. Its ordered `blockers` list keeps
+the unavailable base-change enforcement precondition ahead of, but separate
+from, the unavailable pointer proof.
 Its `live_authority` object is historical provenance, not proof that `current`
 still has that state. Only an independently configured live authority can
 re-read the exact scoped current pointer and merge lease; the checked-in
-contract explicitly records
+contract explicitly records both
+`base_change_enforcement.status=unavailable,
+base_change_enforcement.reason=
+ruleset-workflow-default-activities-exclude-edited,
+base_change_enforcement.event=pull_request_target,
+base_change_enforcement.required_activity=edited,
+base_change_enforcement.ruleset_dispatch_activities=
+[opened,synchronize,reopened]` and
 `status=unavailable,reason=private-live-authority-not-configured` and contains
 no placeholder private IDs.
 
@@ -223,47 +245,58 @@ test, import, or generated file. Its verifier is self-contained in base-owned
 workflow bytes. That protects the workflow execution, but it is not sufficient
 merge enforcement until GitHub itself requires that workflow by identity.
 
-The base workflow first runs `cisco-cutover-selector` with only two
+The base workflow first runs `cisco-cutover-selector` with only three
 administrator-owned repository variables:
-`CISCO_CUTOVER_TARGET_PR_NUMBER` and `CISCO_CUTOVER_TARGET_HEAD_SHA`. The
-selector validates the exact target/event/head repository and `master` base
-ref for the retirement PR. For the exact target PR number it fails if the head
-repository or event head differs; only an exact repository/number/head match
-enables `cisco-cutover-admission`. Every other PR, including a fork PR, routes
-to `cisco-cutover-neutral`, returns
+`CISCO_CUTOVER_TARGET_PR_NUMBER`, `CISCO_CUTOVER_TARGET_HEAD_SHA`, and
+`CISCO_CUTOVER_TARGET_BASE_SHA`. The selector validates the exact
+target/event/head repository plus `master` base ref and provider-observed base
+SHA for the retirement PR. For the exact target PR number it fails if the head
+repository, event head, or event base differs; only an exact
+repository/number/head/base match enables `cisco-cutover-admission`. Every
+other PR, including a fork PR, routes to `cisco-cutover-neutral`, returns
 `classification=not_applicable`, and never receives or reads the receipt or any
 target evidence variable. Missing, malformed, or placeholder selector state
-fails closed except for the one intentionally unconfigured state: when both
-selector variables are absent, no retirement PR is selected, so every PR takes
-the explicit `not_applicable` neutral path. Configuring exactly one selector
-variable remains `blocked_until_trusted`.
+fails closed except for the one intentionally unconfigured state: when all
+three selector variables are absent, no retirement PR is selected, so every
+PR takes the explicit `not_applicable` neutral path. Configuring only a subset
+of the selector variables remains `blocked_until_trusted`.
 
 This split matters because the organization required-workflow rule applies to
 every PR targeting the default branch. A concurrent PR and a future PR after
 cutover therefore complete the same required workflow through the explicit
 neutral job rather than being blocked by evidence that belongs to the one
-retirement PR. A target-head change fails instead of becoming neutral. The
-doctor independently reads both selector variables twice and requires them to
-equal its PR number and candidate-head arguments; changing the selector cannot
-turn a neutral run into target evidence. It also requires the workflow ID and
-SHA variables to equal both the administrator-pinned doctor arguments and the
-native workflow metadata and source commit returned by GitHub.
+retirement PR. A target-head or target-base mismatch fails instead of becoming
+neutral whenever a run is dispatched. The workflow declares `edited` as
+ordinary dispatch defense-in-depth, but GitHub's organization required-workflow
+rule evaluates only its default `opened`, `synchronize`, and `reopened`
+activities and ignores the workflow's broader `types`; it therefore does not
+guarantee a new run for the `edited` event produced by a base-only retarget.
+The doctor independently reads all three selector variables twice and
+requires them to equal its PR-number, candidate-head, and expected-base
+arguments; changing the selector cannot turn a neutral run into target
+evidence. The expected base is never derived from the provider-observed PR
+object. It also requires the workflow ID and SHA variables to equal both the
+administrator-pinned doctor arguments and the native workflow metadata and
+source commit returned by GitHub.
 
 The target admission job binds the selector outputs, exact event PR
-number/head, receipt cutover object, and workflow ID/SHA before validating the
-private release and pointer. It exposes no secret or token to a candidate
+number/head/base, receipt cutover object and active lease, and workflow ID/SHA
+before validating the private release and pointer. It exposes no secret or token to a candidate
 process because there is no candidate process. It reports static mismatches
-before the terminal authority decision. With the checked-in contract's live
-authority unavailable, even complete static equivalence ends with
-`classification=blocked_until_trusted,reason=pointer-proof-unavailable`; there
-is no target green outcome. The live doctor follows the same ordering: it
-finishes static collection, performs the final protected-snapshot
-revalidation, and hashes the canonical evidence before asking for pointer
-proof. A pointer-only blocker therefore includes
+before the terminal admission-precondition decision. With both checked-in
+preconditions unavailable, even complete static equivalence ends with
+`classification=blocked_until_trusted,
+reason=admission-preconditions-unavailable`; the ordered `blockers` list
+contains `base-change-enforcement` at priority 1 and `pointer-proof` at
+priority 2, so neither limitation hides the other. There is no target green
+outcome even when a test double supplies pointer proof. The live doctor follows
+the same ordering: it finishes static collection, performs the final
+protected-snapshot revalidation, and hashes the canonical evidence before
+checking both admission preconditions. That blocker therefore includes
 `static_equivalence=validated` and its non-null `evidence_sha256`; failures
 before that boundary leave the static claim unset. These fields, together with
 sanitized cleanup-failure evidence when applicable, define doctor receipt
-schema 5.
+schema 6.
 
 The enforcement boundary is an active organization-level GitHub ruleset rule
 with `source_type=Organization` and `type=workflows`, not a repository-level
@@ -287,17 +320,24 @@ ruleset or named status context. The exact rule must:
 A branch ref without the exact `sha` is mutable and remains blocked. The SHA
 does not silently follow later edits: an administrator must review a new
 workflow version and deliberately update the ruleset and doctor expectation.
+Even that exact workflow binding does not make base-change enforcement
+available: the ruleset's default activity set excludes `edited`. Activation
+must remain unavailable until a merge queue or an independent provider
+guarantees the required base-change reevaluation and the machine-readable
+precondition is reviewed to an available state.
 The machine-readable fixed contract is
 `docs/cisco-cutover-enforcement-contract.json`.
 
 The gate intentionally remains red until the authenticated private release
 workflow has produced a real receipt and a repository administrator has pinned
 these non-secret GitHub Actions repository variables independently. Configure
-the two selector variables first, but do not activate the organization ruleset
+the three selector variables first, but do not activate the organization ruleset
 until all target evidence variables are exact:
 
 - `CISCO_CUTOVER_TARGET_PR_NUMBER`: frozen retirement PR number
 - `CISCO_CUTOVER_TARGET_HEAD_SHA`: frozen retirement PR head
+- `CISCO_CUTOVER_TARGET_BASE_SHA`: frozen retirement PR base commit, independent
+  from both the event/API observation and the pinned workflow source commit
 - `CISCO_CUTOVER_RECEIPT_BASE64`: exact Base64 of the producer-authored receipt
 - `CISCO_CUTOVER_EXPECTED_CANONICAL_COMMIT`: final signed canonical candidate
   commit
@@ -319,10 +359,14 @@ until all target evidence variables are exact:
 
 Do not derive any `EXPECTED_*` value from `CISCO_CUTOVER_RECEIPT_BASE64`.
 The base verifier compares `CISCO_CUTOVER_EXPECTED_CANONICAL_COMMIT` against
-the exact event head SHA, so a valid old receipt and stale repository variable
-cannot admit a different candidate. Missing, empty, recognizable placeholder,
-all-zero, malformed, stale, or mismatched values keep the trusted workflow red.
-The doctor must read all twelve variables through fixed, no-redirect REST
+the exact event head SHA and compares `CISCO_CUTOVER_TARGET_BASE_SHA` against
+the event base SHA plus both receipt base fields. In any run that is actually
+dispatched, a valid old receipt is rejected after a base-only retarget while
+the head stays unchanged. The required-workflow rule does not itself guarantee
+that dispatch, so this mismatch check is not an activation guarantee.
+Missing, empty, recognizable placeholder, all-zero, malformed, stale, or
+mismatched values keep the trusted workflow red.
+The doctor must read all thirteen variables through fixed, no-redirect REST
 `GET` requests to the exact `https://api.github.com` origin and require every
 variable's `updated_at` to be strictly earlier than the selected workflow
 attempt's `run_started_at`. Equality is not an ordering proof. The
@@ -480,7 +524,7 @@ The same process:
   the fixed no-redirect transport to prove both token validity and the exact
   authenticated account without printing credential output
 - reads the exact organization, target repository, selected PR, organization
-  ruleset, all twelve cutover-input repository variables, the exact selected
+  ruleset, all thirteen cutover-input repository variables, the exact selected
   run-attempt endpoint, source workflow repository, workflow metadata, and
   pinned source commit
 - lists every effective target-repository ruleset with
@@ -505,6 +549,10 @@ The same process:
   repository, PR head/base, ruleset content/scope, workflow source, or
   same-name execution-lineage changes block admission, while timestamps alone
   are not treated as object replacement or content mutation
+- requires the separately supplied expected base SHA, both stored selector
+  snapshots, the provider-observed PR base SHA, and the
+  `pull_request_target` run/job/check base lineage to agree exactly; the
+  workflow-source SHA remains an independent ruleset binding
 
 The doctor rejects pagination totals that do not match the fully collected
 items, duplicate check-suite or check-run IDs, suite/head linkage drift,
@@ -515,8 +563,9 @@ or default-branch conditions, or any same-name `required_status_checks` rule.
 It also rejects every collected `cisco-cutover-admission` check whose native
 run/job/provider lineage differs from the pinned workflow. Therefore a green
 candidate-authored duplicate cannot compensate for a red or absent trusted
-workflow run. Multiple executions or rerun attempts on the same frozen head are
-not ambiguous by themselves: the administrator must pin one exact run ID and
+workflow run. Multiple executions or rerun attempts on the same frozen
+head/base range are not ambiguous by themselves: the administrator must pin
+one exact run ID and
 its current attempt number, every collected same-name lineage must still bind
 to the trusted workflow identity and its ruleset-pinned executed-file SHA, and
 only the pinned lineage's run, job, and check must be complete and successful.
@@ -615,18 +664,21 @@ python3 scripts/doctor_cisco_cutover_enforcement.py \
   --expected-run-id <numeric-actions-run-id> \
   --expected-run-attempt <positive-decimal-attempt> \
   --expected-workflow-id <numeric-workflow-id> \
-  --expected-workflow-sha <protected-base-40-lowercase-hex> \
+  --expected-workflow-sha <workflow-source-40-lowercase-hex> \
+  --expected-base-sha <retirement-base-40-lowercase-hex> \
   --candidate-head-sha <retirement-head-40-lowercase-hex>
 ```
 
-The schema-5 admitted doctor receipt has exact fields for the schema/operation,
+The schema-6 doctor output reserves exact admitted fields for a future contract
+whose admission preconditions are both available. Those fields cover the schema/operation,
 contract and collected-evidence SHA-256 digests, collection timestamps and
 page bounds, authenticated account identity, organization/target repository,
-PR number/head repository ID/head SHA, ruleset source/ID, source workflow
-repository ID/name/path/ref/SHA, the administrator-pinned run ID/attempt, and
-the trusted run/job/check IDs, URLs, provider, status, and conclusion. Blocked
-output includes the
-available digests plus `reason_code` and `reason`. The receipt is an output of
+PR number/head repository ID/head SHA, the administrator-pinned expected base
+SHA, the separately named provider-observed base SHA, ruleset source/ID, source
+workflow repository ID/name/path/ref/SHA, the administrator-pinned run
+ID/attempt, and the trusted run/job/check IDs, URLs, provider, status, and
+conclusion. Current blocked output includes the available digests,
+`reason_code`, `reason`, and the ordered admission `blockers`. The receipt is an output of
 the live collection transaction, not reusable evidence input, and no admitted
 receipt is stored in this repository.
 
@@ -641,38 +693,44 @@ ordinary PR-merge state machine is therefore:
 2. Confirm the workflow file is present on protected `master`; record that base
    commit SHA and authenticated workflow ID. Then create the separate
    retirement PR from that base, finish its implementation, and freeze the
-   final signed PR number/head without merging it.
+   final signed PR number/head/base without merging it.
 3. Ask the independently authorized private release workflow to publish and
    verify the real private overlay. Its producer-authored schema-3 receipt must
    bind the exact target repository ID/name/default branch, frozen PR
-   number/head/base, workflow ID/repository/path/ref/SHA/event/check name,
+   number/head/base ref/base SHA, workflow
+   ID/repository/path/ref/SHA/event/check name,
    non-replay pointer state, exact provider run/current attempt/artifact, and
-   active PR/head/scope/generation merge lease.
+   active PR/head/base/scope/generation merge lease.
    Do not fabricate a receipt or derive independent expectations from it.
-4. A repository administrator configures both selector variables plus the
-   receipt and all nine independent `EXPECTED_*` variables. Re-read all twelve
-   values and require the selector number/head, canonical commit, receipt
-   cutover object, workflow ID/SHA, scope, generation, and pointer-state digest
-   to agree.
+4. A repository administrator configures all three selector variables plus the
+   receipt and all nine independent `EXPECTED_*` variables. Re-read all
+   thirteen values and require the selector number/head/base, canonical commit,
+   receipt cutover object and lease, workflow ID/SHA, scope, generation, and
+   pointer-state digest to agree.
 5. Only after step 4, an organization owner creates or updates the active,
    bypass-free organization `workflows` ruleset with the exact target
    repository/default-branch conditions and source
-   repository/path/ref/SHA binding, then records its numeric ruleset ID. Do not
-   add a same-name status-only requirement.
+   repository/path/ref/SHA binding, then records its numeric ruleset ID. This
+   candidate rule does not satisfy base-change enforcement: its default
+   activity set excludes `edited`, regardless of the workflow's source-level
+   declaration. Do not treat it as an activatable merge gate or add a same-name
+   status-only requirement. A future merge queue or independent provider must
+   guarantee the required reevaluation.
 6. Configure and independently validate the live pointer authority before
-   attempting a target evaluation. The checked-in contract deliberately has no
-   private authority repository/workflow/artifact locator and therefore stops
-   here with `pointer-proof-unavailable`; the Jenkins compatibility route
-   remains installed. Do not insert placeholder IDs to advance the state
-   machine.
+   attempting a target evaluation. Independently of the base-change blocker,
+   the checked-in contract deliberately has no private authority
+   repository/workflow/artifact locator. Static-equivalent results therefore
+   report both unavailable blockers and the Jenkins compatibility route remains
+   installed. Do not insert placeholder IDs to advance the state machine.
 7. After a separately reviewed contract/workflow version supplies real
-   authority locators, use explicit Actions authorization to trigger a new target evaluation
-   without changing the frozen head—for example, rerun the target workflow
+   authority locators and an independent base-change enforcement provider, use
+   explicit Actions authorization to trigger a new target evaluation
+   without changing the frozen head or base—for example, rerun the target workflow
    attempt or use one of the declared `pull_request_target` activity
    transitions—and observe selector, target admission, run, job, and check
    success. Record the exact successful Actions run ID and its current attempt
    number; this document does not perform that mutation automatically.
-8. Run the live read-only doctor against that exact retirement PR/head. Its
+8. Run the live read-only doctor against that exact retirement PR/head/base. Its
    fully paginated, twice-stable API snapshot must prove selector variables,
    the exact identity-bound rule, and the current successful target
    run/job/check lineage selected by that exact run ID/attempt. It must fetch
@@ -682,9 +740,11 @@ ordinary PR-merge state machine is therefore:
    alone is replayable and cannot admit.
 9. Immediately before merge, revalidate that the PR is still open, its
    base/head are unchanged, the selector/ruleset/workflow snapshots still match,
-   the receipt expectations still name the same head, and the fresh doctor
-   receipt is `admitted`. Any head, workflow SHA, selector, receipt, or ruleset
-   change returns the state machine to step 2 or the earliest affected step.
+   the receipt expectations still name the same head and base, and the fresh
+   doctor receipt is `admitted`. Any head, base, workflow SHA, selector,
+   receipt, or ruleset change returns the state machine to step 2 or the
+   earliest affected step and requires a provider-guaranteed reevaluation; the
+   ruleset alone does not schedule a base-only retarget.
 10. Only then may an authorized maintainer merge the retirement PR and allow the
    private consumer source-sync step. No merge, rerun, variable write, ruleset
    write, or release publication is an automatic action of this bootstrap
@@ -706,11 +766,12 @@ create-if-absent repository-variable lease named
 `CISCO_CUTOVER_DECOMMISSION_LEASE`; it must not claim server-enforced CAS:
 
 1. Atomically create the absent lease with a transaction ID, actor, frozen
-   target PR/head, ruleset ID plus canonical JSON SHA-256, all cutover variable
-   name/value-SHA-256/`updated_at` observations, and workflow path/blob SHA.
+   target PR/head/base, ruleset ID plus canonical JSON SHA-256, all cutover
+   variable name/value-SHA-256/`updated_at` observations, and workflow
+   path/blob SHA.
    Read the lease back and stop if it differs. A pre-existing lease is a
    recovery blocker, not permission to overwrite it.
-2. Revalidate the merged PR identity/head, the final admitted doctor receipt,
+2. Revalidate the merged PR identity/head/base, the final admitted doctor receipt,
    the exact active ruleset content, every variable observation, and the
    base-owned workflow blob. Before every later mutation, re-read the object
    being changed and compare it to the frozen observation. Any concurrent
@@ -720,12 +781,12 @@ create-if-absent repository-variable lease named
    target repository's fully paginated effective list that the rule is no
    longer effective. Never delete selector/evidence variables or remove the
    workflow while this proof is missing.
-4. With the ruleset proved inactive, keep all twelve cutover variables in place
+4. With the ruleset proved inactive, keep all thirteen cutover variables in place
    while removing the workflow in a separate reviewed PR. That cleanup PR must
    still complete the base-owned workflow through the neutral path. Verify the
    protected-base workflow blob is absent and the cutover ruleset remains
    ineffective before continuing.
-5. Delete only the twelve exact cutover variables, in the contract's declared
+5. Delete only the thirteen exact cutover variables, in the contract's declared
    order, after per-variable
    name/value-SHA-256/`updated_at` comparison. Keep the lease. A partial
    deletion is recoverable because the rule is already inactive and the

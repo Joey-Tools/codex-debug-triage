@@ -30,14 +30,20 @@ identity: another GitHub Actions workflow can emit the same
 `cisco-cutover-admission` context.
 
 The checked-in enforcement contract is deliberately non-admitting. Its
+`base_change_enforcement` precondition is
+`status=unavailable,reason=ruleset-workflow-default-activities-exclude-edited,
+event=pull_request_target,required_activity=edited,
+ruleset_dispatch_activities=[opened,synchronize,reopened]`, and its
 `pointer_authority` is
 `status=unavailable,reason=private-live-authority-not-configured`; it contains
 no invented private repository, workflow, run, artifact, or locator ID. The
 workflow and local validator can verify a schema-3 receipt's exact static
 equivalence—including its independently pinned installation scope, monotonic
 pointer generation, domain-separated pointer-state digest, freshness window,
-provider provenance, and active PR/head-bound merge lease—but they then return
-`classification=blocked_until_trusted,reason=pointer-proof-unavailable`.
+provider provenance, and active PR/head/base-bound merge lease—but they then return
+`classification=blocked_until_trusted,
+reason=admission-preconditions-unavailable` with an ordered `blockers` list
+that preserves both unavailable preconditions.
 Static receipt bytes and repository variables never establish that the private
 authority still serves that pointer state.
 
@@ -49,16 +55,26 @@ rule binds the source workflow repository ID, exact workflow path,
 workflow `repository_id` identifies the source workflow repository; it is not
 the ruleset target condition. A `required_status_checks` rule with the same
 context is explicitly insufficient.
+GitHub's organization required-workflow enforcement uses its default
+pull-request activities (`opened`, `synchronize`, and `reopened`) rather than
+the workflow's declared `types`, so it does not guarantee a run for the
+`edited` activity that carries a base-only retarget. The workflow declares
+`edited` as ordinary dispatch defense-in-depth, but that source declaration
+does not satisfy the missing enforcement precondition.
 
 Because the organization rule applies to every default-branch PR, the workflow
-uses administrator-owned exact PR-number/head selector variables. The one
-frozen retirement PR runs `cisco-cutover-admission`; concurrent and future PRs
-run the explicit `cisco-cutover-neutral` path without receiving target receipt
-evidence. When neither selector variable is configured, all PRs are explicitly
-neutral; a partial selector configuration or target-head change fails closed.
-The satisfiable rollout order is:
-merge the bootstrap workflow, create and freeze the retirement PR, publish a
-receipt bound to that repo/PR/head/workflow contract, configure variables and
+uses administrator-owned exact PR-number/head/base-SHA selector variables. The
+one frozen retirement PR range runs `cisco-cutover-admission`; concurrent and
+future PRs run the explicit `cisco-cutover-neutral` path without receiving
+target receipt evidence. When all three selector variables are absent, all PRs
+are explicitly neutral; a partial selector configuration or target-head/base
+change is rejected by any run that is dispatched. That comparison does not
+prove that the ruleset dispatches a new run after a base-only retarget.
+Activation therefore remains unavailable until a merge queue or independent
+provider guarantees the required reevaluation. After that prerequisite exists,
+the intended rollout order is:
+merge the bootstrap workflow, create and freeze the retirement PR range,
+publish a receipt bound to that repo/PR/head/base/workflow contract, configure variables and
 the ruleset, observe the target run, obtain a fresh doctor admission, and only
 then pass merge readiness. None of those live mutations is automatic.
 
@@ -132,11 +148,13 @@ existing classification, while any nonzero local `gh auth token` exit remains
 an authentication failure. Until it returns
 `classification=admitted`, retirement remains `blocked_until_trusted` and the
 Jenkins entrypoint stays installed. With the checked-in
-`private-live-authority-not-configured` policy, that compatibility route
-therefore remains mandatory.
+base-change-enforcement and pointer-authority policies both unavailable, that
+compatibility route therefore remains mandatory.
 
-Doctor receipt schema 5 adds the static-equivalence boundary and sanitized
-cleanup-failure evidence. Termination-signal supervision begins before the
+Doctor receipt schema 6 adds distinct administrator-pinned
+`expected_base_sha` and provider-observed `provider_observed_base_sha` fields
+plus ordered admission `blockers` to the static-equivalence boundary, alongside
+sanitized cleanup-failure evidence. Termination-signal supervision begins before the
 first credential source read and remains the single outer transaction through
 configuration/executable snapshot creation, every request gap and parse, final
 revalidation, and verified cleanup. A deferred signal first blocks further

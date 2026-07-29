@@ -44,6 +44,17 @@
     "private-consumer-source-sync"
   ],
   "unproved_atomicity_fallback": "retain-bug-triage-compat",
+  "base_change_enforcement": {
+    "status": "unavailable",
+    "reason": "ruleset-workflow-default-activities-exclude-edited",
+    "event": "pull_request_target",
+    "required_activity": "edited",
+    "ruleset_dispatch_activities": [
+      "opened",
+      "synchronize",
+      "reopened"
+    ]
+  },
   "retirement_state_machine": {
     "phases": [
       "bootstrap-workflow-merged",
@@ -57,15 +68,17 @@
       "retirement-pr-merged"
     ],
     "head_change_transition": "retirement-pr-head-frozen",
+    "base_change_transition": "retirement-pr-head-frozen",
     "mutation_authority": "explicit-repository-admin-or-organization-owner",
     "automatic_mutation": false
   },
   "post_cutover_decommission": {
-    "trigger": "retirement-pr-merged-at-frozen-head",
+    "trigger": "retirement-pr-merged-at-frozen-range",
     "lease_variable": "CISCO_CUTOVER_DECOMMISSION_LEASE",
     "cutover_input_variables": [
       "CISCO_CUTOVER_TARGET_PR_NUMBER",
       "CISCO_CUTOVER_TARGET_HEAD_SHA",
+      "CISCO_CUTOVER_TARGET_BASE_SHA",
       "CISCO_CUTOVER_RECEIPT_BASE64",
       "CISCO_CUTOVER_EXPECTED_CANONICAL_COMMIT",
       "CISCO_CUTOVER_EXPECTED_PRIVATE_RELEASE_COMMIT",
@@ -89,7 +102,7 @@
     },
     "ordered_steps": [
       "acquire-and-read-back-exclusive-lease",
-      "revalidate-merged-pr-head-and-doctor-receipt",
+      "revalidate-merged-pr-range-and-doctor-receipt",
       "disable-exact-ruleset-after-content-compare",
       "prove-ruleset-is-not-effective",
       "remove-workflow-in-separate-reviewed-pr",
@@ -116,6 +129,7 @@
     "pointer_target_template": "releases/{private_release_commit}",
     "required_exact_inputs": [
       "expected_canonical_commit",
+      "expected_base_sha",
       "expected_pull_request_number",
       "expected_private_release_commit",
       "expected_release_manifest_sha256",

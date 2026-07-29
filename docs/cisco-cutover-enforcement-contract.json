@@ -47,14 +47,27 @@
   "applicability_selector": {
     "target_pr_number_variable": "CISCO_CUTOVER_TARGET_PR_NUMBER",
     "target_head_sha_variable": "CISCO_CUTOVER_TARGET_HEAD_SHA",
+    "target_base_sha_variable": "CISCO_CUTOVER_TARGET_BASE_SHA",
     "selector_job_name": "cisco-cutover-selector",
     "target_job_name": "cisco-cutover-admission",
     "neutral_job_name": "cisco-cutover-neutral",
     "non_target_classification": "not_applicable"
   },
+  "base_change_enforcement": {
+    "status": "unavailable",
+    "reason": "ruleset-workflow-default-activities-exclude-edited",
+    "event": "pull_request_target",
+    "required_activity": "edited",
+    "ruleset_dispatch_activities": [
+      "opened",
+      "synchronize",
+      "reopened"
+    ]
+  },
   "cutover_input_variables": [
     "CISCO_CUTOVER_TARGET_PR_NUMBER",
     "CISCO_CUTOVER_TARGET_HEAD_SHA",
+    "CISCO_CUTOVER_TARGET_BASE_SHA",
     "CISCO_CUTOVER_RECEIPT_BASE64",
     "CISCO_CUTOVER_EXPECTED_CANONICAL_COMMIT",
     "CISCO_CUTOVER_EXPECTED_PRIVATE_RELEASE_COMMIT",

@@ -27,7 +27,7 @@ from typing import Any, Callable, Optional
 
 CONTRACT_SCHEMA_VERSION = 4
 COLLECTOR_SCHEMA_VERSION = 4
-DOCTOR_SCHEMA_VERSION = 5
+DOCTOR_SCHEMA_VERSION = 6
 AUTH_HOST = "github.com"
 API_ORIGIN_HOST = "api.github.com"
 API_ROOT = f"https://{API_ORIGIN_HOST}"
@@ -134,6 +134,7 @@ GH_TRANSPORT_REDIRECT_KEYS = frozenset(
 CUTOVER_INPUT_VARIABLES = (
     "CISCO_CUTOVER_TARGET_PR_NUMBER",
     "CISCO_CUTOVER_TARGET_HEAD_SHA",
+    "CISCO_CUTOVER_TARGET_BASE_SHA",
     "CISCO_CUTOVER_RECEIPT_BASE64",
     "CISCO_CUTOVER_EXPECTED_CANONICAL_COMMIT",
     "CISCO_CUTOVER_EXPECTED_PRIVATE_RELEASE_COMMIT",
@@ -145,6 +146,17 @@ CUTOVER_INPUT_VARIABLES = (
     "CISCO_CUTOVER_EXPECTED_POINTER_GENERATION",
     "CISCO_CUTOVER_EXPECTED_POINTER_STATE_SHA256",
 )
+EXPECTED_BASE_CHANGE_ENFORCEMENT = {
+    "status": "unavailable",
+    "reason": "ruleset-workflow-default-activities-exclude-edited",
+    "event": "pull_request_target",
+    "required_activity": "edited",
+    "ruleset_dispatch_activities": [
+        "opened",
+        "synchronize",
+        "reopened",
+    ],
+}
 SHA1_PATTERN = re.compile(r"[0-9a-f]{40}")
 SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 RFC3339_UTC_PATTERN = re.compile(
@@ -162,11 +174,13 @@ class EnforcementDoctorError(ValueError):
         reason: str,
         *,
         api_failure: Optional[dict[str, Any]] = None,
+        blockers: Optional[list[dict[str, Any]]] = None,
         cleanup_failure: Optional[dict[str, Any]] = None,
     ) -> None:
         super().__init__(reason)
         self.reason_code = reason_code
         self.api_failure = api_failure
+        self.blockers = blockers
         self.cleanup_failure = cleanup_failure
 
 
@@ -175,12 +189,14 @@ def _blocked(
     reason: str,
     *,
     api_failure: Optional[dict[str, Any]] = None,
+    blockers: Optional[list[dict[str, Any]]] = None,
     cleanup_failure: Optional[dict[str, Any]] = None,
 ) -> EnforcementDoctorError:
     return EnforcementDoctorError(
         reason_code,
         reason,
         api_failure=api_failure,
+        blockers=blockers,
         cleanup_failure=cleanup_failure,
     )
 
@@ -510,6 +526,7 @@ def _load_contract(contract: dict[str, Any]) -> dict[str, Any]:
             "ruleset",
             "required_workflow",
             "applicability_selector",
+            "base_change_enforcement",
             "cutover_input_variables",
             "pointer_authority",
             "disallowed_status_contexts",
@@ -641,6 +658,7 @@ def _load_contract(contract: dict[str, Any]) -> dict[str, Any]:
     expected_applicability = {
         "target_pr_number_variable": "CISCO_CUTOVER_TARGET_PR_NUMBER",
         "target_head_sha_variable": "CISCO_CUTOVER_TARGET_HEAD_SHA",
+        "target_base_sha_variable": "CISCO_CUTOVER_TARGET_BASE_SHA",
         "selector_job_name": "cisco-cutover-selector",
         "target_job_name": workflow["check_name"],
         "neutral_job_name": "cisco-cutover-neutral",
@@ -650,6 +668,15 @@ def _load_contract(contract: dict[str, Any]) -> dict[str, Any]:
         raise _blocked(
             "invalid-contract",
             "contract applicability selector differs",
+        )
+    base_change_enforcement = _exact_dict(
+        contract["base_change_enforcement"],
+        label="contract base-change enforcement",
+    )
+    if base_change_enforcement != EXPECTED_BASE_CHANGE_ENFORCEMENT:
+        raise _blocked(
+            "invalid-contract",
+            "contract base-change enforcement precondition differs",
         )
     cutover_input_variables = _exact_list(
         contract["cutover_input_variables"],
@@ -6202,9 +6229,14 @@ def _assert_static_identity(
     expected_ruleset_id: int,
     expected_workflow_id: int,
     expected_workflow_sha: str,
+    expected_base_sha: str,
     candidate_head_sha: str,
     pull_request_number: int,
 ) -> None:
+    expected_base_sha = _exact_sha1(
+        expected_base_sha,
+        label="pinned expected pull-request base SHA",
+    )
     organization = snapshot["organization"]
     if organization != contract["source_organization"]:
         raise _blocked(
@@ -6241,6 +6273,7 @@ def _assert_static_identity(
         or pull_request["base"]["repository"]
         != {"id": target["id"], "full_name": target["full_name"]}
         or pull_request["base"]["ref"] != target["default_branch"]
+        or pull_request["base"]["sha"] != expected_base_sha
     ):
         raise _blocked(
             "pull-request-identity-mismatch",
@@ -6263,6 +6296,10 @@ def _assert_static_identity(
         selector["target_head_sha_variable"]: {
             "name": selector["target_head_sha_variable"],
             "value": candidate_head_sha,
+        },
+        selector["target_base_sha_variable"]: {
+            "name": selector["target_base_sha_variable"],
+            "value": expected_base_sha,
         },
     }
     cutover_variables = {
@@ -6373,9 +6410,14 @@ def _collect_snapshot(
     expected_ruleset_id: int,
     expected_workflow_id: int,
     expected_workflow_sha: str,
+    expected_base_sha: str,
     candidate_head_sha: str,
     pull_request_number: int,
 ) -> dict[str, Any]:
+    expected_base_sha = _exact_sha1(
+        expected_base_sha,
+        label="pinned expected pull-request base SHA",
+    )
     organization_name = contract["source_organization"]["login"]
     target_name = contract["target_repository"]["full_name"]
     workflow_contract = contract["required_workflow"]
@@ -6407,6 +6449,11 @@ def _collect_snapshot(
             endpoint=f"/repos/{target_name}/pulls/{pull_request_number}",
         )
     )
+    if pull_request["base"]["sha"] != expected_base_sha:
+        raise _blocked(
+            "pull-request-identity-mismatch",
+            "provider-observed pull-request base SHA differs from the pinned base SHA",
+        )
     variable_values = _collect_pages(
         client,
         trace,
@@ -6534,6 +6581,7 @@ def _collect_snapshot(
         expected_ruleset_id=expected_ruleset_id,
         expected_workflow_id=expected_workflow_id,
         expected_workflow_sha=expected_workflow_sha,
+        expected_base_sha=expected_base_sha,
         candidate_head_sha=candidate_head_sha,
         pull_request_number=pull_request_number,
     )
@@ -7270,6 +7318,7 @@ def _validate_snapshot_enforcement(
     expected_ruleset_id: int,
     expected_workflow_id: int,
     expected_workflow_sha: str,
+    expected_base_sha: str,
     candidate_head_sha: str,
     pull_request_number: int,
 ) -> dict[str, Any]:
@@ -7304,6 +7353,7 @@ def _validate_snapshot_enforcement(
         expected_ruleset_id=expected_ruleset_id,
         expected_workflow_id=expected_workflow_id,
         expected_workflow_sha=expected_workflow_sha,
+        expected_base_sha=expected_base_sha,
         candidate_head_sha=candidate_head_sha,
         pull_request_number=pull_request_number,
     )
@@ -7357,6 +7407,33 @@ def _require_pointer_proof(contract: dict[str, Any]) -> None:
     )
 
 
+def _require_admission_preconditions(contract: dict[str, Any]) -> None:
+    blockers = [
+        {
+            "name": "base-change-enforcement",
+            "priority": 1,
+            **contract["base_change_enforcement"],
+        }
+    ]
+    try:
+        _require_pointer_proof(contract)
+    except EnforcementDoctorError as error:
+        blockers.append(
+            {
+                "authority_reason": contract["pointer_authority"]["reason"],
+                "name": "pointer-proof",
+                "priority": 2,
+                "reason": error.reason_code,
+                "status": "unavailable",
+            }
+        )
+    raise _blocked(
+        "admission-preconditions-unavailable",
+        "admission preconditions are unavailable",
+        blockers=blockers,
+    )
+
+
 def validate_enforcement(
     contract: dict[str, Any],
     snapshot: dict[str, Any],
@@ -7366,6 +7443,7 @@ def validate_enforcement(
     expected_ruleset_id: int,
     expected_workflow_id: int,
     expected_workflow_sha: str,
+    expected_base_sha: str,
     candidate_head_sha: str,
     pull_request_number: int,
 ) -> dict[str, Any]:
@@ -7378,10 +7456,11 @@ def validate_enforcement(
         expected_ruleset_id=expected_ruleset_id,
         expected_workflow_id=expected_workflow_id,
         expected_workflow_sha=expected_workflow_sha,
+        expected_base_sha=expected_base_sha,
         candidate_head_sha=candidate_head_sha,
         pull_request_number=pull_request_number,
     )
-    _require_pointer_proof(loaded_contract)
+    _require_admission_preconditions(loaded_contract)
     return admission
 
 
@@ -7394,6 +7473,7 @@ def _collect_and_validate_static(
     expected_ruleset_id: int,
     expected_workflow_id: int,
     expected_workflow_sha: str,
+    expected_base_sha: str,
     candidate_head_sha: str,
     pull_request_number: int,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -7414,6 +7494,7 @@ def _collect_and_validate_static(
         expected_ruleset_id=expected_ruleset_id,
         expected_workflow_id=expected_workflow_id,
         expected_workflow_sha=expected_workflow_sha,
+        expected_base_sha=expected_base_sha,
         candidate_head_sha=candidate_head_sha,
         pull_request_number=pull_request_number,
     )
@@ -7425,6 +7506,7 @@ def _collect_and_validate_static(
         expected_ruleset_id=expected_ruleset_id,
         expected_workflow_id=expected_workflow_id,
         expected_workflow_sha=expected_workflow_sha,
+        expected_base_sha=expected_base_sha,
         candidate_head_sha=candidate_head_sha,
         pull_request_number=pull_request_number,
     )
@@ -7438,6 +7520,7 @@ def _collect_and_validate_static(
         expected_ruleset_id=expected_ruleset_id,
         expected_workflow_id=expected_workflow_id,
         expected_workflow_sha=expected_workflow_sha,
+        expected_base_sha=expected_base_sha,
         candidate_head_sha=candidate_head_sha,
         pull_request_number=pull_request_number,
     )
@@ -7454,6 +7537,7 @@ def _collect_and_validate_static(
         expected_ruleset_id=expected_ruleset_id,
         expected_workflow_id=expected_workflow_id,
         expected_workflow_sha=expected_workflow_sha,
+        expected_base_sha=expected_base_sha,
         candidate_head_sha=candidate_head_sha,
         pull_request_number=pull_request_number,
     )
@@ -7515,6 +7599,7 @@ def collect_and_validate(
     expected_ruleset_id: int,
     expected_workflow_id: int,
     expected_workflow_sha: str,
+    expected_base_sha: str,
     candidate_head_sha: str,
     pull_request_number: int,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -7527,10 +7612,11 @@ def collect_and_validate(
         expected_ruleset_id=expected_ruleset_id,
         expected_workflow_id=expected_workflow_id,
         expected_workflow_sha=expected_workflow_sha,
+        expected_base_sha=expected_base_sha,
         candidate_head_sha=candidate_head_sha,
         pull_request_number=pull_request_number,
     )
-    _require_pointer_proof(loaded_contract)
+    _require_admission_preconditions(loaded_contract)
     return evidence, static_admission
 
 
@@ -7610,6 +7696,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=_sha1_argument,
     )
     parser.add_argument(
+        "--expected-base-sha",
+        required=True,
+        type=_sha1_argument,
+    )
+    parser.add_argument(
         "--candidate-head-sha",
         required=True,
         type=_sha1_argument,
@@ -7621,6 +7712,7 @@ def main() -> int:
     args = build_parser().parse_args()
     contract_sha256 = None
     evidence_sha256 = None
+    observed_base_sha = None
     static_equivalence = None
     try:
         contract, contract_sha256 = _read_json(args.contract, label="contract")
@@ -7638,20 +7730,24 @@ def main() -> int:
                 expected_ruleset_id=args.expected_ruleset_id,
                 expected_workflow_id=args.expected_workflow_id,
                 expected_workflow_sha=args.expected_workflow_sha,
+                expected_base_sha=args.expected_base_sha,
                 candidate_head_sha=args.candidate_head_sha,
                 pull_request_number=args.pull_request_number,
             )
+            observed_base_sha = evidence["revalidation"]["pull_request"]["base"]["sha"]
             client.revalidate_for_admission()
             evidence_sha256 = hashlib.sha256(
                 _canonical_json_bytes(evidence)
             ).hexdigest()
             static_equivalence = "validated"
-            _require_pointer_proof(loaded_contract)
+            _require_admission_preconditions(loaded_contract)
     except EnforcementDoctorError as error:
         blocked_receipt = {
             "classification": "blocked_until_trusted",
             "contract_sha256": contract_sha256,
             "evidence_sha256": evidence_sha256,
+            "expected_base_sha": args.expected_base_sha,
+            "provider_observed_base_sha": observed_base_sha,
             "operation": "cisco-cutover-enforcement-doctor",
             "reason": str(error),
             "reason_code": error.reason_code,
@@ -7660,6 +7756,8 @@ def main() -> int:
         }
         if error.api_failure is not None:
             blocked_receipt["api_failure"] = error.api_failure
+        if error.blockers is not None:
+            blocked_receipt["blockers"] = error.blockers
         if error.cleanup_failure is not None:
             blocked_receipt["cleanup_failure"] = error.cleanup_failure
         print(
@@ -7696,6 +7794,7 @@ def main() -> int:
                     "base_ref": pull_request["base"]["ref"],
                     "base_repository_id": pull_request["base"]["repository"]["id"],
                     "base_sha": pull_request["base"]["sha"],
+                    "expected_base_sha": args.expected_base_sha,
                     "head_repository_full_name": pull_request["head"]["repository"][
                         "full_name"
                     ],
@@ -7704,6 +7803,7 @@ def main() -> int:
                     "pull_request_id": pull_request["id"],
                     "pull_request_number": args.pull_request_number,
                     "pull_request_url": pull_request["url"],
+                    "provider_observed_base_sha": pull_request["base"]["sha"],
                 },
                 "classification": "admitted",
                 "collection": evidence["collector"],

@@ -37,6 +37,7 @@ RFC3339_UTC_PATTERN = re.compile(
 VALIDATOR_PATH = "scripts/validate_cisco_cutover_receipt.py"
 REQUIRED_EXACT_INPUTS = [
     "expected_canonical_commit",
+    "expected_base_sha",
     "expected_pull_request_number",
     "expected_private_release_commit",
     "expected_release_manifest_sha256",
@@ -50,6 +51,7 @@ REQUIRED_EXACT_INPUTS = [
 EXPECTED_CUTOVER_INPUT_VARIABLES = [
     "CISCO_CUTOVER_TARGET_PR_NUMBER",
     "CISCO_CUTOVER_TARGET_HEAD_SHA",
+    "CISCO_CUTOVER_TARGET_BASE_SHA",
     "CISCO_CUTOVER_RECEIPT_BASE64",
     "CISCO_CUTOVER_EXPECTED_CANONICAL_COMMIT",
     "CISCO_CUTOVER_EXPECTED_PRIVATE_RELEASE_COMMIT",
@@ -76,6 +78,18 @@ EXPECTED_GITHUB_ACTIONS_PROVIDER = {
     "slug": "github-actions",
 }
 POINTER_STATE_HASH_DOMAIN = "cisco-installed-pointer-state-v1"
+ADMISSION_PRECONDITIONS_UNAVAILABLE_REASON = "admission-preconditions-unavailable"
+EXPECTED_BASE_CHANGE_ENFORCEMENT = {
+    "status": "unavailable",
+    "reason": "ruleset-workflow-default-activities-exclude-edited",
+    "event": "pull_request_target",
+    "required_activity": "edited",
+    "ruleset_dispatch_activities": [
+        "opened",
+        "synchronize",
+        "reopened",
+    ],
+}
 POINTER_PROOF_UNAVAILABLE_REASON = "pointer-proof-unavailable"
 POINTER_AUTHORITY_REASON = "private-live-authority-not-configured"
 EXPECTED_ACTIVATION = {
@@ -131,11 +145,12 @@ EXPECTED_RETIREMENT_STATE_MACHINE = {
         "retirement-pr-merged",
     ],
     "head_change_transition": "retirement-pr-head-frozen",
+    "base_change_transition": "retirement-pr-head-frozen",
     "mutation_authority": "explicit-repository-admin-or-organization-owner",
     "automatic_mutation": False,
 }
 EXPECTED_POST_CUTOVER_DECOMMISSION = {
-    "trigger": "retirement-pr-merged-at-frozen-head",
+    "trigger": "retirement-pr-merged-at-frozen-range",
     "lease_variable": "CISCO_CUTOVER_DECOMMISSION_LEASE",
     "cutover_input_variables": EXPECTED_CUTOVER_INPUT_VARIABLES,
     "compare_and_swap": {
@@ -150,7 +165,7 @@ EXPECTED_POST_CUTOVER_DECOMMISSION = {
     },
     "ordered_steps": [
         "acquire-and-read-back-exclusive-lease",
-        "revalidate-merged-pr-head-and-doctor-receipt",
+        "revalidate-merged-pr-range-and-doctor-receipt",
         "disable-exact-ruleset-after-content-compare",
         "prove-ruleset-is-not-effective",
         "remove-workflow-in-separate-reviewed-pr",
@@ -551,6 +566,7 @@ def _validate_contract(contract: dict[str, Any]) -> dict[str, Any]:
             "trust_gates",
             "blocked_until_trusted",
             "unproved_atomicity_fallback",
+            "base_change_enforcement",
             "retirement_state_machine",
             "post_cutover_decommission",
             "receipt_admission",
@@ -600,6 +616,11 @@ def _validate_contract(contract: dict[str, Any]) -> dict[str, Any]:
         label="contract unproved_atomicity_fallback",
     )
     _require_exact_json(
+        contract["base_change_enforcement"],
+        EXPECTED_BASE_CHANGE_ENFORCEMENT,
+        label="contract base_change_enforcement",
+    )
+    _require_exact_json(
         contract["retirement_state_machine"],
         EXPECTED_RETIREMENT_STATE_MACHINE,
         label="contract retirement_state_machine",
@@ -646,6 +667,7 @@ def _validate_receipt(
     contract: dict[str, Any],
     *,
     expected_canonical_commit: str,
+    expected_base_sha: str,
     expected_private_release_commit: str,
     expected_release_manifest_sha256: str,
     expected_pull_request_number: int,
@@ -728,6 +750,7 @@ def _validate_receipt(
             "number": expected_pull_request_number,
             "head_sha": expected_canonical_commit,
             "base_ref": EXPECTED_DEFAULT_BRANCH,
+            "base_sha": expected_base_sha,
         },
         "required_workflow": {
             "id": expected_workflow_id,
@@ -934,6 +957,7 @@ def _validate_receipt(
             "target_repository_id",
             "pull_request_number",
             "pull_request_head_sha",
+            "pull_request_base_sha",
             "installation_scope_id",
             "pointer_generation",
             "acquired_at",
@@ -964,6 +988,14 @@ def _validate_receipt(
         merge_lease["pull_request_head_sha"],
         expected_canonical_commit,
         label="receipt pointer merge lease pull-request head SHA",
+    )
+    _require_exact_json(
+        _require_sha1(
+            merge_lease["pull_request_base_sha"],
+            label="receipt pointer merge lease pull-request base SHA",
+        ),
+        expected_base_sha,
+        label="receipt pointer merge lease pull-request base SHA",
     )
     _require_exact_json(
         merge_lease["installation_scope_id"],
@@ -1021,6 +1053,23 @@ def _blocked(
     return 1
 
 
+def _admission_blockers() -> list[dict[str, Any]]:
+    return [
+        {
+            "name": "base-change-enforcement",
+            "priority": 1,
+            **EXPECTED_BASE_CHANGE_ENFORCEMENT,
+        },
+        {
+            "authority_reason": POINTER_AUTHORITY_REASON,
+            "name": "pointer-proof",
+            "priority": 2,
+            "reason": POINTER_PROOF_UNAVAILABLE_REASON,
+            "status": "unavailable",
+        },
+    ]
+
+
 class ReceiptArgumentParser(argparse.ArgumentParser):
     def error(self, message: str) -> None:
         _blocked(f"argument error: {message}")
@@ -1045,6 +1094,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--receipt")
     parser.add_argument("--expected-canonical-commit")
+    parser.add_argument("--expected-base-sha")
     parser.add_argument("--expected-pull-request-number")
     parser.add_argument("--expected-private-release-commit")
     parser.add_argument("--expected-release-manifest-sha256")
@@ -1071,6 +1121,7 @@ def main(argv: list[str] | None = None) -> int:
 
         expectations = {
             "expected_canonical_commit": args.expected_canonical_commit,
+            "expected_base_sha": args.expected_base_sha,
             "expected_pull_request_number": args.expected_pull_request_number,
             "expected_private_release_commit": (args.expected_private_release_commit),
             "expected_release_manifest_sha256": (args.expected_release_manifest_sha256),
@@ -1090,6 +1141,10 @@ def main(argv: list[str] | None = None) -> int:
         expected_canonical_commit = _require_sha1(
             args.expected_canonical_commit,
             label="expected canonical commit",
+        )
+        expected_base_sha = _require_sha1(
+            args.expected_base_sha,
+            label="expected base SHA",
         )
         expected_private_release_commit = _require_sha1(
             args.expected_private_release_commit,
@@ -1140,6 +1195,7 @@ def main(argv: list[str] | None = None) -> int:
             receipt,
             contract,
             expected_canonical_commit=expected_canonical_commit,
+            expected_base_sha=expected_base_sha,
             expected_private_release_commit=expected_private_release_commit,
             expected_release_manifest_sha256=(expected_release_manifest_sha256),
             expected_pull_request_number=expected_pull_request_number,
@@ -1154,9 +1210,11 @@ def main(argv: list[str] | None = None) -> int:
         return _blocked(str(error))
 
     return _blocked(
-        POINTER_PROOF_UNAVAILABLE_REASON,
+        ADMISSION_PRECONDITIONS_UNAVAILABLE_REASON,
         details={
+            "blockers": _admission_blockers(),
             "canonical_commit": expected_canonical_commit,
+            "expected_base_sha": expected_base_sha,
             "installation_scope_id": pointer["installation_scope_id"],
             "pointer_authority_reason": POINTER_AUTHORITY_REASON,
             "pointer_authority_status": "unavailable",

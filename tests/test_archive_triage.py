@@ -5524,6 +5524,7 @@ class ArchiveTriageTests(unittest.TestCase):
 class BugTriageDocumentationTests(unittest.TestCase):
     _pull_request_number = 7
     _canonical_commit = "1" * 40
+    _base_sha = "9" * 40
     _private_release_commit = "2" * 40
     _release_manifest_sha256 = "3" * 64
     _workflow_source_commit = "4" * 40
@@ -5536,11 +5537,14 @@ class BugTriageDocumentationTests(unittest.TestCase):
     _trusted_gate_environment_names = (
         "EVENT_REPOSITORY",
         "PR_BASE_REF",
+        "PR_BASE_SHA",
         "PR_HEAD_REPOSITORY",
         "PR_HEAD_SHA",
         "PR_NUMBER",
         "SELECTED_TARGET_HEAD_SHA",
+        "SELECTED_TARGET_BASE_SHA",
         "SELECTED_TARGET_PR_NUMBER",
+        "CISCO_CUTOVER_TARGET_BASE_SHA",
         "CISCO_CUTOVER_RECEIPT_BASE64",
         "CISCO_CUTOVER_EXPECTED_CANONICAL_COMMIT",
         "CISCO_CUTOVER_EXPECTED_PRIVATE_RELEASE_COMMIT",
@@ -5555,13 +5559,54 @@ class BugTriageDocumentationTests(unittest.TestCase):
     _selector_environment_names = (
         "EVENT_REPOSITORY",
         "PR_BASE_REF",
+        "PR_BASE_SHA",
         "PR_HEAD_REPOSITORY",
         "PR_HEAD_SHA",
         "PR_NUMBER",
         "CISCO_CUTOVER_TARGET_HEAD_SHA",
+        "CISCO_CUTOVER_TARGET_BASE_SHA",
         "CISCO_CUTOVER_TARGET_PR_NUMBER",
         "GITHUB_OUTPUT",
     )
+
+    @staticmethod
+    def _expected_base_change_enforcement() -> dict[str, object]:
+        return {
+            "status": "unavailable",
+            "reason": "ruleset-workflow-default-activities-exclude-edited",
+            "event": "pull_request_target",
+            "required_activity": "edited",
+            "ruleset_dispatch_activities": [
+                "opened",
+                "synchronize",
+                "reopened",
+            ],
+        }
+
+    @classmethod
+    def _expected_admission_blockers(
+        cls,
+        *,
+        pointer_available: bool = False,
+    ) -> list[dict[str, object]]:
+        blockers = [
+            {
+                "name": "base-change-enforcement",
+                "priority": 1,
+                **cls._expected_base_change_enforcement(),
+            }
+        ]
+        if not pointer_available:
+            blockers.append(
+                {
+                    "authority_reason": "private-live-authority-not-configured",
+                    "name": "pointer-proof",
+                    "priority": 2,
+                    "reason": "pointer-proof-unavailable",
+                    "status": "unavailable",
+                }
+            )
+        return blockers
 
     def test_generated_project_journal_index_is_ignored_exactly(self) -> None:
         ignore_lines = (
@@ -5624,6 +5669,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
                     "number": self._pull_request_number,
                     "head_sha": self._canonical_commit,
                     "base_ref": "master",
+                    "base_sha": self._base_sha,
                 },
                 "required_workflow": {
                     "id": self._workflow_id,
@@ -5678,6 +5724,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
                     "target_repository_id": 1242512092,
                     "pull_request_number": self._pull_request_number,
                     "pull_request_head_sha": self._canonical_commit,
+                    "pull_request_base_sha": self._base_sha,
                     "installation_scope_id": self._installation_scope_id,
                     "pointer_generation": self._pointer_generation,
                     "acquired_at": self._pointer_observed_at,
@@ -5710,6 +5757,8 @@ class BugTriageDocumentationTests(unittest.TestCase):
         receipt_path: Path | None = None,
         receipt_sha256: str | None = None,
         expected_installation_scope_id: str | None = None,
+        expected_base_sha: str | None = None,
+        include_expected_base_sha: bool = True,
         expected_pointer_generation: int | None = None,
         expected_pointer_state_sha256: str | None = None,
     ) -> subprocess.CompletedProcess[str]:
@@ -5746,6 +5795,12 @@ class BugTriageDocumentationTests(unittest.TestCase):
                     (expected_pointer_state_sha256 or self._pointer_state_sha256()),
                 ]
             )
+            if include_expected_base_sha:
+                canonical_index = command.index("--expected-canonical-commit")
+                command[canonical_index + 2 : canonical_index + 2] = [
+                    "--expected-base-sha",
+                    expected_base_sha or self._base_sha,
+                ]
         return subprocess.run(
             command,
             check=False,
@@ -5797,11 +5852,14 @@ class BugTriageDocumentationTests(unittest.TestCase):
                 "GITHUB_REPOSITORY": "Joey-Tools/codex-debug-triage",
                 "EVENT_REPOSITORY": "Joey-Tools/codex-debug-triage",
                 "PR_BASE_REF": "master",
+                "PR_BASE_SHA": self._base_sha,
                 "PR_HEAD_REPOSITORY": "Joey-Tools/codex-debug-triage",
                 "PR_HEAD_SHA": self._canonical_commit,
                 "PR_NUMBER": str(self._pull_request_number),
                 "SELECTED_TARGET_HEAD_SHA": self._canonical_commit,
+                "SELECTED_TARGET_BASE_SHA": self._base_sha,
                 "SELECTED_TARGET_PR_NUMBER": str(self._pull_request_number),
+                "CISCO_CUTOVER_TARGET_BASE_SHA": self._base_sha,
                 "CISCO_CUTOVER_RECEIPT_BASE64": base64.b64encode(
                     receipt_payload
                 ).decode("ascii"),
@@ -5838,8 +5896,10 @@ class BugTriageDocumentationTests(unittest.TestCase):
         output_path: Path,
         current_pr_number: int | None = None,
         current_head_sha: str | None = None,
+        current_base_sha: str | None = None,
         target_pr_number: int | None = None,
         target_head_sha: str | None = None,
+        target_base_sha: str | None = None,
         overrides: dict[str, str] | None = None,
     ) -> dict[str, str]:
         environment = os.environ.copy()
@@ -5850,12 +5910,14 @@ class BugTriageDocumentationTests(unittest.TestCase):
                 "GITHUB_REPOSITORY": "Joey-Tools/codex-debug-triage",
                 "EVENT_REPOSITORY": "Joey-Tools/codex-debug-triage",
                 "PR_BASE_REF": "master",
+                "PR_BASE_SHA": current_base_sha or self._base_sha,
                 "PR_HEAD_REPOSITORY": "Joey-Tools/codex-debug-triage",
                 "PR_HEAD_SHA": current_head_sha or self._canonical_commit,
                 "PR_NUMBER": str(current_pr_number or self._pull_request_number),
                 "CISCO_CUTOVER_TARGET_HEAD_SHA": (
                     target_head_sha or self._canonical_commit
                 ),
+                "CISCO_CUTOVER_TARGET_BASE_SHA": (target_base_sha or self._base_sha),
                 "CISCO_CUTOVER_TARGET_PR_NUMBER": str(
                     target_pr_number or self._pull_request_number
                 ),
@@ -5913,7 +5975,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
                     "full_name": repository["full_name"],
                     "id": repository["id"],
                 },
-                "sha": "9" * 40,
+                "sha": self._base_sha,
             },
             "head": {
                 "repository": {
@@ -5933,7 +5995,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
             "base": {
                 "ref": repository["default_branch"],
                 "repository_id": repository["id"],
-                "sha": "9" * 40,
+                "sha": self._base_sha,
             },
             "head": {
                 "repository_id": repository["id"],
@@ -6050,6 +6112,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
         cutover_values = {
             "CISCO_CUTOVER_TARGET_PR_NUMBER": str(self._pull_request_number),
             "CISCO_CUTOVER_TARGET_HEAD_SHA": self._canonical_commit,
+            "CISCO_CUTOVER_TARGET_BASE_SHA": self._base_sha,
             "CISCO_CUTOVER_RECEIPT_BASE64": "Zml4dHVyZS1yZWNlaXB0",
             "CISCO_CUTOVER_EXPECTED_CANONICAL_COMMIT": self._canonical_commit,
             "CISCO_CUTOVER_EXPECTED_PRIVATE_RELEASE_COMMIT": (
@@ -6390,6 +6453,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
             expected_ruleset_id=self._ruleset_id,
             expected_workflow_id=self._workflow_id,
             expected_workflow_sha=self._workflow_source_commit,
+            expected_base_sha=self._base_sha,
             candidate_head_sha=self._canonical_commit,
             pull_request_number=7,
         )
@@ -6403,6 +6467,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
         expected_ruleset_id: int | None = None,
         expected_workflow_id: int | None = None,
         expected_workflow_sha: str | None = None,
+        expected_base_sha: str | None = None,
         candidate_head_sha: str | None = None,
     ) -> subprocess.CompletedProcess[str]:
         contract_payload = CUTOVER_ENFORCEMENT_CONTRACT_PATH.read_bytes()
@@ -6410,6 +6475,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
         ruleset_id = expected_ruleset_id or self._ruleset_id
         workflow_id = expected_workflow_id or self._workflow_id
         workflow_sha = expected_workflow_sha or self._workflow_source_commit
+        base_sha = expected_base_sha or self._base_sha
         head_sha = candidate_head_sha or self._canonical_commit
         try:
             admission = ENFORCEMENT_MODULE.validate_enforcement(
@@ -6420,6 +6486,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
                 expected_ruleset_id=ruleset_id,
                 expected_workflow_id=workflow_id,
                 expected_workflow_sha=workflow_sha,
+                expected_base_sha=base_sha,
                 candidate_head_sha=head_sha,
                 pull_request_number=7,
             )
@@ -6429,6 +6496,8 @@ class BugTriageDocumentationTests(unittest.TestCase):
                 "reason": str(error),
                 "reason_code": error.reason_code,
             }
+            if error.blockers is not None:
+                outcome["blockers"] = error.blockers
             return subprocess.CompletedProcess(
                 args=[],
                 returncode=1,
@@ -6475,6 +6544,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
         expected_ruleset_id: int | None = None,
         expected_workflow_id: int | None = None,
         expected_workflow_sha: str | None = None,
+        expected_base_sha: str | None = None,
         candidate_head_sha: str | None = None,
     ) -> dict[str, object]:
         selected_contract = contract or json.loads(
@@ -6490,6 +6560,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
             expected_workflow_sha=(
                 expected_workflow_sha or self._workflow_source_commit
             ),
+            expected_base_sha=expected_base_sha or self._base_sha,
             candidate_head_sha=candidate_head_sha or self._canonical_commit,
             pull_request_number=7,
         )
@@ -6783,6 +6854,16 @@ class BugTriageDocumentationTests(unittest.TestCase):
         self.assertIn("does not document conditional `If-Match`", migration)
         self.assertIn("--expected-run-id", migration)
         self.assertIn("--expected-run-attempt", migration)
+        self.assertIn("--expected-base-sha", migration)
+        self.assertIn("CISCO_CUTOVER_TARGET_BASE_SHA", migration)
+        self.assertIn("base-only retarget", migration)
+        self.assertIn(
+            "schema-6 doctor output reserves exact admitted fields", migration
+        )
+        self.assertIn(
+            "ruleset-workflow-default-activities-exclude-edited",
+            migration,
+        )
         self.assertIn("--gh-executable", migration)
         self.assertIn("--expected-gh-sha256", migration)
         self.assertIn("--gh-config-dir", migration)
@@ -6809,7 +6890,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
             "Separately review and merge a compatibility/bootstrap PR",
             "create the separate\n   retirement PR",
             "producer-authored schema-3 receipt",
-            "configures both selector variables",
+            "configures all three selector variables",
             "creates or updates the active,\n   bypass-free organization",
             "Configure and independently validate the live pointer authority",
             "trigger a new target evaluation",
@@ -6838,6 +6919,11 @@ class BugTriageDocumentationTests(unittest.TestCase):
 
         self.assertIn("pull_request_target:", workflow)
         self.assertIn("branches:\n      - master", workflow)
+        event_source = workflow.split("pull_request_target:\n", 1)[1].split(
+            "\npermissions:",
+            1,
+        )[0]
+        self.assertIn("      - edited\n", event_source)
         self.assertIn("name: cisco-cutover-admission", workflow)
         self.assertIn("permissions:\n  contents: read", workflow)
         self.assertIn(
@@ -7242,8 +7328,10 @@ class BugTriageDocumentationTests(unittest.TestCase):
                     )
                     outcome = json.loads(result.stdout)
                     self.assertEqual(outcome["classification"], classification)
+                    self.assertEqual(outcome["target_base_sha"], self._base_sha)
                     output = output_path.read_text(encoding="utf-8")
                     self.assertIn(f"applicable={applicable}\n", output)
+                    self.assertIn(f"target-base-sha={self._base_sha}\n", output)
 
     def test_trusted_cutover_selector_blocks_target_head_change(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -7262,6 +7350,23 @@ class BugTriageDocumentationTests(unittest.TestCase):
         self.assertEqual(outcome["classification"], "blocked_until_trusted")
         self.assertIn("head changed", outcome["reason"])
 
+    def test_trusted_cutover_selector_blocks_target_base_change(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            environment = self._selector_workflow_environment(
+                output_path=temp_root / "selector.output",
+                current_base_sha="8" * 40,
+            )
+            result = self._run_selector_workflow_program(
+                environment=environment,
+                cwd=temp_root,
+            )
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        outcome = json.loads(result.stdout)
+        self.assertEqual(outcome["classification"], "blocked_until_trusted")
+        self.assertIn("base changed", outcome["reason"])
+
     def test_trusted_cutover_selector_is_neutral_when_unconfigured(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_root = Path(temp_dir)
@@ -7271,6 +7376,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
             )
             environment.pop("CISCO_CUTOVER_TARGET_PR_NUMBER")
             environment.pop("CISCO_CUTOVER_TARGET_HEAD_SHA")
+            environment.pop("CISCO_CUTOVER_TARGET_BASE_SHA")
             result = self._run_selector_workflow_program(
                 environment=environment,
                 cwd=temp_root,
@@ -7282,15 +7388,22 @@ class BugTriageDocumentationTests(unittest.TestCase):
         self.assertEqual(outcome["classification"], "not_applicable")
         self.assertIsNone(outcome["target_pr_number"])
         self.assertIsNone(outcome["target_head_sha"])
+        self.assertIsNone(outcome["target_base_sha"])
         self.assertEqual(
             output,
-            "applicable=false\ntarget-head-sha=\ntarget-pr-number=\n",
+            (
+                "applicable=false\n"
+                "target-base-sha=\n"
+                "target-head-sha=\n"
+                "target-pr-number=\n"
+            ),
         )
 
     def test_trusted_cutover_selector_blocks_partial_configuration(self) -> None:
         for missing_name in (
             "CISCO_CUTOVER_TARGET_PR_NUMBER",
             "CISCO_CUTOVER_TARGET_HEAD_SHA",
+            "CISCO_CUTOVER_TARGET_BASE_SHA",
         ):
             with self.subTest(missing=missing_name):
                 with tempfile.TemporaryDirectory() as temp_dir:
@@ -7394,6 +7507,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
             {
                 "target_pr_number_variable": "CISCO_CUTOVER_TARGET_PR_NUMBER",
                 "target_head_sha_variable": "CISCO_CUTOVER_TARGET_HEAD_SHA",
+                "target_base_sha_variable": "CISCO_CUTOVER_TARGET_BASE_SHA",
                 "selector_job_name": "cisco-cutover-selector",
                 "target_job_name": "cisco-cutover-admission",
                 "neutral_job_name": "cisco-cutover-neutral",
@@ -7405,6 +7519,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
             [
                 "CISCO_CUTOVER_TARGET_PR_NUMBER",
                 "CISCO_CUTOVER_TARGET_HEAD_SHA",
+                "CISCO_CUTOVER_TARGET_BASE_SHA",
                 "CISCO_CUTOVER_RECEIPT_BASE64",
                 "CISCO_CUTOVER_EXPECTED_CANONICAL_COMMIT",
                 "CISCO_CUTOVER_EXPECTED_PRIVATE_RELEASE_COMMIT",
@@ -7424,6 +7539,36 @@ class BugTriageDocumentationTests(unittest.TestCase):
                 "reason": "private-live-authority-not-configured",
             },
         )
+        self.assertEqual(
+            contract["base_change_enforcement"],
+            self._expected_base_change_enforcement(),
+        )
+
+    def test_enforcement_contract_rejects_base_change_precondition_drift(
+        self,
+    ) -> None:
+        cases = {
+            "available": lambda precondition: precondition.update(
+                {"status": "available"}
+            ),
+            "edited-dispatched": lambda precondition: precondition[
+                "ruleset_dispatch_activities"
+            ].append("edited"),
+        }
+        for label, mutate in cases.items():
+            with self.subTest(case=label):
+                contract = json.loads(
+                    CUTOVER_ENFORCEMENT_CONTRACT_PATH.read_text(encoding="utf-8")
+                )
+                mutate(contract["base_change_enforcement"])
+
+                with self.assertRaises(
+                    ENFORCEMENT_MODULE.EnforcementDoctorError
+                ) as raised:
+                    ENFORCEMENT_MODULE._load_contract(contract)
+
+                self.assertEqual(raised.exception.reason_code, "invalid-contract")
+                self.assertIn("base-change enforcement", str(raised.exception))
 
     def test_trusted_cutover_workflow_cannot_green_without_inputs(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -7469,6 +7614,9 @@ class BugTriageDocumentationTests(unittest.TestCase):
             "base-ref": {
                 "PR_BASE_REF": "attacker-base",
             },
+            "base-sha": {
+                "PR_BASE_SHA": "8" * 40,
+            },
             "head-sha": {
                 "PR_HEAD_SHA": "4" * 40,
             },
@@ -7478,11 +7626,17 @@ class BugTriageDocumentationTests(unittest.TestCase):
             "selector-head": {
                 "SELECTED_TARGET_HEAD_SHA": "4" * 40,
             },
+            "selector-base": {
+                "SELECTED_TARGET_BASE_SHA": "8" * 40,
+            },
             "selector-pr": {
                 "SELECTED_TARGET_PR_NUMBER": str(self._pull_request_number + 1),
             },
             "expected-canonical": {
                 "CISCO_CUTOVER_EXPECTED_CANONICAL_COMMIT": "4" * 40,
+            },
+            "expected-base": {
+                "CISCO_CUTOVER_TARGET_BASE_SHA": "8" * 40,
             },
             "receipt-digest": {
                 "CISCO_CUTOVER_EXPECTED_RECEIPT_SHA256": "4" * 64,
@@ -7544,6 +7698,12 @@ class BugTriageDocumentationTests(unittest.TestCase):
                 ),
                 "merge lease head differs",
             ),
+            "lease-base": (
+                lambda pointer: pointer["merge_lease"].update(
+                    {"pull_request_base_sha": "8" * 40}
+                ),
+                "merge lease base differs",
+            ),
             "lease-generation": (
                 lambda pointer: pointer["merge_lease"].update(
                     {"pointer_generation": self._pointer_generation + 1}
@@ -7594,6 +7754,41 @@ class BugTriageDocumentationTests(unittest.TestCase):
                         "blocked_until_trusted",
                     )
                     self.assertIn(expected_reason, outcome["reason"])
+
+    def test_trusted_cutover_workflow_rejects_stale_receipt_after_base_retarget(
+        self,
+    ) -> None:
+        fixture = json.loads(MIGRATION_FIXTURE_PATH.read_text(encoding="utf-8"))
+        stale_receipt = self._matching_cutover_receipt(fixture)
+        receipt_payload = (
+            json.dumps(
+                stale_receipt,
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            + "\n"
+        ).encode("utf-8")
+        new_base_sha = "8" * 40
+        environment = self._trusted_workflow_environment(
+            receipt_payload=receipt_payload,
+            overrides={
+                "PR_BASE_SHA": new_base_sha,
+                "SELECTED_TARGET_BASE_SHA": new_base_sha,
+                "CISCO_CUTOVER_TARGET_BASE_SHA": new_base_sha,
+            },
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result = self._run_trusted_workflow_program(
+                environment=environment,
+                cwd=Path(temp_dir),
+            )
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        outcome = json.loads(result.stdout)
+        self.assertEqual(outcome["classification"], "blocked_until_trusted")
+        self.assertIn("receipt cutover contract differs", outcome["reason"])
+        self.assertNotEqual(outcome.get("static_equivalence"), "validated")
 
     def test_trusted_cutover_workflow_ignores_malicious_candidate_files(
         self,
@@ -7649,8 +7844,20 @@ class BugTriageDocumentationTests(unittest.TestCase):
         self.assertFalse(candidate_executed)
         outcome = json.loads(result.stdout)
         self.assertEqual(outcome["classification"], "blocked_until_trusted")
-        self.assertEqual(outcome["reason"], "pointer-proof-unavailable")
+        self.assertEqual(
+            outcome["reason"],
+            "admission-preconditions-unavailable",
+        )
+        self.assertEqual(
+            outcome["blockers"],
+            self._expected_admission_blockers(),
+        )
         self.assertEqual(outcome["static_equivalence"], "validated")
+        self.assertEqual(outcome["expected_base_sha"], self._base_sha)
+        self.assertEqual(
+            outcome["provider_observed_base_sha"],
+            self._base_sha,
+        )
         self.assertEqual(
             outcome["receipt_sha256"],
             hashlib.sha256(receipt_payload).hexdigest(),
@@ -7679,7 +7886,42 @@ class BugTriageDocumentationTests(unittest.TestCase):
                 )
                 self.assertIn("is a placeholder", outcome["reason"])
 
-    def test_enforcement_doctor_blocks_without_live_pointer_authority(
+    def test_trusted_cutover_workflow_rejects_untrusted_base_expectations(
+        self,
+    ) -> None:
+        cases = {
+            "missing": None,
+            "malformed": "A" * 40,
+            "placeholder": "placeholder",
+            "all-zero": "0" * 40,
+        }
+        for label, value in cases.items():
+            with self.subTest(case=label):
+                environment = self._trusted_workflow_environment(
+                    receipt_payload=b"{}\n",
+                )
+                if value is None:
+                    environment.pop("CISCO_CUTOVER_TARGET_BASE_SHA")
+                else:
+                    environment["CISCO_CUTOVER_TARGET_BASE_SHA"] = value
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    result = self._run_trusted_workflow_program(
+                        environment=environment,
+                        cwd=Path(temp_dir),
+                    )
+
+                self.assertEqual(result.returncode, 1, result.stderr)
+                outcome = json.loads(result.stdout)
+                self.assertEqual(
+                    outcome["classification"],
+                    "blocked_until_trusted",
+                )
+                self.assertRegex(
+                    outcome["reason"],
+                    r"(is missing|is a placeholder|must be exact lowercase hex)",
+                )
+
+    def test_enforcement_doctor_blocks_on_unavailable_admission_preconditions(
         self,
     ) -> None:
         result = self._run_enforcement_doctor(self._matching_enforcement_evidence())
@@ -7688,7 +7930,14 @@ class BugTriageDocumentationTests(unittest.TestCase):
         self.assertEqual(result.stderr, "")
         outcome = json.loads(result.stdout)
         self.assertEqual(outcome["classification"], "blocked_until_trusted")
-        self.assertEqual(outcome["reason_code"], "pointer-proof-unavailable")
+        self.assertEqual(
+            outcome["reason_code"],
+            "admission-preconditions-unavailable",
+        )
+        self.assertEqual(
+            outcome["blockers"],
+            self._expected_admission_blockers(),
+        )
 
     def test_enforcement_live_collector_exhausts_pages_and_binds_lineage(
         self,
@@ -7706,6 +7955,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
             expected_ruleset_id=self._ruleset_id,
             expected_workflow_id=self._workflow_id,
             expected_workflow_sha=self._workflow_source_commit,
+            expected_base_sha=self._base_sha,
             candidate_head_sha=self._canonical_commit,
             pull_request_number=7,
         )
@@ -8054,6 +8304,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
                 expected_ruleset_id=self._ruleset_id,
                 expected_workflow_id=self._workflow_id,
                 expected_workflow_sha=self._workflow_source_commit,
+                expected_base_sha=self._base_sha,
                 candidate_head_sha=self._canonical_commit,
                 pull_request_number=7,
             )
@@ -8100,6 +8351,52 @@ class BugTriageDocumentationTests(unittest.TestCase):
                 expected_ruleset_id=self._ruleset_id,
                 expected_workflow_id=self._workflow_id,
                 expected_workflow_sha=self._workflow_source_commit,
+                expected_base_sha=self._base_sha,
+                candidate_head_sha=self._canonical_commit,
+                pull_request_number=7,
+            )
+
+        self.assertEqual(
+            raised.exception.reason_code,
+            "pull-request-identity-mismatch",
+        )
+        self.assertEqual(pull_reads, 2)
+
+    def test_enforcement_live_collector_rejects_base_change_on_revalidation(
+        self,
+    ) -> None:
+        contract = json.loads(
+            CUTOVER_ENFORCEMENT_CONTRACT_PATH.read_text(encoding="utf-8")
+        )
+        client = self._matching_live_api_client()
+        pull_endpoint = "/repos/Joey-Tools/codex-debug-triage/pulls/7"
+        original_get_json = client.get_json
+        pull_reads = 0
+
+        def raced_get_json(
+            endpoint: str,
+            parameters: dict[str, object] | None = None,
+        ) -> object:
+            nonlocal pull_reads
+            result = original_get_json(endpoint, parameters)
+            if endpoint == pull_endpoint:
+                pull_reads += 1
+                if pull_reads == 2:
+                    result["base"]["sha"] = "8" * 40
+            return result
+
+        client.get_json = raced_get_json
+
+        with self.assertRaises(ENFORCEMENT_MODULE.EnforcementDoctorError) as raised:
+            ENFORCEMENT_MODULE.collect_and_validate(
+                client,
+                contract,
+                expected_run_attempt=1,
+                expected_run_id=10101,
+                expected_ruleset_id=self._ruleset_id,
+                expected_workflow_id=self._workflow_id,
+                expected_workflow_sha=self._workflow_source_commit,
+                expected_base_sha=self._base_sha,
                 candidate_head_sha=self._canonical_commit,
                 pull_request_number=7,
             )
@@ -8141,6 +8438,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
             expected_ruleset_id=self._ruleset_id,
             expected_workflow_id=self._workflow_id,
             expected_workflow_sha=self._workflow_source_commit,
+            expected_base_sha=self._base_sha,
             candidate_head_sha=self._canonical_commit,
             pull_request_number=7,
         )
@@ -8169,6 +8467,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
             expected_ruleset_id=self._ruleset_id,
             expected_workflow_id=self._workflow_id,
             expected_workflow_sha=self._workflow_source_commit,
+            expected_base_sha=self._base_sha,
             candidate_head_sha=self._canonical_commit,
             pull_request_number=7,
         )
@@ -8183,7 +8482,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
             {value["phase"] for value in bounds},
             {"initial", "revalidation"},
         )
-        self.assertTrue(all(value["item_count"] == 12 for value in bounds))
+        self.assertTrue(all(value["item_count"] == 13 for value in bounds))
         self.assertTrue(all(value["terminal_empty_page"] == 3 for value in bounds))
         self.assertTrue(all(value["per_page"] == 30 for value in bounds))
         variable_calls = [
@@ -8233,6 +8532,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
                         expected_ruleset_id=self._ruleset_id,
                         expected_workflow_id=self._workflow_id,
                         expected_workflow_sha=self._workflow_source_commit,
+                        expected_base_sha=self._base_sha,
                         candidate_head_sha=self._canonical_commit,
                         pull_request_number=7,
                     )
@@ -8275,6 +8575,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
                 expected_ruleset_id=self._ruleset_id,
                 expected_workflow_id=self._workflow_id,
                 expected_workflow_sha=self._workflow_source_commit,
+                expected_base_sha=self._base_sha,
                 candidate_head_sha=self._canonical_commit,
                 pull_request_number=7,
             )
@@ -8323,6 +8624,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
                 expected_ruleset_id=self._ruleset_id,
                 expected_workflow_id=self._workflow_id,
                 expected_workflow_sha=self._workflow_source_commit,
+                expected_base_sha=self._base_sha,
                 candidate_head_sha=self._canonical_commit,
                 pull_request_number=7,
             )
@@ -8351,6 +8653,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
                 expected_ruleset_id=self._ruleset_id,
                 expected_workflow_id=self._workflow_id,
                 expected_workflow_sha=self._workflow_source_commit,
+                expected_base_sha=self._base_sha,
                 candidate_head_sha=self._canonical_commit,
                 pull_request_number=7,
             )
@@ -8498,6 +8801,8 @@ class BugTriageDocumentationTests(unittest.TestCase):
                         str(self._workflow_id),
                         "--expected-workflow-sha",
                         self._workflow_source_commit,
+                        "--expected-base-sha",
+                        self._base_sha,
                         "--candidate-head-sha",
                         self._canonical_commit,
                     ]
@@ -8532,6 +8837,8 @@ class BugTriageDocumentationTests(unittest.TestCase):
             str(self._workflow_id),
             "--expected-workflow-sha",
             self._workflow_source_commit,
+            "--expected-base-sha",
+            self._base_sha,
             "--candidate-head-sha",
             self._canonical_commit,
         ]
@@ -8542,6 +8849,59 @@ class BugTriageDocumentationTests(unittest.TestCase):
                 with redirect_stderr(io.StringIO()):
                     with self.assertRaises(SystemExit) as raised:
                         ENFORCEMENT_MODULE.build_parser().parse_args(incomplete)
+                self.assertEqual(raised.exception.code, 2)
+
+    def test_enforcement_doctor_requires_exact_pinned_base_sha(self) -> None:
+        base_arguments = [
+            "--contract",
+            str(CUTOVER_ENFORCEMENT_CONTRACT_PATH),
+            "--gh-executable",
+            "/usr/bin/true",
+            "--expected-gh-sha256",
+            "a" * 64,
+            "--gh-config-dir",
+            tempfile.gettempdir(),
+            "--pull-request-number",
+            "7",
+            "--expected-ruleset-id",
+            str(self._ruleset_id),
+            "--expected-run-id",
+            "10101",
+            "--expected-run-attempt",
+            "1",
+            "--expected-workflow-id",
+            str(self._workflow_id),
+            "--expected-workflow-sha",
+            self._workflow_source_commit,
+            "--expected-base-sha",
+            self._base_sha,
+            "--candidate-head-sha",
+            self._canonical_commit,
+        ]
+        base_index = base_arguments.index("--expected-base-sha")
+        cases = {
+            "missing": base_arguments[:base_index] + base_arguments[base_index + 2 :],
+            "malformed": (
+                base_arguments[: base_index + 1]
+                + ["A" * 40]
+                + base_arguments[base_index + 2 :]
+            ),
+            "placeholder": (
+                base_arguments[: base_index + 1]
+                + ["placeholder"]
+                + base_arguments[base_index + 2 :]
+            ),
+            "all-zero": (
+                base_arguments[: base_index + 1]
+                + ["0" * 40]
+                + base_arguments[base_index + 2 :]
+            ),
+        }
+        for label, arguments in cases.items():
+            with self.subTest(case=label):
+                with redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit) as raised:
+                        ENFORCEMENT_MODULE.build_parser().parse_args(arguments)
                 self.assertEqual(raised.exception.code, 2)
 
     def test_enforcement_acl_contract_is_descriptor_bound_and_platform_explicit(
@@ -13297,6 +13657,8 @@ class BugTriageDocumentationTests(unittest.TestCase):
             str(self._workflow_id),
             "--expected-workflow-sha",
             self._workflow_source_commit,
+            "--expected-base-sha",
+            self._base_sha,
             "--candidate-head-sha",
             self._canonical_commit,
         ]
@@ -13331,7 +13693,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
 
         self.assertEqual(return_code, 1)
         outcome = json.loads(output.getvalue())
-        self.assertEqual(outcome["schema_version"], 5)
+        self.assertEqual(outcome["schema_version"], 6)
         self.assertEqual(outcome["reason_code"], "blocked-permission")
         self.assertEqual(
             outcome["api_failure"],
@@ -13352,6 +13714,8 @@ class BugTriageDocumentationTests(unittest.TestCase):
         )
         self.assertIsNone(outcome["evidence_sha256"])
         self.assertIsNone(outcome["static_equivalence"])
+        self.assertEqual(outcome["expected_base_sha"], self._base_sha)
+        self.assertIsNone(outcome["provider_observed_base_sha"])
         self.assertNotIn("command", outcome)
         self.assertNotIn("headers", outcome)
         self.assertNotIn("token", output.getvalue().lower())
@@ -13377,6 +13741,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
                 expected_ruleset_id=self._ruleset_id,
                 expected_workflow_id=self._workflow_id,
                 expected_workflow_sha=self._workflow_source_commit,
+                expected_base_sha=self._base_sha,
                 candidate_head_sha=self._canonical_commit,
                 pull_request_number=7,
             )
@@ -13406,6 +13771,8 @@ class BugTriageDocumentationTests(unittest.TestCase):
             str(self._workflow_id),
             "--expected-workflow-sha",
             self._workflow_source_commit,
+            "--expected-base-sha",
+            self._base_sha,
             "--candidate-head-sha",
             self._canonical_commit,
         ]
@@ -13427,9 +13794,21 @@ class BugTriageDocumentationTests(unittest.TestCase):
         self.assertEqual(return_code, 1)
         outcome = json.loads(output.getvalue())
         self.assertEqual(outcome["classification"], "blocked_until_trusted")
-        self.assertEqual(outcome["schema_version"], 5)
-        self.assertEqual(outcome["reason_code"], "pointer-proof-unavailable")
+        self.assertEqual(outcome["schema_version"], 6)
+        self.assertEqual(
+            outcome["reason_code"],
+            "admission-preconditions-unavailable",
+        )
+        self.assertEqual(
+            outcome["blockers"],
+            self._expected_admission_blockers(),
+        )
         self.assertEqual(outcome["static_equivalence"], "validated")
+        self.assertEqual(outcome["expected_base_sha"], self._base_sha)
+        self.assertEqual(
+            outcome["provider_observed_base_sha"],
+            self._base_sha,
+        )
         self.assertEqual(
             outcome["evidence_sha256"],
             expected_evidence_sha256,
@@ -13452,6 +13831,75 @@ class BugTriageDocumentationTests(unittest.TestCase):
             [endpoint for endpoint, _ in client.calls if endpoint == attempt_endpoint],
             [attempt_endpoint, attempt_endpoint],
         )
+
+    def test_enforcement_doctor_stays_blocked_with_pointer_proof_test_double(
+        self,
+    ) -> None:
+        client = self._matching_live_api_client()
+        arguments = [
+            str(CUTOVER_ENFORCEMENT_DOCTOR_PATH),
+            "--contract",
+            str(CUTOVER_ENFORCEMENT_CONTRACT_PATH),
+            "--gh-executable",
+            "/fixed/gh",
+            "--expected-gh-sha256",
+            "a" * 64,
+            "--gh-config-dir",
+            "/fixed/config",
+            "--pull-request-number",
+            "7",
+            "--expected-ruleset-id",
+            str(self._ruleset_id),
+            "--expected-run-id",
+            "10101",
+            "--expected-run-attempt",
+            "1",
+            "--expected-workflow-id",
+            str(self._workflow_id),
+            "--expected-workflow-sha",
+            self._workflow_source_commit,
+            "--expected-base-sha",
+            self._base_sha,
+            "--candidate-head-sha",
+            self._canonical_commit,
+        ]
+        output = io.StringIO()
+        with mock.patch.object(
+            ENFORCEMENT_MODULE,
+            "GitHubApiClient",
+            return_value=client,
+        ):
+            with mock.patch.object(
+                ENFORCEMENT_MODULE,
+                "_require_pointer_proof",
+                return_value=None,
+            ):
+                with mock.patch.object(sys, "argv", arguments):
+                    with redirect_stdout(output):
+                        return_code = ENFORCEMENT_MODULE.main()
+
+        self.assertEqual(return_code, 1)
+        outcome = json.loads(output.getvalue())
+        self.assertEqual(outcome["schema_version"], 6)
+        self.assertEqual(outcome["classification"], "blocked_until_trusted")
+        self.assertEqual(
+            outcome["reason_code"],
+            "admission-preconditions-unavailable",
+        )
+        self.assertEqual(
+            outcome["blockers"],
+            self._expected_admission_blockers(pointer_available=True),
+        )
+        self.assertEqual(
+            outcome["expected_base_sha"],
+            self._base_sha,
+        )
+        self.assertEqual(
+            outcome["provider_observed_base_sha"],
+            self._base_sha,
+        )
+        self.assertEqual(outcome["static_equivalence"], "validated")
+        self.assertNotIn("candidate", outcome)
 
     def test_enforcement_accepts_distinct_source_workflow_repository(
         self,
@@ -13521,7 +13969,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertEqual(
             json.loads(result.stdout)["reason_code"],
-            "pointer-proof-unavailable",
+            "admission-preconditions-unavailable",
         )
 
     def test_enforcement_doctor_rejects_identity_and_scope_drift(
@@ -13538,6 +13986,12 @@ class BugTriageDocumentationTests(unittest.TestCase):
             "wrong-target-default-branch": (
                 lambda evidence: evidence["pull_request"]["base"].update(
                     {"ref": "candidate"}
+                ),
+                "pull-request-identity-mismatch",
+            ),
+            "wrong-target-base-sha": (
+                lambda evidence: evidence["pull_request"]["base"].update(
+                    {"sha": "8" * 40}
                 ),
                 "pull-request-identity-mismatch",
             ),
@@ -13585,6 +14039,13 @@ class BugTriageDocumentationTests(unittest.TestCase):
                 ).update({"value": "8" * 40}),
                 "selector-mismatch",
             ),
+            "selector-base-tamper": (
+                lambda evidence: self._cutover_variable(
+                    evidence,
+                    "CISCO_CUTOVER_TARGET_BASE_SHA",
+                ).update({"value": "8" * 40}),
+                "selector-mismatch",
+            ),
             "workflow-id-input-tamper": (
                 lambda evidence: self._cutover_variable(
                     evidence,
@@ -13609,6 +14070,36 @@ class BugTriageDocumentationTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 1, result.stderr)
                 outcome = json.loads(result.stdout)
                 self.assertEqual(outcome["reason_code"], reason_code)
+
+    def test_enforcement_doctor_rejects_base_only_pin_mismatch(self) -> None:
+        evidence = self._matching_enforcement_evidence()
+
+        result = self._run_enforcement_doctor(
+            evidence,
+            expected_base_sha="8" * 40,
+        )
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        outcome = json.loads(result.stdout)
+        self.assertEqual(outcome["classification"], "blocked_until_trusted")
+        self.assertEqual(
+            outcome["reason_code"],
+            "pull-request-identity-mismatch",
+        )
+
+    def test_enforcement_constructor_rejects_malformed_base_pin(self) -> None:
+        for value in ("A" * 40, "placeholder", "0" * 40):
+            with self.subTest(value=value):
+                evidence = self._matching_enforcement_evidence()
+                with self.assertRaises(
+                    ENFORCEMENT_MODULE.EnforcementDoctorError
+                ) as raised:
+                    self._validate_static_enforcement(
+                        evidence,
+                        expected_base_sha=value,
+                    )
+
+                self.assertEqual(raised.exception.reason_code, "invalid-evidence")
 
     def test_enforcement_doctor_rejects_cross_pr_and_cross_head_lineage(
         self,
@@ -13846,7 +14337,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertEqual(
             json.loads(result.stdout)["reason_code"],
-            "pointer-proof-unavailable",
+            "admission-preconditions-unavailable",
         )
 
         superseded = self._run_enforcement_doctor(
@@ -14155,6 +14646,10 @@ class BugTriageDocumentationTests(unittest.TestCase):
             "retain-bug-triage-compat",
         )
         self.assertEqual(
+            fixture["base_change_enforcement"],
+            self._expected_base_change_enforcement(),
+        )
+        self.assertEqual(
             fixture["trust_gates"],
             [
                 "private-package-validation",
@@ -14178,8 +14673,16 @@ class BugTriageDocumentationTests(unittest.TestCase):
                 "retirement-pr-merged",
             ],
         )
+        self.assertEqual(
+            state_machine["base_change_transition"],
+            "retirement-pr-head-frozen",
+        )
         self.assertFalse(state_machine["automatic_mutation"])
         decommission = fixture["post_cutover_decommission"]
+        self.assertEqual(
+            decommission["trigger"],
+            "retirement-pr-merged-at-frozen-range",
+        )
         self.assertEqual(
             decommission["lease_variable"],
             "CISCO_CUTOVER_DECOMMISSION_LEASE",
@@ -14225,6 +14728,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
                 "pointer_target_template": ("releases/{private_release_commit}"),
                 "required_exact_inputs": [
                     "expected_canonical_commit",
+                    "expected_base_sha",
                     "expected_pull_request_number",
                     "expected_private_release_commit",
                     "expected_release_manifest_sha256",
@@ -14305,7 +14809,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
         self.assertEqual(outcome["classification"], "blocked_until_trusted")
         self.assertIn("argument error", outcome["reason"])
 
-    def test_cutover_validator_blocks_static_receipt_without_live_authority(
+    def test_cutover_validator_blocks_on_unavailable_admission_preconditions(
         self,
     ) -> None:
         fixture = json.loads(MIGRATION_FIXTURE_PATH.read_text(encoding="utf-8"))
@@ -14325,7 +14829,14 @@ class BugTriageDocumentationTests(unittest.TestCase):
         self.assertEqual(result.stderr, "")
         outcome = json.loads(result.stdout)
         self.assertEqual(outcome["classification"], "blocked_until_trusted")
-        self.assertEqual(outcome["reason"], "pointer-proof-unavailable")
+        self.assertEqual(
+            outcome["reason"],
+            "admission-preconditions-unavailable",
+        )
+        self.assertEqual(
+            outcome["blockers"],
+            self._expected_admission_blockers(),
+        )
         self.assertEqual(outcome["static_equivalence"], "validated")
         self.assertEqual(
             outcome["validation_scope"],
@@ -14336,6 +14847,62 @@ class BugTriageDocumentationTests(unittest.TestCase):
             f"releases/{self._private_release_commit}",
         )
         self.assertEqual(outcome["receipt_sha256"], receipt_sha256)
+
+    def test_cutover_validator_requires_exact_expected_base_sha(self) -> None:
+        fixture = json.loads(MIGRATION_FIXTURE_PATH.read_text(encoding="utf-8"))
+        receipt = self._matching_cutover_receipt(fixture)
+        cases = {
+            "missing": (None, False),
+            "malformed": ("A" * 40, True),
+            "placeholder": ("placeholder", True),
+            "all-zero": ("0" * 40, True),
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            receipt_path = temp_root / "cutover-receipt.json"
+            receipt_sha256 = self._write_cutover_receipt(receipt_path, receipt)
+            for label, (expected_base_sha, include_expected) in cases.items():
+                with self.subTest(case=label):
+                    result = self._run_cutover_validator(
+                        receipt_path=receipt_path,
+                        receipt_sha256=receipt_sha256,
+                        expected_base_sha=expected_base_sha,
+                        include_expected_base_sha=include_expected,
+                    )
+
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    outcome = json.loads(result.stdout)
+                    self.assertEqual(
+                        outcome["classification"],
+                        "blocked_until_trusted",
+                    )
+                    self.assertRegex(
+                        outcome["reason"],
+                        r"(were not provided|must be exact lowercase 40-hex)",
+                    )
+
+    def test_cutover_validator_rejects_stale_receipt_after_base_retarget(
+        self,
+    ) -> None:
+        fixture = json.loads(MIGRATION_FIXTURE_PATH.read_text(encoding="utf-8"))
+        stale_receipt = self._matching_cutover_receipt(fixture)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            receipt_path = Path(temp_dir) / "stale-base-receipt.json"
+            receipt_sha256 = self._write_cutover_receipt(
+                receipt_path,
+                stale_receipt,
+            )
+            result = self._run_cutover_validator(
+                receipt_path=receipt_path,
+                receipt_sha256=receipt_sha256,
+                expected_base_sha="8" * 40,
+            )
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        outcome = json.loads(result.stdout)
+        self.assertEqual(outcome["classification"], "blocked_until_trusted")
+        self.assertIn("receipt cutover", outcome["reason"])
+        self.assertNotEqual(outcome.get("static_equivalence"), "validated")
 
     def test_cutover_validator_rejects_pointer_authority_and_lease_drift(
         self,
@@ -14385,6 +14952,12 @@ class BugTriageDocumentationTests(unittest.TestCase):
                     {"pull_request_head_sha": "8" * 40}
                 ),
                 "merge lease pull-request head SHA differs",
+            ),
+            "lease-base": (
+                lambda pointer: pointer["merge_lease"].update(
+                    {"pull_request_base_sha": "8" * 40}
+                ),
+                "merge lease pull-request base SHA differs",
             ),
             "lease-scope": (
                 lambda pointer: pointer["merge_lease"].update(
@@ -14550,7 +15123,11 @@ class BugTriageDocumentationTests(unittest.TestCase):
         rollback_outcome = json.loads(rollback_result.stdout)
         self.assertEqual(
             rollback_outcome["reason"],
-            "pointer-proof-unavailable",
+            "admission-preconditions-unavailable",
+        )
+        self.assertEqual(
+            rollback_outcome["blockers"],
+            self._expected_admission_blockers(),
         )
         self.assertEqual(
             rollback_outcome["static_equivalence"],
@@ -14675,6 +15252,11 @@ class BugTriageDocumentationTests(unittest.TestCase):
                     {"head_sha": "8" * 40}
                 )
             ),
+            "base": (
+                lambda receipt: receipt["cutover"]["pull_request"].update(
+                    {"base_sha": "8" * 40}
+                )
+            ),
             "workflow": (
                 lambda receipt: receipt["cutover"]["required_workflow"].update(
                     {"sha": "8" * 40}
@@ -14705,23 +15287,49 @@ class BugTriageDocumentationTests(unittest.TestCase):
                     )
                     self.assertIn("receipt cutover", outcome["reason"])
 
-    def test_cutover_validator_rejects_weakened_atomic_contract(self) -> None:
-        contract = json.loads(MIGRATION_FIXTURE_PATH.read_text(encoding="utf-8"))
-        contract["activation"]["atomic"] = False
+    def test_cutover_validator_rejects_weakened_admission_contract(self) -> None:
+        cases = {
+            "non-atomic": (
+                lambda contract: contract["activation"].update({"atomic": False}),
+                "activation.atomic",
+            ),
+            "base-change-available": (
+                lambda contract: contract["base_change_enforcement"].update(
+                    {"status": "available"}
+                ),
+                "base_change_enforcement",
+            ),
+            "base-change-dispatch-drift": (
+                lambda contract: contract["base_change_enforcement"][
+                    "ruleset_dispatch_activities"
+                ].append("edited"),
+                "base_change_enforcement",
+            ),
+        }
         with tempfile.TemporaryDirectory() as temp_dir:
-            contract_path = Path(temp_dir) / "weakened-contract.json"
-            contract_path.write_text(
-                json.dumps(contract),
-                encoding="utf-8",
-            )
-            result = self._run_cutover_validator(
-                contract_path=contract_path,
-            )
+            temp_root = Path(temp_dir)
+            for label, (mutate, expected_reason) in cases.items():
+                with self.subTest(case=label):
+                    contract = json.loads(
+                        MIGRATION_FIXTURE_PATH.read_text(encoding="utf-8")
+                    )
+                    mutate(contract)
+                    contract_path = temp_root / f"{label}.json"
+                    contract_path.write_text(
+                        json.dumps(contract),
+                        encoding="utf-8",
+                    )
+                    result = self._run_cutover_validator(
+                        contract_path=contract_path,
+                    )
 
-        self.assertEqual(result.returncode, 1, result.stderr)
-        outcome = json.loads(result.stdout)
-        self.assertEqual(outcome["classification"], "blocked_until_trusted")
-        self.assertIn("activation.atomic", outcome["reason"])
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    outcome = json.loads(result.stdout)
+                    self.assertEqual(
+                        outcome["classification"],
+                        "blocked_until_trusted",
+                    )
+                    self.assertIn(expected_reason, outcome["reason"])
 
     def test_cutover_validator_routes_enforcement_contract_to_doctor(self) -> None:
         result = self._run_cutover_validator(
@@ -14753,6 +15361,11 @@ class BugTriageDocumentationTests(unittest.TestCase):
                 True,
             ),
             ("trust-gates-object", ("trust_gates",), {"gate": "passed"}),
+            (
+                "base-change-status-boolean",
+                ("base_change_enforcement", "status"),
+                True,
+            ),
             (
                 "receipt-schema-boolean",
                 ("receipt_admission", "receipt_schema_version"),
@@ -14791,6 +15404,11 @@ class BugTriageDocumentationTests(unittest.TestCase):
             ("atomic-integer", ("activation", "atomic"), 1),
             ("gate-status-boolean", ("gates", 0, "status"), True),
             ("digest-boolean", ("release_manifest_sha256",), True),
+            (
+                "base-sha-boolean",
+                ("cutover", "pull_request", "base_sha"),
+                True,
+            ),
             ("pointer-name-boolean", ("installed_pointer", "name"), True),
         )
         with tempfile.TemporaryDirectory() as temp_dir:
