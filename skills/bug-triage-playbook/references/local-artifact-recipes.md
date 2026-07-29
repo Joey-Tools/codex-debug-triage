@@ -152,17 +152,26 @@ atomically creates a unique `0700` root plus a `0600` regular file, and binds
 their descriptor/path identity, owner, mode, link count, size, and access
 policy before writing the first archive byte. On Darwin, the fixed descriptor
 ACL runtime rejects every extended allow and every inherited or inheritable
-entry on the created root or file; Linux binds the effective POSIX ACL mask
-through group mode bits forced to zero by the owner-only mode, and unsupported
-platforms fail closed. The file is then unlinked and the empty root removed,
-leaving a zero-link descriptor as the only parser input. It next revalidates
-the source descriptor's identity, access policy, link count, size, and
-complete SHA-256 content before any parser consumes the snapshot. The reader
-exposes the snapshot's initial size as the only EOF and revalidates its
-metadata, descriptor ACL binding, and complete digest before success. This
-freezes the exact bytes used by member selection and reading: source-path
-replacement, growth, shrinkage, and same-inode/same-size rewrites after
-binding cannot change the parser's view.
+entry on the created root or file and binds the bounded external ACL
+representation. The Darwin source profile binds that representation without
+applying the private snapshot's no-grant predicate, so a stable legitimate
+source ACL remains readable. On Linux, a fixed descriptor `fgetxattr` profile
+binds the bounded raw `system.posix_acl_access` value in addition to the
+separately bound mode mask, so named-ACL changes cannot hide behind unchanged
+group mode bits. An absent access ACL is distinct from an unsupported or
+unreadable ACL query, and unsupported platforms fail closed. The file is then
+unlinked and the empty root removed, leaving a zero-link descriptor as the only
+parser input. The helper binds the source descriptor's identity, ACL, link
+count, mode, and size before snapshot creation; revalidates that metadata and
+ACL immediately before the first copy read, after the bounded copy, and again
+after re-reading the complete SHA-256 content before any parser consumes the
+snapshot. ACL query failure remains distinct from a successfully observed
+binding mismatch. The reader exposes the snapshot's initial size as the only
+EOF and revalidates its metadata, descriptor ACL binding, and complete digest
+before success. This freezes the exact bytes used by member selection and
+reading: source-path replacement, growth, shrinkage, and
+same-inode/same-size rewrites remain isolated from the parser; sampled ACL
+drift after binding also fails closed.
 
 Before constructing Python `ZipInfo` objects, it reads EOCD/ZIP64 metadata and
 sequentially counts bounded central-directory records from that same descriptor.

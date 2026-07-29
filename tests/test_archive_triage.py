@@ -1095,6 +1095,146 @@ class ArchiveTriageTests(unittest.TestCase):
         self.assertEqual(stdout.getvalue(), "")
         self.assertIn("archive changed during snapshot binding", stderr.getvalue())
 
+    def test_source_acl_drift_before_copy_is_rejected_with_unchanged_mode(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            archive_path = self._make_archive(Path(temp_dir))
+            source_metadata = archive_path.stat()
+            source_identity = (source_metadata.st_dev, source_metadata.st_ino)
+            source_mode = stat.S_IMODE(source_metadata.st_mode)
+            initial_policy = ("test-source-acl-v1", 32, "a" * 64)
+            changed_policy = ("test-source-acl-v1", 32, "b" * 64)
+            source_policies = [initial_policy, changed_policy]
+            real_policy = MODULE._stable_source_access_policy_binding
+
+            def policy_for_descriptor(fd: int) -> tuple[str, int, str]:
+                current = os.fstat(fd)
+                if (current.st_dev, current.st_ino) == source_identity:
+                    return source_policies.pop(0)
+                return real_policy(fd)
+
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_stable_source_access_policy_binding",
+                    side_effect=policy_for_descriptor,
+                ),
+                mock.patch.object(MODULE, "_copy_archive_snapshot") as copied,
+                self.assertRaisesRegex(
+                    zipfile.BadZipFile,
+                    "archive source access policy changed during snapshot binding",
+                ),
+            ):
+                with MODULE._open_pinned_archive(
+                    archive_path,
+                    MODULE.DEFAULT_MAX_ARCHIVE_BYTES,
+                ):
+                    self.fail("source ACL drift was accepted")
+
+            copied.assert_not_called()
+            self.assertEqual(source_policies, [])
+            self.assertEqual(stat.S_IMODE(archive_path.stat().st_mode), source_mode)
+
+    def test_source_acl_drift_after_copy_is_rejected_before_digest(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            archive_path = self._make_archive(Path(temp_dir))
+            source_metadata = archive_path.stat()
+            source_identity = (source_metadata.st_dev, source_metadata.st_ino)
+            initial_policy = ("test-source-acl-v1", 32, "a" * 64)
+            changed_policy = ("test-source-acl-v1", 32, "b" * 64)
+            source_policies = [
+                initial_policy,
+                initial_policy,
+                changed_policy,
+            ]
+            real_policy = MODULE._stable_source_access_policy_binding
+            real_copy = MODULE._copy_archive_snapshot
+
+            def policy_for_descriptor(fd: int) -> tuple[str, int, str]:
+                current = os.fstat(fd)
+                if (current.st_dev, current.st_ino) == source_identity:
+                    return source_policies.pop(0)
+                return real_policy(fd)
+
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_stable_source_access_policy_binding",
+                    side_effect=policy_for_descriptor,
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "_copy_archive_snapshot",
+                    wraps=real_copy,
+                ) as copied,
+                mock.patch.object(MODULE, "_digest_archive_fd") as digested,
+                self.assertRaisesRegex(
+                    zipfile.BadZipFile,
+                    "archive source access policy changed during snapshot binding",
+                ),
+            ):
+                with MODULE._open_pinned_archive(
+                    archive_path,
+                    MODULE.DEFAULT_MAX_ARCHIVE_BYTES,
+                ):
+                    self.fail("post-copy source ACL drift was accepted")
+
+            copied.assert_called_once()
+            digested.assert_not_called()
+            self.assertEqual(source_policies, [])
+
+    def test_source_acl_drift_after_final_digest_is_rejected_with_unchanged_mode(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            archive_path = self._make_archive(Path(temp_dir))
+            source_metadata = archive_path.stat()
+            source_identity = (source_metadata.st_dev, source_metadata.st_ino)
+            source_mode = stat.S_IMODE(source_metadata.st_mode)
+            initial_policy = ("test-source-acl-v1", 32, "a" * 64)
+            changed_policy = ("test-source-acl-v1", 32, "b" * 64)
+            source_policies = [
+                initial_policy,
+                initial_policy,
+                initial_policy,
+                changed_policy,
+            ]
+            real_policy = MODULE._stable_source_access_policy_binding
+            real_copy = MODULE._copy_archive_snapshot
+
+            def policy_for_descriptor(fd: int) -> tuple[str, int, str]:
+                current = os.fstat(fd)
+                if (current.st_dev, current.st_ino) == source_identity:
+                    return source_policies.pop(0)
+                return real_policy(fd)
+
+            with (
+                mock.patch.object(
+                    MODULE,
+                    "_stable_source_access_policy_binding",
+                    side_effect=policy_for_descriptor,
+                ),
+                mock.patch.object(
+                    MODULE,
+                    "_copy_archive_snapshot",
+                    wraps=real_copy,
+                ) as copied,
+                self.assertRaisesRegex(
+                    zipfile.BadZipFile,
+                    "archive source access policy changed during snapshot binding",
+                ),
+            ):
+                with MODULE._open_pinned_archive(
+                    archive_path,
+                    MODULE.DEFAULT_MAX_ARCHIVE_BYTES,
+                ):
+                    self.fail("source ACL drift was accepted")
+
+            copied.assert_called_once()
+            self.assertEqual(source_policies, [])
+            self.assertEqual(stat.S_IMODE(archive_path.stat().st_mode), source_mode)
+
     def test_snapshot_ignores_ambient_tmpdir_and_is_unlinked_before_copy(
         self,
     ) -> None:
@@ -1152,7 +1292,8 @@ class ArchiveTriageTests(unittest.TestCase):
             real_policy = MODULE._stable_snapshot_access_policy_binding
 
             def reject_regular_file(fd: int) -> tuple[str, int, str]:
-                if stat.S_ISREG(os.fstat(fd).st_mode):
+                metadata = os.fstat(fd)
+                if stat.S_ISREG(metadata.st_mode) and metadata.st_nlink == 0:
                     raise OSError(errno.EACCES, "injected snapshot ACL grant")
                 return real_policy(fd)
 
@@ -1178,6 +1319,165 @@ class ArchiveTriageTests(unittest.TestCase):
                     self.fail("unsafe snapshot was published")
 
             copied.assert_not_called()
+
+    def test_linux_acl_profile_binds_raw_named_acl_under_the_same_mask(
+        self,
+    ) -> None:
+        def access_acl(named_user_permissions: int) -> bytes:
+            undefined_id = 0xFFFFFFFF
+            return b"".join(
+                (
+                    struct.pack("<I", 0x0002),
+                    struct.pack("<HHI", 0x0001, 0o6, undefined_id),
+                    struct.pack("<HHI", 0x0002, named_user_permissions, 1000),
+                    struct.pack("<HHI", 0x0004, 0, undefined_id),
+                    struct.pack("<HHI", 0x0010, 0o4, undefined_id),
+                    struct.pack("<HHI", 0x0020, 0, undefined_id),
+                )
+            )
+
+        first_acl = access_acl(0o4)
+        second_acl = access_acl(0)
+        self.assertEqual(len(first_acl), len(second_acl))
+        payloads = iter((first_acl, second_acl))
+
+        def copy_acl(
+            fd: int,
+            name: bytes,
+            destination: object,
+            capacity: int,
+        ) -> int:
+            self.assertEqual(fd, 17)
+            self.assertEqual(name, MODULE.LINUX_POSIX_ACL_XATTR_NAME)
+            payload = next(payloads)
+            self.assertGreaterEqual(capacity, len(payload))
+            ctypes.memmove(destination, payload, len(payload))
+            return len(payload)
+
+        runtime = object.__new__(MODULE._LinuxSnapshotAclRuntime)
+        runtime._libc = mock.Mock()
+        runtime._libc.fgetxattr.side_effect = copy_acl
+
+        first_binding = runtime.binding(17)
+        second_binding = runtime.binding(17)
+
+        self.assertEqual(
+            first_binding,
+            (
+                MODULE.LINUX_SNAPSHOT_ACL_PROFILE,
+                len(first_acl),
+                hashlib.sha256(first_acl).hexdigest(),
+            ),
+        )
+        self.assertEqual(second_binding[1], len(second_acl))
+        self.assertNotEqual(first_binding, second_binding)
+
+    def test_linux_acl_query_distinguishes_absent_unsupported_and_unreadable(
+        self,
+    ) -> None:
+        runtime = object.__new__(MODULE._LinuxSnapshotAclRuntime)
+        runtime._libc = mock.Mock()
+
+        def fail_with(error_number: int) -> object:
+            def fail(
+                _fd: int,
+                _name: bytes,
+                _destination: object,
+                _capacity: int,
+            ) -> int:
+                ctypes.set_errno(error_number)
+                return -1
+
+            return fail
+
+        runtime._libc.fgetxattr.side_effect = fail_with(errno.ENODATA)
+        self.assertEqual(
+            runtime.binding(17),
+            (
+                MODULE.LINUX_SNAPSHOT_ACL_PROFILE,
+                0,
+                "no-posix-access-acl",
+            ),
+        )
+
+        cases = (
+            (
+                getattr(errno, "EOPNOTSUPP", errno.ENOTSUP),
+                "is unsupported",
+            ),
+            (errno.EACCES, "query failed"),
+        )
+        for error_number, message in cases:
+            with self.subTest(error_number=error_number):
+                runtime._libc.fgetxattr.side_effect = fail_with(error_number)
+                with self.assertRaisesRegex(OSError, message) as raised:
+                    runtime.binding(17)
+                self.assertEqual(raised.exception.errno, error_number)
+
+        runtime._libc.fgetxattr.side_effect = fail_with(errno.ERANGE)
+        with self.assertRaisesRegex(OSError, "byte ceiling") as overflow:
+            runtime.binding(17)
+        self.assertEqual(overflow.exception.errno, errno.EOVERFLOW)
+
+    def test_access_policy_query_failure_is_distinct_from_binding_drift(
+        self,
+    ) -> None:
+        with mock.patch.object(
+            MODULE,
+            "_source_access_policy_binding",
+            side_effect=OSError(errno.EACCES, "injected unreadable ACL"),
+        ):
+            with self.assertRaisesRegex(
+                OSError,
+                "injected unreadable ACL",
+            ) as unreadable:
+                MODULE._stable_source_access_policy_binding(17)
+        self.assertEqual(unreadable.exception.errno, errno.EACCES)
+
+        with mock.patch.object(
+            MODULE,
+            "_source_access_policy_binding",
+            side_effect=(
+                ("test-source-acl-v1", 32, "a" * 64),
+                ("test-source-acl-v1", 32, "b" * 64),
+            ),
+        ):
+            with self.assertRaisesRegex(
+                OSError,
+                "access policy changed during inspection",
+            ) as drift:
+                MODULE._stable_source_access_policy_binding(17)
+        self.assertEqual(drift.exception.errno, errno.EAGAIN)
+
+    def test_source_acl_query_errors_abort_before_snapshot_creation(self) -> None:
+        cases = (
+            (errno.ENOTSUP, "injected unsupported ACL"),
+            (errno.EACCES, "injected unreadable ACL"),
+        )
+        for error_number, message in cases:
+            with self.subTest(error_number=error_number):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    archive_path = self._make_archive(Path(temp_dir))
+                    with (
+                        mock.patch.object(
+                            MODULE,
+                            "_stable_source_access_policy_binding",
+                            side_effect=OSError(error_number, message),
+                        ),
+                        mock.patch.object(
+                            MODULE,
+                            "_create_private_archive_snapshot",
+                        ) as created,
+                        self.assertRaisesRegex(OSError, message) as raised,
+                    ):
+                        with MODULE._open_pinned_archive(
+                            archive_path,
+                            MODULE.DEFAULT_MAX_ARCHIVE_BYTES,
+                        ):
+                            self.fail("unavailable source ACL was accepted")
+
+                    self.assertEqual(raised.exception.errno, error_number)
+                    created.assert_not_called()
 
     @unittest.skipUnless(
         sys.platform == "darwin",
@@ -1214,6 +1514,80 @@ class ArchiveTriageTests(unittest.TestCase):
                 copied.assert_not_called()
             finally:
                 _clear_fixture_darwin_acl(temp_root)
+
+    @unittest.skipUnless(
+        sys.platform == "darwin",
+        "requires Darwin extended ACLs",
+    )
+    def test_source_darwin_acl_drift_after_copy_is_rejected(self) -> None:
+        with owner_controlled_temp_root() as temp_root:
+            archive_path = self._make_archive(temp_root)
+            real_copy = MODULE._copy_archive_snapshot
+            acl_set = False
+
+            def copy_then_change_acl(
+                source_fd: int,
+                snapshot_fd: int,
+                archive_size: int,
+                deadline: MODULE.ArchiveCommandDeadline,
+            ) -> bytes:
+                nonlocal acl_set
+                digest = real_copy(
+                    source_fd,
+                    snapshot_fd,
+                    archive_size,
+                    deadline,
+                )
+                _set_fixture_darwin_acl(
+                    archive_path,
+                    "everyone deny readextattr",
+                )
+                acl_set = True
+                return digest
+
+            try:
+                with (
+                    mock.patch.object(
+                        MODULE,
+                        "_copy_archive_snapshot",
+                        side_effect=copy_then_change_acl,
+                    ),
+                    self.assertRaisesRegex(
+                        zipfile.BadZipFile,
+                        "archive source access policy changed during snapshot binding",
+                    ),
+                ):
+                    with MODULE._open_pinned_archive(
+                        archive_path,
+                        MODULE.DEFAULT_MAX_ARCHIVE_BYTES,
+                    ):
+                        self.fail("Darwin source ACL drift was accepted")
+            finally:
+                if acl_set:
+                    _clear_fixture_darwin_acl(archive_path)
+
+    @unittest.skipUnless(
+        sys.platform == "darwin",
+        "requires Darwin extended ACLs",
+    )
+    def test_source_darwin_stable_extended_allow_acl_is_bound_not_rejected(
+        self,
+    ) -> None:
+        with owner_controlled_temp_root() as temp_root:
+            archive_path = self._make_archive(temp_root)
+            _set_fixture_darwin_acl(
+                archive_path,
+                "everyone allow readextattr",
+            )
+            try:
+                with MODULE._open_pinned_archive(
+                    archive_path,
+                    MODULE.DEFAULT_MAX_ARCHIVE_BYTES,
+                ) as archive_stream:
+                    archive_stream.seek(0)
+                    self.assertEqual(archive_stream.read(4), b"PK\x03\x04")
+            finally:
+                _clear_fixture_darwin_acl(archive_path)
 
     def test_final_validation_allows_timestamp_only_churn(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -5189,6 +5563,18 @@ class BugTriageDocumentationTests(unittest.TestCase):
         "GITHUB_OUTPUT",
     )
 
+    def test_generated_project_journal_index_is_ignored_exactly(self) -> None:
+        ignore_lines = (
+            (REPO_ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
+        )
+        generated_index = "/docs/project_journal/INDEX.md"
+        self.assertEqual(ignore_lines.count(generated_index), 1)
+        self.assertNotIn("docs/project_journal/", ignore_lines)
+        self.assertIn(
+            "docs/project_journal/INDEX.md",
+            (REPO_ROOT / "docs/PROJECT_STATE.md").read_text(encoding="utf-8"),
+        )
+
     def _pointer_state_sha256(
         self,
         *,
@@ -6514,6 +6900,8 @@ class BugTriageDocumentationTests(unittest.TestCase):
         self.assertNotIn("continue-on-error:", workflow)
         for test_name in (
             "test_snapshot_rejects_inherited_allow_acl_before_copy",
+            "test_source_darwin_acl_drift_after_copy_is_rejected",
+            "test_source_darwin_stable_extended_allow_acl_is_bound_not_rejected",
             "test_enforcement_darwin_acl_ctypes_abi_constants_and_iteration",
             "test_enforcement_gh_acl_allows_only_noninherited_deny_entries",
             "test_enforcement_gh_acl_rejects_inherited_source_token_read_grant",

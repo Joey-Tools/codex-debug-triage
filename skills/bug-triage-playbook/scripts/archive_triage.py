@@ -124,7 +124,10 @@ DARWIN_ACL_INHERITANCE_FLAGS = (1 << 4, 1 << 5, 1 << 6, 1 << 7, 1 << 8)
 MAX_DARWIN_ACL_BYTES = 64 * 1024
 MAX_DARWIN_ACL_ENTRIES = 128
 DARWIN_SNAPSHOT_ACL_PROFILE = "darwin-fd-no-extended-grants-v1"
-LINUX_SNAPSHOT_ACL_PROFILE = "linux-posix-mode-mask-v1"
+DARWIN_SOURCE_ACL_PROFILE = "darwin-fd-extended-acl-sha256-v1"
+LINUX_POSIX_ACL_XATTR_NAME = b"system.posix_acl_access"
+MAX_LINUX_POSIX_ACL_BYTES = 64 * 1024
+LINUX_SNAPSHOT_ACL_PROFILE = "linux-fd-posix-access-acl-sha256-v1"
 DEFAULT_MAX_REGEX_PATTERN_CHARS = 4 * 1024
 DEFAULT_REGEX_WORKER_START_TIMEOUT_SECONDS = 1.0
 DEFAULT_REGEX_MATCH_TIMEOUT_SECONDS = 0.25
@@ -686,6 +689,24 @@ class _DarwinSnapshotAclRuntime:
         error_number = ctypes.get_errno() or fallback
         return OSError(error_number, f"Darwin ACL {operation} failed")
 
+    def _external_binding(self, acl: int) -> tuple[int, str]:
+        ctypes.set_errno(0)
+        external_size = self._libc.acl_size(acl)
+        if external_size <= 0 or external_size > MAX_DARWIN_ACL_BYTES:
+            raise OSError(
+                errno.EOVERFLOW,
+                "Darwin ACL external representation exceeds its byte ceiling",
+            )
+        external = ctypes.create_string_buffer(external_size)
+        ctypes.set_errno(0)
+        copied = self._libc.acl_copy_ext(external, acl, external_size)
+        if copied != external_size:
+            raise self._error("external copy")
+        return (
+            external_size,
+            hashlib.sha256(bytes(external.raw[:external_size])).hexdigest(),
+        )
+
     def binding(self, fd: int) -> tuple[str, int, str]:
         ctypes.set_errno(0)
         acl = self._libc.acl_get_fd_np(fd, DARWIN_ACL_TYPE_EXTENDED)
@@ -698,19 +719,7 @@ class _DarwinSnapshotAclRuntime:
                 )
             raise self._error("descriptor query")
         try:
-            ctypes.set_errno(0)
-            external_size = self._libc.acl_size(acl)
-            if external_size <= 0 or external_size > MAX_DARWIN_ACL_BYTES:
-                raise OSError(
-                    errno.EOVERFLOW,
-                    "Darwin ACL external representation exceeds its byte ceiling",
-                )
-            external = ctypes.create_string_buffer(external_size)
-            ctypes.set_errno(0)
-            copied = self._libc.acl_copy_ext(external, acl, external_size)
-            if copied != external_size:
-                raise self._error("external copy")
-
+            external_size, external_digest = self._external_binding(acl)
             entry = ctypes.c_void_p()
             entry_id = DARWIN_ACL_FIRST_ENTRY
             entry_count = 0
@@ -776,54 +785,187 @@ class _DarwinSnapshotAclRuntime:
             raise self._error("release")
         return (
             DARWIN_SNAPSHOT_ACL_PROFILE,
-            0,
-            "no-extended-grants-or-inheritance",
+            external_size,
+            external_digest,
+        )
+
+    def source_binding(self, fd: int) -> tuple[str, int, str]:
+        ctypes.set_errno(0)
+        acl = self._libc.acl_get_fd_np(fd, DARWIN_ACL_TYPE_EXTENDED)
+        if not acl:
+            if ctypes.get_errno() == errno.ENOENT:
+                return (
+                    DARWIN_SOURCE_ACL_PROFILE,
+                    0,
+                    "no-extended-acl",
+                )
+            raise self._error("descriptor query")
+        try:
+            external_size, external_digest = self._external_binding(acl)
+        except BaseException:
+            self._libc.acl_free(acl)
+            raise
+        if self._libc.acl_free(acl) != 0:
+            raise self._error("release")
+        return (
+            DARWIN_SOURCE_ACL_PROFILE,
+            external_size,
+            external_digest,
         )
 
 
 _DARWIN_SNAPSHOT_ACL_RUNTIME: _DarwinSnapshotAclRuntime | None = None
 
 
+class _LinuxSnapshotAclRuntime:
+    def __init__(self) -> None:
+        self._libc = ctypes.CDLL(None, use_errno=True)
+        self._libc.fgetxattr.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+        ]
+        self._libc.fgetxattr.restype = ctypes.c_ssize_t
+
+    def binding(self, fd: int) -> tuple[str, int, str]:
+        raw_acl = ctypes.create_string_buffer(MAX_LINUX_POSIX_ACL_BYTES)
+        ctypes.set_errno(0)
+        copied = self._libc.fgetxattr(
+            fd,
+            LINUX_POSIX_ACL_XATTR_NAME,
+            raw_acl,
+            len(raw_acl),
+        )
+        if copied < 0:
+            error_number = ctypes.get_errno() or errno.EIO
+            if error_number == errno.ENODATA:
+                return (
+                    LINUX_SNAPSHOT_ACL_PROFILE,
+                    0,
+                    "no-posix-access-acl",
+                )
+            if error_number in {
+                errno.ENOTSUP,
+                getattr(errno, "EOPNOTSUPP", errno.ENOTSUP),
+            }:
+                raise OSError(
+                    error_number,
+                    "Linux descriptor POSIX ACL query is unsupported",
+                )
+            if error_number == errno.ERANGE:
+                raise OSError(
+                    errno.EOVERFLOW,
+                    "Linux descriptor POSIX ACL exceeds its byte ceiling",
+                )
+            raise OSError(
+                error_number,
+                "Linux descriptor POSIX ACL query failed",
+            )
+        if copied > MAX_LINUX_POSIX_ACL_BYTES:
+            raise OSError(
+                errno.EOVERFLOW,
+                "Linux descriptor POSIX ACL exceeds its byte ceiling",
+            )
+        payload = bytes(raw_acl[:copied])
+        return (
+            LINUX_SNAPSHOT_ACL_PROFILE,
+            copied,
+            hashlib.sha256(payload).hexdigest(),
+        )
+
+
+_LINUX_SNAPSHOT_ACL_RUNTIME: _LinuxSnapshotAclRuntime | None = None
+
+
+def _darwin_snapshot_acl_runtime() -> _DarwinSnapshotAclRuntime:
+    global _DARWIN_SNAPSHOT_ACL_RUNTIME
+    if _DARWIN_SNAPSHOT_ACL_RUNTIME is None:
+        try:
+            _DARWIN_SNAPSHOT_ACL_RUNTIME = _DarwinSnapshotAclRuntime()
+        except (AttributeError, OSError) as error:
+            raise OSError(
+                errno.ENOTSUP,
+                "fixed Darwin descriptor ACL runtime is unavailable",
+            ) from error
+    return _DARWIN_SNAPSHOT_ACL_RUNTIME
+
+
+def _linux_snapshot_acl_runtime() -> _LinuxSnapshotAclRuntime:
+    global _LINUX_SNAPSHOT_ACL_RUNTIME
+    if _LINUX_SNAPSHOT_ACL_RUNTIME is None:
+        try:
+            _LINUX_SNAPSHOT_ACL_RUNTIME = _LinuxSnapshotAclRuntime()
+        except (AttributeError, OSError) as error:
+            raise OSError(
+                errno.ENOTSUP,
+                "fixed Linux descriptor POSIX ACL runtime is unavailable",
+            ) from error
+    return _LINUX_SNAPSHOT_ACL_RUNTIME
+
+
 def _snapshot_access_policy_binding(fd: int) -> tuple[str, int, str]:
     if sys.platform == "darwin":
-        global _DARWIN_SNAPSHOT_ACL_RUNTIME
-        if _DARWIN_SNAPSHOT_ACL_RUNTIME is None:
-            try:
-                _DARWIN_SNAPSHOT_ACL_RUNTIME = _DarwinSnapshotAclRuntime()
-            except (AttributeError, OSError) as error:
-                raise OSError(
-                    errno.ENOTSUP,
-                    "fixed Darwin descriptor ACL runtime is unavailable",
-                ) from error
-        return _DARWIN_SNAPSHOT_ACL_RUNTIME.binding(fd)
+        return _darwin_snapshot_acl_runtime().binding(fd)
     if sys.platform.startswith("linux"):
-        return (LINUX_SNAPSHOT_ACL_PROFILE, 0, "mode-bits-authoritative")
+        return _linux_snapshot_acl_runtime().binding(fd)
     raise OSError(
         errno.ENOTSUP,
         "archive snapshot ACL policy is unsupported on this platform",
     )
 
 
-def _stable_snapshot_access_policy_binding(fd: int) -> tuple[str, int, str]:
-    first = _snapshot_access_policy_binding(fd)
-    second = _snapshot_access_policy_binding(fd)
+def _source_access_policy_binding(fd: int) -> tuple[str, int, str]:
+    if sys.platform == "darwin":
+        return _darwin_snapshot_acl_runtime().source_binding(fd)
+    if sys.platform.startswith("linux"):
+        return _linux_snapshot_acl_runtime().binding(fd)
+    raise OSError(
+        errno.ENOTSUP,
+        "archive source ACL policy is unsupported on this platform",
+    )
+
+
+def _stable_access_policy_binding(
+    fd: int,
+    query: Callable[[int], tuple[str, int, str]],
+    *,
+    subject: str,
+) -> tuple[str, int, str]:
+    first = query(fd)
+    second = query(fd)
     if first != second:
         raise OSError(
             errno.EAGAIN,
-            "archive snapshot access policy changed during inspection",
+            f"archive {subject} access policy changed during inspection",
         )
     return first
+
+
+def _stable_snapshot_access_policy_binding(fd: int) -> tuple[str, int, str]:
+    return _stable_access_policy_binding(
+        fd,
+        _snapshot_access_policy_binding,
+        subject="snapshot",
+    )
+
+
+def _stable_source_access_policy_binding(fd: int) -> tuple[str, int, str]:
+    return _stable_access_policy_binding(
+        fd,
+        _source_access_policy_binding,
+        subject="source",
+    )
 
 
 def _same_file_identity(
     descriptor: os.stat_result,
     path_status: os.stat_result,
 ) -> bool:
-    return (
-        stat.S_IFMT(descriptor.st_mode) == stat.S_IFMT(path_status.st_mode)
-        and (descriptor.st_dev, descriptor.st_ino)
-        == (path_status.st_dev, path_status.st_ino)
-    )
+    return stat.S_IFMT(descriptor.st_mode) == stat.S_IFMT(path_status.st_mode) and (
+        descriptor.st_dev,
+        descriptor.st_ino,
+    ) == (path_status.st_dev, path_status.st_ino)
 
 
 def _open_snapshot_parent(deadline: ArchiveCommandDeadline) -> int:
@@ -853,9 +995,7 @@ def _open_snapshot_parent(deadline: ArchiveCommandDeadline) -> int:
         mode = stat.S_IMODE(descriptor.st_mode)
         owner_private = descriptor.st_uid == os.geteuid() and mode & 0o077 == 0
         root_sticky = (
-            descriptor.st_uid == 0
-            and bool(mode & stat.S_ISVTX)
-            and bool(mode & 0o002)
+            descriptor.st_uid == 0 and bool(mode & stat.S_ISVTX) and bool(mode & 0o002)
         )
         if (
             not stat.S_ISDIR(descriptor.st_mode)
@@ -924,8 +1064,7 @@ def _create_private_archive_snapshot(
             or not _same_file_identity(root_descriptor, root_path_status)
             or root_descriptor.st_uid != os.geteuid()
             or stat.S_IMODE(root_descriptor.st_mode) != 0o700
-            or root_access_policy
-            != _stable_snapshot_access_policy_binding(root_fd)
+            or root_access_policy != _stable_snapshot_access_policy_binding(root_fd)
         ):
             raise OSError("archive snapshot root identity or policy is unsafe")
 
@@ -1135,10 +1274,7 @@ class PinnedArchiveReader(io.RawIOBase):
             self._binding.size,
         )
         observed = _archive_metadata_binding(current)
-        if (
-            observed != expected
-            or current_access_policy != self._binding.access_policy
-        ):
+        if observed != expected or current_access_policy != self._binding.access_policy:
             raise zipfile.BadZipFile(
                 "archive identity, access policy, link count, or size changed after open"
             )
@@ -2241,7 +2377,22 @@ def _open_pinned_archive(
                 "archive file exceeds max bytes: "
                 f"{metadata.st_size} > {max_archive_bytes}"
             )
+        command_deadline.check("archive source access-policy binding")
+        source_access_policy = _stable_source_access_policy_binding(fd)
+        command_deadline.check("archive source access-policy binding")
         snapshot_stream = _create_private_archive_snapshot(command_deadline)
+        metadata_before_copy = os.fstat(fd)
+        if _archive_metadata_binding(metadata_before_copy) != (
+            _archive_metadata_binding(metadata)
+        ):
+            raise zipfile.BadZipFile("archive changed during snapshot binding")
+        command_deadline.check("archive source access-policy validation")
+        source_access_policy_before_copy = _stable_source_access_policy_binding(fd)
+        command_deadline.check("archive source access-policy validation")
+        if source_access_policy_before_copy != source_access_policy:
+            raise zipfile.BadZipFile(
+                "archive source access policy changed during snapshot binding"
+            )
         snapshot_digest = _copy_archive_snapshot(
             fd,
             snapshot_stream.fileno(),
@@ -2249,6 +2400,13 @@ def _open_pinned_archive(
             command_deadline,
         )
         metadata_after_copy = os.fstat(fd)
+        command_deadline.check("archive source post-copy policy validation")
+        source_access_policy_after_copy = _stable_source_access_policy_binding(fd)
+        command_deadline.check("archive source post-copy policy validation")
+        if source_access_policy_after_copy != source_access_policy:
+            raise zipfile.BadZipFile(
+                "archive source access policy changed during snapshot binding"
+            )
         source_digest = _digest_archive_fd(
             fd,
             metadata.st_size,
@@ -2256,6 +2414,13 @@ def _open_pinned_archive(
             phase="archive source content revalidation",
         )
         metadata_after_digest = os.fstat(fd)
+        command_deadline.check("archive source access-policy revalidation")
+        source_access_policy_after_digest = _stable_source_access_policy_binding(fd)
+        command_deadline.check("archive source access-policy revalidation")
+        if source_access_policy_after_digest != source_access_policy:
+            raise zipfile.BadZipFile(
+                "archive source access policy changed during snapshot binding"
+            )
         if (
             _archive_metadata_binding(metadata_after_copy)
             != _archive_metadata_binding(metadata)
