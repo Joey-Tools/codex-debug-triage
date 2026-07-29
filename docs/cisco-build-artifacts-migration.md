@@ -416,11 +416,17 @@ uses only `LC_ALL=C`, `GH_PROMPT_DISABLED=1`,
 `PATH`, `HOME`, `TMPDIR`, token, loader, proxy, CA, and other `GH_*` variables
 are absent. API commands use only relative endpoints plus exact
 `--hostname github.com`, so the snapshot supplies no authentication source for
-a non-GitHub host. The source executable/config and snapshot
-path/descriptor identities, content digests, sizes, owners, groups, links, and
-modes are revalidated before and after every invocation and once more before
-any admission. Replacement or mutation after pinning discards the command
-output and returns `collector-inconclusive`.
+a non-GitHub host. The source executable/config and snapshot path/descriptor
+identities, sizes, owners, groups, links, modes, and access-policy bindings are
+revalidated before and after every invocation and once more before any
+admission. Each exact content digest is cached only with a descriptor/path
+generation receipt bound to size, `mtime_ns`, and `ctime_ns`. An unchanged
+generation avoids rereading a large executable; a changed generation performs
+the same bounded content read and exact digest comparison before the receipt
+can advance. Metadata churn is therefore only a rehash signal, while
+replacement, access-policy expansion, or content mutation still returns `collector-inconclusive`
+and discards command output. The 4,096-call ceiling cannot
+amplify unchanged executable/config hashing into 4,096 full reads.
 The same process:
 
 - runs `gh auth status --hostname github.com` without printing its output, then
@@ -480,17 +486,29 @@ and malformed responses map to `api-unavailable`; and bounded command expiry
 maps to `api-timeout`. Response bodies, raw headers, command environments,
 tokens, and raw `gh` stderr are never copied into the doctor receipt.
 
-The process boundary starts before `Popen`: the collector blocks the ordinary
-catchable termination signals while spawning, constructing the managed-process
-handle, and publishing it in the client registry. It restores delivery only
-after that registry publication. A signal deferred across this boundary, or
-received while the registered child is running, first drives bounded
-TERM/grace/KILL, drain, and reap, then closes the owner-private credential and
-executable snapshot, restores the caller's handlers and signal mask, and
-forwards the original signal to the caller's handler. The original signal
-remains primary when child or snapshot cleanup also fails; an unsafe
-handler/mask restoration keeps the termination signals fenced instead of
-opening an unowned interruption window.
+The termination boundary starts before the first source credential read and
+remains one client-lifecycle transaction until verified deletion.
+Initialization keeps ordinary catchable termination signals blocked while
+configuration and executable snapshots are created; context entry then
+restores delivery through request gaps, snapshot revalidation, response
+parsing, and admission work. Before `Popen`, the same guard blocks delivery
+again while spawning, constructing the managed-process handle, and publishing
+it in the client registry, so no nested guard can restore a stale handler. A
+signal deferred in any lifecycle phase first blocks further delivery, drives
+bounded TERM/grace/KILL, drain, and reap when needed, closes the owner-private
+credential and executable snapshot, restores the caller's handlers and signal
+mask, and forwards the original signal to the caller's handler. The original
+signal remains primary when child or snapshot cleanup also fails; retained
+runtime/object locators carry the recovery identity. An unsafe handler/mask
+restoration keeps the termination signals fenced instead of opening an
+unowned interruption window.
+
+Pre-execution snapshot revalidation and the child share one absolute monotonic
+collection deadline. Revalidation checks that deadline around each bounded
+read, recomputes remaining time afterward, and passes the absolute deadline
+into process supervision; expiration before spawn prohibits `Popen`, and
+post-execution revalidation plus JSON parsing must also finish before evidence
+can be consumed.
 
 The direct process is registered before deadline, buffer, or selector
 initialization. Every post-spawn error enters bounded TERM/grace/KILL with

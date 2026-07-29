@@ -81,8 +81,16 @@ the group mode bits and repeats that check after each owner-only `fchmod`;
 other platforms fail closed rather than claiming Darwin ACL coverage.
 Only the active `github.com` authentication entry enters the generated
 configuration snapshot, whose global config contains no transport redirect.
-Source and snapshot identities, access policy, and content are revalidated
-before and after each invocation and before admission. It collects
+Source and snapshot identities and access policy are revalidated before and
+after each invocation and before admission. Content receipts bind the exact
+SHA-256 to descriptor/path identity plus size, `mtime_ns`, and `ctime_ns`;
+unchanged generations reuse that receipt, while any generation change forces a
+bounded reread and exact digest comparison. This avoids multiplying a large
+executable hash by the 4,096-call ceiling without treating metadata churn alone
+as a content violation or allowing source drift. All pre/post revalidation,
+child execution, and response parsing consume one monotonic absolute collection
+deadline; remaining child time is computed only after preflight revalidation,
+and an exhausted budget cannot reach `Popen`. It collects
 every API page through an explicit empty terminal page,
 and revalidates the protected snapshot before admitting the selector, pinned
 ruleset, workflow, PR head, administrator-pinned exact run ID/attempt, job, and
@@ -99,7 +107,15 @@ Jenkins entrypoint stays installed. With the checked-in
 therefore remains mandatory.
 
 Doctor receipt schema 5 adds the static-equivalence boundary and sanitized
-cleanup-failure evidence. Every spawned `gh` process is registered before
+cleanup-failure evidence. Termination-signal supervision begins before the
+first credential source read and remains the single outer transaction through
+configuration/executable snapshot creation, every request gap and parse, final
+revalidation, and verified cleanup. A deferred signal first blocks further
+termination delivery, tears down any active process, deletes the bound private
+snapshot, restores the original handlers and signal mask, and only then
+forwards the original signal. Cleanup failure remains secondary and publishes
+the retained runtime/object recovery identity. Every spawned `gh` process is
+registered before
 selector or deadline setup and is unregistered only after its direct child is
 reaped, both pipes reach EOF, and its process group was sealed while the
 unreaped leader still pinned the numeric PID/PGID. The protected property is

@@ -61,6 +61,17 @@ sys.modules[ENFORCEMENT_SPEC.name] = ENFORCEMENT_MODULE
 ENFORCEMENT_SPEC.loader.exec_module(ENFORCEMENT_MODULE)
 
 
+class _ForwardedFixtureSignal(BaseException):
+    def __init__(
+        self,
+        signal_number: int,
+        secondary_error: BaseException | None,
+    ) -> None:
+        self.signal_number = signal_number
+        self.secondary_error = secondary_error
+        super().__init__(f"forwarded fixture signal {signal_number}")
+
+
 @contextmanager
 def owner_controlled_temp_root() -> Iterator[Path]:
     with tempfile.TemporaryDirectory(
@@ -2477,9 +2488,7 @@ class ArchiveTriageTests(unittest.TestCase):
                     "injected cleanup support failure",
                 ),
             ):
-                with self.assertRaises(
-                    MODULE.RegexWorkerCleanupError
-                ) as raised:
+                with self.assertRaises(MODULE.RegexWorkerCleanupError) as raised:
                     matcher.close()
                 cleanup_error = raised.exception
 
@@ -5922,9 +5931,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
     def test_ci_exercises_linux_transport_and_real_darwin_acl_integration(
         self,
     ) -> None:
-        workflow = (REPO_ROOT / ".github/workflows/ci.yml").read_text(
-            encoding="utf-8"
-        )
+        workflow = (REPO_ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
         self.assertIn('          - "3.9"', workflow)
         self.assertIn('          - "3.x"', workflow)
         self.assertIn("runs-on: ubuntu-latest", workflow)
@@ -7338,9 +7345,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
                 "_terminate_drain_reap",
                 return_value=[],
             ) as cleanup,
-            self.assertRaises(
-                ENFORCEMENT_MODULE.EnforcementDoctorError
-            ) as raised,
+            self.assertRaises(ENFORCEMENT_MODULE.EnforcementDoctorError) as raised,
         ):
             ENFORCEMENT_MODULE._bounded_subprocess(
                 ["/fixed/gh", "api", "/user"],
@@ -7513,8 +7518,6 @@ class BugTriageDocumentationTests(unittest.TestCase):
         original_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
         if signal.SIGINT in original_mask:
             self.skipTest("the test runner already blocks SIGINT")
-        real_monotonic = time.monotonic
-
         with owner_controlled_temp_root() as temp_root:
             trusted_gh = temp_root / "trusted-gh"
             trusted_payload = b"#!/bin/sh\nexit 0\n"
@@ -7532,17 +7535,14 @@ class BugTriageDocumentationTests(unittest.TestCase):
             process.pid = 4242
             process.stdout = mock.Mock()
             process.stderr = mock.Mock()
-            monotonic_calls = 0
+            original_publish = client._termination_signal_guard.publish
 
-            def interrupt_after_publication() -> float:
-                nonlocal monotonic_calls
-                monotonic_calls += 1
-                if monotonic_calls == 2:
-                    managed = client._active_processes.get(process.pid)
-                    self.assertIsNotNone(managed)
-                    self.assertIs(managed.process, process)
-                    os.kill(os.getpid(), signal.SIGINT)
-                return real_monotonic()
+            def interrupt_after_publication(managed: object) -> None:
+                original_publish(managed)
+                published = client._active_processes.get(process.pid)
+                self.assertIsNotNone(published)
+                self.assertIs(published.process, process)
+                os.kill(os.getpid(), signal.SIGINT)
 
             try:
                 signal.signal(signal.SIGINT, signal.default_int_handler)
@@ -7558,8 +7558,8 @@ class BugTriageDocumentationTests(unittest.TestCase):
                         return_value=[],
                     ) as cleanup,
                     mock.patch.object(
-                        ENFORCEMENT_MODULE.time,
-                        "monotonic",
+                        client._termination_signal_guard,
+                        "publish",
                         side_effect=interrupt_after_publication,
                     ),
                     self.assertRaises(KeyboardInterrupt),
@@ -7577,6 +7577,660 @@ class BugTriageDocumentationTests(unittest.TestCase):
         self.assertFalse(run_path.exists())
         process.stdout.close.assert_called_once_with()
         process.stderr.close.assert_called_once_with()
+
+    @unittest.skipUnless(
+        os.name == "posix"
+        and all(
+            hasattr(signal, name)
+            for name in (
+                "SIGHUP",
+                "SIGQUIT",
+                "SIGTERM",
+                "pthread_sigmask",
+                "sigpending",
+                "sigwait",
+                "SIG_BLOCK",
+                "SIG_SETMASK",
+            )
+        ),
+        "client lifecycle transaction requires POSIX signal controls",
+    )
+    def test_enforcement_client_lifecycle_covers_initialization_phases(
+        self,
+    ) -> None:
+        phases = (
+            "_snapshot_configuration",
+            "_pin_executable",
+            "_revalidate_snapshot",
+        )
+        termination_signals = (
+            signal.SIGHUP,
+            signal.SIGQUIT,
+            signal.SIGTERM,
+        )
+        for phase in phases:
+            for signal_number in termination_signals:
+                with self.subTest(phase=phase, signal=signal_number):
+                    with owner_controlled_temp_root() as temp_root:
+                        trusted_gh = temp_root / "trusted-gh"
+                        trusted_payload = b"#!/bin/sh\nexit 0\n"
+                        trusted_gh.write_bytes(trusted_payload)
+                        trusted_gh.chmod(0o700)
+                        config_dir, runtime_parent = self._make_private_gh_config(
+                            temp_root,
+                            hosts_payload=(
+                                "github.com:\n"
+                                "    git_protocol: https\n"
+                                "    users:\n"
+                                "        fixture-admin:\n"
+                                f"            oauth_token: {SYNTHETIC_ACCESS_TOKEN}\n"
+                                "    user: fixture-admin\n"
+                                f"    oauth_token: {SYNTHETIC_ACCESS_TOKEN}\n"
+                            ),
+                        )
+                        original_phase = getattr(
+                            ENFORCEMENT_MODULE.GitHubApiClient,
+                            phase,
+                        )
+                        injected = False
+
+                        def inject_signal(
+                            client: object,
+                            *args: object,
+                            **kwargs: object,
+                        ) -> object:
+                            nonlocal injected
+                            result = original_phase(client, *args, **kwargs)
+                            if not injected:
+                                injected = True
+                                client._termination_signal_guard._handle_signal(
+                                    signal_number,
+                                    None,
+                                )
+                            return result
+
+                        def forward_signal(
+                            forwarded: int,
+                            secondary_error: BaseException | None,
+                        ) -> None:
+                            raise _ForwardedFixtureSignal(
+                                forwarded,
+                                secondary_error,
+                            )
+
+                        with (
+                            mock.patch.object(
+                                ENFORCEMENT_MODULE.GitHubApiClient,
+                                phase,
+                                autospec=True,
+                                side_effect=inject_signal,
+                            ),
+                            mock.patch.object(
+                                ENFORCEMENT_MODULE,
+                                "_forward_deferred_termination_signal",
+                                side_effect=forward_signal,
+                            ),
+                            self.assertRaises(_ForwardedFixtureSignal) as raised,
+                        ):
+                            ENFORCEMENT_MODULE.GitHubApiClient(
+                                trusted_gh,
+                                hashlib.sha256(trusted_payload).hexdigest(),
+                                config_dir,
+                                runtime_parent=runtime_parent,
+                            )
+
+                        self.assertTrue(injected)
+                        self.assertEqual(
+                            raised.exception.signal_number,
+                            signal_number,
+                        )
+                        self.assertIsNone(raised.exception.secondary_error)
+                        self.assertEqual(
+                            list(runtime_parent.glob("run-*")),
+                            [],
+                        )
+
+    @unittest.skipUnless(
+        os.name == "posix"
+        and all(
+            hasattr(signal, name)
+            for name in (
+                "SIGTERM",
+                "pthread_sigmask",
+                "sigpending",
+                "sigwait",
+                "SIG_BLOCK",
+                "SIG_SETMASK",
+            )
+        ),
+        "client lifecycle transaction requires POSIX signal controls",
+    )
+    def test_enforcement_client_lifecycle_covers_request_gaps_and_parsing(
+        self,
+    ) -> None:
+        for phase in ("request-gap", "json-parse", "snapshot-revalidation"):
+            with self.subTest(phase=phase):
+                with owner_controlled_temp_root() as temp_root:
+                    trusted_gh = temp_root / "trusted-gh"
+                    trusted_payload = b"#!/bin/sh\nexit 0\n"
+                    trusted_gh.write_bytes(trusted_payload)
+                    trusted_gh.chmod(0o700)
+                    config_dir, runtime_parent = self._make_private_gh_config(
+                        temp_root,
+                        hosts_payload=(
+                            "github.com:\n"
+                            "    git_protocol: https\n"
+                            "    users:\n"
+                            "        fixture-admin:\n"
+                            f"            oauth_token: {SYNTHETIC_ACCESS_TOKEN}\n"
+                            "    user: fixture-admin\n"
+                            f"    oauth_token: {SYNTHETIC_ACCESS_TOKEN}\n"
+                        ),
+                    )
+                    client = ENFORCEMENT_MODULE.GitHubApiClient(
+                        trusted_gh,
+                        hashlib.sha256(trusted_payload).hexdigest(),
+                        config_dir,
+                        runtime_parent=runtime_parent,
+                    )
+                    run_path = client._run_directory.path
+
+                    def forward_signal(
+                        forwarded: int,
+                        secondary_error: BaseException | None,
+                    ) -> None:
+                        raise _ForwardedFixtureSignal(
+                            forwarded,
+                            secondary_error,
+                        )
+
+                    bounded_context = mock.patch.object(
+                        ENFORCEMENT_MODULE,
+                        "_bounded_subprocess",
+                        return_value=(
+                            0,
+                            b'{"id":1,"login":"fixture"}',
+                            b"",
+                        ),
+                    )
+                    original_revalidate = client._revalidate_snapshot
+                    revalidation_calls = 0
+
+                    def interrupt_revalidation(
+                        **kwargs: object,
+                    ) -> None:
+                        nonlocal revalidation_calls
+                        original_revalidate(**kwargs)
+                        revalidation_calls += 1
+                        if revalidation_calls == 1:
+                            client._termination_signal_guard._handle_signal(
+                                signal.SIGTERM,
+                                None,
+                            )
+
+                    def interrupt_json(*_args: object, **_kwargs: object) -> object:
+                        client._termination_signal_guard._handle_signal(
+                            signal.SIGTERM,
+                            None,
+                        )
+                        self.fail("termination signal did not interrupt JSON parsing")
+
+                    try:
+                        with (
+                            mock.patch.object(
+                                ENFORCEMENT_MODULE,
+                                "_forward_deferred_termination_signal",
+                                side_effect=forward_signal,
+                            ),
+                            bounded_context,
+                            self.assertRaises(_ForwardedFixtureSignal) as raised,
+                        ):
+                            with client:
+                                if phase == "request-gap":
+                                    client._termination_signal_guard._handle_signal(
+                                        signal.SIGTERM,
+                                        None,
+                                    )
+                                elif phase == "json-parse":
+                                    with mock.patch.object(
+                                        ENFORCEMENT_MODULE,
+                                        "_parse_json_bytes",
+                                        side_effect=interrupt_json,
+                                    ):
+                                        client.get_json("/user")
+                                else:
+                                    with mock.patch.object(
+                                        client,
+                                        "_revalidate_snapshot",
+                                        side_effect=interrupt_revalidation,
+                                    ):
+                                        client.get_json("/user")
+                    finally:
+                        if not client._closed:
+                            client.close()
+
+                    self.assertEqual(
+                        raised.exception.signal_number,
+                        signal.SIGTERM,
+                    )
+                    self.assertIsNone(raised.exception.secondary_error)
+                    self.assertTrue(client._closed)
+                    self.assertFalse(run_path.exists())
+
+    @unittest.skipUnless(
+        os.name == "posix"
+        and all(
+            hasattr(signal, name)
+            for name in (
+                "SIGQUIT",
+                "pthread_sigmask",
+                "sigpending",
+                "sigwait",
+                "SIG_BLOCK",
+                "SIG_SETMASK",
+            )
+        ),
+        "client lifecycle transaction requires POSIX signal controls",
+    )
+    def test_enforcement_client_finish_forwards_only_after_token_deletion(
+        self,
+    ) -> None:
+        with owner_controlled_temp_root() as temp_root:
+            trusted_gh = temp_root / "trusted-gh"
+            trusted_payload = b"#!/bin/sh\nexit 0\n"
+            trusted_gh.write_bytes(trusted_payload)
+            trusted_gh.chmod(0o700)
+            config_dir, runtime_parent = self._make_private_gh_config(
+                temp_root,
+                hosts_payload=(
+                    "github.com:\n"
+                    "    git_protocol: https\n"
+                    "    users:\n"
+                    "        fixture-admin:\n"
+                    f"            oauth_token: {SYNTHETIC_ACCESS_TOKEN}\n"
+                    "    user: fixture-admin\n"
+                    f"    oauth_token: {SYNTHETIC_ACCESS_TOKEN}\n"
+                ),
+            )
+            client = ENFORCEMENT_MODULE.GitHubApiClient(
+                trusted_gh,
+                hashlib.sha256(trusted_payload).hexdigest(),
+                config_dir,
+                runtime_parent=runtime_parent,
+            )
+            run_path = client._run_directory.path
+            snapshot_hosts = client._config_snapshot_directory.path / "hosts.yml"
+            original_finish = client._termination_signal_guard.finish
+
+            def inject_during_finish() -> None:
+                self.assertFalse(snapshot_hosts.exists())
+                self.assertFalse(run_path.exists())
+                client._termination_signal_guard._handle_signal(
+                    signal.SIGQUIT,
+                    None,
+                )
+                original_finish()
+
+            def forward_signal(
+                forwarded: int,
+                secondary_error: BaseException | None,
+            ) -> None:
+                raise _ForwardedFixtureSignal(
+                    forwarded,
+                    secondary_error,
+                )
+
+            with (
+                mock.patch.object(
+                    client._termination_signal_guard,
+                    "finish",
+                    side_effect=inject_during_finish,
+                ),
+                mock.patch.object(
+                    ENFORCEMENT_MODULE,
+                    "_forward_deferred_termination_signal",
+                    side_effect=forward_signal,
+                ),
+                self.assertRaises(_ForwardedFixtureSignal) as raised,
+            ):
+                client.close()
+
+        self.assertEqual(raised.exception.signal_number, signal.SIGQUIT)
+        self.assertIsNone(raised.exception.secondary_error)
+        self.assertTrue(client._closed)
+        self.assertFalse(run_path.exists())
+
+    @unittest.skipUnless(
+        os.name == "posix"
+        and all(
+            hasattr(signal, name)
+            for name in (
+                "SIGTERM",
+                "pthread_sigmask",
+                "sigpending",
+                "sigwait",
+                "SIG_BLOCK",
+                "SIG_SETMASK",
+            )
+        ),
+        "client lifecycle transaction requires POSIX signal controls",
+    )
+    def test_enforcement_client_signal_cleanup_failure_retains_recovery_identity(
+        self,
+    ) -> None:
+        with owner_controlled_temp_root() as temp_root:
+            trusted_gh = temp_root / "trusted-gh"
+            trusted_payload = b"#!/bin/sh\nexit 0\n"
+            trusted_gh.write_bytes(trusted_payload)
+            trusted_gh.chmod(0o700)
+            config_dir, runtime_parent = self._make_private_gh_config(
+                temp_root,
+                hosts_payload=(
+                    "github.com:\n"
+                    "    git_protocol: https\n"
+                    "    users:\n"
+                    "        fixture-admin:\n"
+                    f"            oauth_token: {SYNTHETIC_ACCESS_TOKEN}\n"
+                    "    user: fixture-admin\n"
+                    f"    oauth_token: {SYNTHETIC_ACCESS_TOKEN}\n"
+                ),
+            )
+            client = ENFORCEMENT_MODULE.GitHubApiClient(
+                trusted_gh,
+                hashlib.sha256(trusted_payload).hexdigest(),
+                config_dir,
+                runtime_parent=runtime_parent,
+            )
+            run_path = client._run_directory.path
+            config_fd = client._config_snapshot_directory.fd
+            original_unlink = os.unlink
+
+            def reject_token_unlink(
+                path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+                *,
+                dir_fd: int | None = None,
+            ) -> None:
+                if path == "hosts.yml" and dir_fd == config_fd:
+                    raise PermissionError(
+                        errno.EACCES,
+                        "injected token unlink failure",
+                    )
+                original_unlink(path, dir_fd=dir_fd)
+
+            def forward_signal(
+                forwarded: int,
+                secondary_error: BaseException | None,
+            ) -> None:
+                raise _ForwardedFixtureSignal(
+                    forwarded,
+                    secondary_error,
+                ) from secondary_error
+
+            try:
+                with (
+                    mock.patch.object(
+                        ENFORCEMENT_MODULE.os,
+                        "unlink",
+                        side_effect=reject_token_unlink,
+                    ),
+                    mock.patch.object(
+                        ENFORCEMENT_MODULE,
+                        "_forward_deferred_termination_signal",
+                        side_effect=forward_signal,
+                    ),
+                    self.assertRaises(_ForwardedFixtureSignal) as raised,
+                ):
+                    with client:
+                        client._termination_signal_guard._handle_signal(
+                            signal.SIGTERM,
+                            None,
+                        )
+
+                cleanup_error = raised.exception.secondary_error
+                self.assertIsInstance(
+                    cleanup_error,
+                    ENFORCEMENT_MODULE.EnforcementDoctorError,
+                )
+                assert isinstance(
+                    cleanup_error,
+                    ENFORCEMENT_MODULE.EnforcementDoctorError,
+                )
+                cleanup = cleanup_error.cleanup_failure
+                self.assertEqual(cleanup["cleanup_proof"], "inconclusive")
+                self.assertEqual(
+                    cleanup["retained_runtime"]["path"],
+                    str(run_path),
+                )
+                self.assertEqual(
+                    cleanup["retained_runtime"]["path_binding"],
+                    "verified",
+                )
+                retained_labels = {
+                    locator["label"] for locator in cleanup["retained_objects"]
+                }
+                self.assertIn(
+                    "GitHub CLI private hosts.yml snapshot",
+                    retained_labels,
+                )
+                self.assertTrue(run_path.exists())
+            finally:
+                for directory in (run_path / "config", run_path / "bin"):
+                    if directory.exists():
+                        directory.chmod(0o700)
+                if run_path.exists():
+                    run_path.chmod(0o700)
+                    shutil.rmtree(run_path)
+
+    def test_enforcement_run_recomputes_budget_after_snapshot_revalidation(
+        self,
+    ) -> None:
+        client = object.__new__(ENFORCEMENT_MODULE.GitHubApiClient)
+        client.executable = "/fixed/gh"
+        client.calls = 0
+        client.total_bytes = 0
+        client.deadline = 100.0
+        client._active_processes = {}
+        client._environment = {}
+        client._execution_cwd = tempfile.gettempdir()
+        client._closed = False
+        client._revalidate_snapshot = mock.Mock()
+
+        with (
+            mock.patch.object(
+                ENFORCEMENT_MODULE.time,
+                "monotonic",
+                side_effect=(90.0, 95.0),
+            ),
+            mock.patch.object(
+                ENFORCEMENT_MODULE,
+                "_bounded_subprocess",
+                return_value=(0, b"{}", b""),
+            ) as bounded,
+        ):
+            self.assertEqual(
+                client._run(
+                    ["/fixed/gh", "api", "/user"],
+                    endpoint_class="authenticated-user",
+                    stdout_limit=1024,
+                ),
+                b"{}",
+            )
+
+        self.assertEqual(client.calls, 1)
+        self.assertEqual(
+            bounded.call_args.kwargs["timeout_seconds"],
+            5.0,
+        )
+        self.assertEqual(
+            bounded.call_args.kwargs["absolute_deadline"],
+            100.0,
+        )
+
+    def test_enforcement_run_never_spawns_after_revalidation_exhausts_budget(
+        self,
+    ) -> None:
+        client = object.__new__(ENFORCEMENT_MODULE.GitHubApiClient)
+        client.executable = "/fixed/gh"
+        client.calls = 0
+        client.total_bytes = 0
+        client.deadline = 100.0
+        client._active_processes = {}
+        client._environment = {}
+        client._execution_cwd = tempfile.gettempdir()
+        client._closed = False
+        client._revalidate_snapshot = mock.Mock()
+
+        with (
+            mock.patch.object(
+                ENFORCEMENT_MODULE.time,
+                "monotonic",
+                side_effect=(90.0, 101.0),
+            ),
+            mock.patch.object(
+                ENFORCEMENT_MODULE,
+                "_bounded_subprocess",
+            ) as bounded,
+            self.assertRaises(ENFORCEMENT_MODULE.EnforcementDoctorError) as raised,
+        ):
+            client._run(
+                ["/fixed/gh", "api", "/user"],
+                endpoint_class="authenticated-user",
+                stdout_limit=1024,
+            )
+
+        self.assertEqual(raised.exception.reason_code, "api-timeout")
+        self.assertEqual(client.calls, 0)
+        bounded.assert_not_called()
+
+    def test_enforcement_slow_content_revalidation_honors_absolute_deadline(
+        self,
+    ) -> None:
+        with owner_controlled_temp_root() as temp_root:
+            trusted_gh = temp_root / "trusted-gh"
+            trusted_payload = b"#!/bin/sh\nexit 0\n"
+            trusted_gh.write_bytes(trusted_payload)
+            trusted_gh.chmod(0o700)
+            config_dir, runtime_parent = self._make_private_gh_config(temp_root)
+            client = ENFORCEMENT_MODULE.GitHubApiClient(
+                trusted_gh,
+                hashlib.sha256(trusted_payload).hexdigest(),
+                config_dir,
+                runtime_parent=runtime_parent,
+            )
+            client._source_content_generation = (-1, -1, -1)
+
+            def exhaust_during_hash(
+                _fd: int,
+                *,
+                deadline_check: object,
+            ) -> tuple[str, int]:
+                client.deadline = time.monotonic() - 1
+                deadline_check()
+                self.fail("expired content hash continued")
+
+            try:
+                with (
+                    mock.patch.object(
+                        ENFORCEMENT_MODULE,
+                        "_sha256_fd_bounded",
+                        side_effect=exhaust_during_hash,
+                    ),
+                    mock.patch.object(
+                        ENFORCEMENT_MODULE,
+                        "_bounded_subprocess",
+                    ) as bounded,
+                    self.assertRaises(
+                        ENFORCEMENT_MODULE.EnforcementDoctorError
+                    ) as raised,
+                ):
+                    client.get_json("/user")
+
+                self.assertEqual(raised.exception.reason_code, "api-timeout")
+                self.assertEqual(client.calls, 0)
+                bounded.assert_not_called()
+            finally:
+                client._source_content_generation = (
+                    ENFORCEMENT_MODULE._file_content_generation(
+                        os.fstat(client._source_fd)
+                    )
+                )
+                client.close()
+
+    def test_enforcement_revalidation_cache_bounds_4096_call_amplification(
+        self,
+    ) -> None:
+        with owner_controlled_temp_root() as temp_root:
+            trusted_gh = temp_root / "trusted-gh"
+            trusted_payload = b"#!/bin/sh\nexit 0\n"
+            trusted_gh.write_bytes(trusted_payload)
+            trusted_gh.chmod(0o700)
+            config_dir, runtime_parent = self._make_private_gh_config(temp_root)
+            client = ENFORCEMENT_MODULE.GitHubApiClient(
+                trusted_gh,
+                hashlib.sha256(trusted_payload).hexdigest(),
+                config_dir,
+                runtime_parent=runtime_parent,
+            )
+            try:
+                with (
+                    mock.patch.object(
+                        ENFORCEMENT_MODULE,
+                        "_sha256_fd_bounded",
+                        wraps=ENFORCEMENT_MODULE._sha256_fd_bounded,
+                    ) as executable_hash,
+                    mock.patch.object(
+                        ENFORCEMENT_MODULE,
+                        "_read_fd_payload_bounded",
+                        wraps=ENFORCEMENT_MODULE._read_fd_payload_bounded,
+                    ) as config_read,
+                ):
+                    for _ in range(ENFORCEMENT_MODULE.MAX_API_CALLS):
+                        client._revalidate_snapshot()
+
+                executable_hash.assert_not_called()
+                config_read.assert_not_called()
+            finally:
+                client.close()
+
+    def test_enforcement_revalidation_cache_rehashes_content_generation_drift(
+        self,
+    ) -> None:
+        with owner_controlled_temp_root() as temp_root:
+            trusted_gh = temp_root / "trusted-gh"
+            trusted_payload = b"#!/bin/sh\nexit 0\n"
+            changed_payload = b"#!/bin/sh\nexit 9\n"
+            self.assertEqual(len(trusted_payload), len(changed_payload))
+            trusted_gh.write_bytes(trusted_payload)
+            trusted_gh.chmod(0o700)
+            config_dir, runtime_parent = self._make_private_gh_config(temp_root)
+            client = ENFORCEMENT_MODULE.GitHubApiClient(
+                trusted_gh,
+                hashlib.sha256(trusted_payload).hexdigest(),
+                config_dir,
+                runtime_parent=runtime_parent,
+            )
+            trusted_gh.write_bytes(changed_payload)
+            trusted_gh.chmod(0o700)
+            try:
+                with (
+                    mock.patch.object(
+                        ENFORCEMENT_MODULE,
+                        "_sha256_fd_bounded",
+                        wraps=ENFORCEMENT_MODULE._sha256_fd_bounded,
+                    ) as executable_hash,
+                    self.assertRaises(
+                        ENFORCEMENT_MODULE.EnforcementDoctorError
+                    ) as raised,
+                ):
+                    client._revalidate_snapshot()
+
+                self.assertEqual(
+                    raised.exception.reason_code,
+                    "collector-inconclusive",
+                )
+                self.assertGreaterEqual(executable_hash.call_count, 1)
+            finally:
+                client.close()
 
     def test_enforcement_subprocess_selector_failures_terminate_before_return(
         self,
@@ -7793,9 +8447,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
         key.data = ("stdout", 1)
         key.fileobj = process.stdout
         selector.get_map.return_value = {"stdout": key}
-        selector.select.return_value = [
-            (key, ENFORCEMENT_MODULE.selectors.EVENT_READ)
-        ]
+        selector.select.return_value = [(key, ENFORCEMENT_MODULE.selectors.EVENT_READ)]
         selector.close.side_effect = OSError(
             errno.EIO,
             "injected selector close failure",
@@ -7821,9 +8473,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
                 "_terminate_drain_reap",
                 return_value=[],
             ) as cleanup,
-            self.assertRaises(
-                ENFORCEMENT_MODULE.EnforcementDoctorError
-            ) as raised,
+            self.assertRaises(ENFORCEMENT_MODULE.EnforcementDoctorError) as raised,
         ):
             ENFORCEMENT_MODULE._bounded_subprocess(
                 ["/fixed/gh", "api", "/user"],
@@ -7876,9 +8526,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
                 "_terminate_drain_reap",
                 return_value=["process-not-reaped"],
             ) as cleanup,
-            self.assertRaises(
-                ENFORCEMENT_MODULE.EnforcementDoctorError
-            ) as raised,
+            self.assertRaises(ENFORCEMENT_MODULE.EnforcementDoctorError) as raised,
         ):
             ENFORCEMENT_MODULE._bounded_subprocess(
                 ["/fixed/gh", "api", "/user"],
@@ -8036,10 +8684,8 @@ class BugTriageDocumentationTests(unittest.TestCase):
                         "kill",
                     ) as direct_kill,
                 ):
-                    failures = (
-                        ENFORCEMENT_MODULE._seal_process_group_before_reap(
-                            managed
-                        )
+                    failures = ENFORCEMENT_MODULE._seal_process_group_before_reap(
+                        managed
                     )
 
                 self.assertEqual(failures, expected_failures)
@@ -8058,9 +8704,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
         self,
     ) -> None:
         original_popen = subprocess.Popen
-        original_signal_managed_process = (
-            ENFORCEMENT_MODULE._signal_managed_process
-        )
+        original_signal_managed_process = ENFORCEMENT_MODULE._signal_managed_process
         spawned: list[subprocess.Popen[bytes]] = []
 
         def record_popen(*args: object, **kwargs: object) -> subprocess.Popen[bytes]:
@@ -8096,9 +8740,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
                     "_signal_managed_process",
                     wraps=original_signal_managed_process,
                 ) as signaller,
-                self.assertRaises(
-                    ENFORCEMENT_MODULE.EnforcementDoctorError
-                ) as raised,
+                self.assertRaises(ENFORCEMENT_MODULE.EnforcementDoctorError) as raised,
             ):
                 ENFORCEMENT_MODULE._bounded_subprocess(
                     [sys.executable, "-c", program],
@@ -8290,9 +8932,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
                         side_effect=signal_leader,
                     ) as kill,
                 ):
-                    first_failures = ENFORCEMENT_MODULE._terminate_drain_reap(
-                        managed
-                    )
+                    first_failures = ENFORCEMENT_MODULE._terminate_drain_reap(managed)
                     self.assertEqual(
                         first_failures,
                         ["process-group-not-quiescent"],
@@ -8354,8 +8994,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
                     "verified",
                 )
                 retained_labels = {
-                    locator["label"]
-                    for locator in cleanup["retained_objects"]
+                    locator["label"] for locator in cleanup["retained_objects"]
                 }
                 self.assertIn(
                     "GitHub CLI private hosts.yml snapshot",
@@ -8381,9 +9020,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
             config_dir = temp_root / "config"
             config_dir.mkdir(mode=0o700)
             hosts_path = config_dir / "hosts.yml"
-            hosts_path.write_bytes(
-                b"x" * (ENFORCEMENT_MODULE.MAX_GH_CONFIG_BYTES + 1)
-            )
+            hosts_path.write_bytes(b"x" * (ENFORCEMENT_MODULE.MAX_GH_CONFIG_BYTES + 1))
             hosts_path.chmod(0o600)
             parent = ENFORCEMENT_MODULE._BoundDirectory(
                 config_dir,
@@ -8521,9 +9158,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
             snapshot_hosts = client._config_snapshot_directory.path / "hosts.yml"
             snapshot_hosts.chmod(0o644)
 
-            with self.assertRaises(
-                ENFORCEMENT_MODULE.EnforcementDoctorError
-            ) as raised:
+            with self.assertRaises(ENFORCEMENT_MODULE.EnforcementDoctorError) as raised:
                 client.close()
 
             self.assertEqual(
@@ -8664,8 +9299,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
                 hosts_locators = [
                     locator
                     for locator in cleanup["retained_objects"]
-                    if locator["label"]
-                    == "GitHub CLI private hosts.yml snapshot"
+                    if locator["label"] == "GitHub CLI private hosts.yml snapshot"
                 ]
                 self.assertEqual(len(hosts_locators), 1)
                 self.assertEqual(
@@ -8905,9 +9539,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
                     and parent.path.name == "config"
                     and parent.path.parent.parent == runtime_parent
                 ):
-                    created_config_status["value"] = (
-                        parent.path / name
-                    ).stat()
+                    created_config_status["value"] = (parent.path / name).stat()
                     raise ENFORCEMENT_MODULE._blocked(
                         "collector-unavailable",
                         "fixture config snapshot binding failure",
@@ -8963,14 +9595,11 @@ class BugTriageDocumentationTests(unittest.TestCase):
                 locator = cleanup["retained_runtime"]
                 self.assertEqual(locator["path_binding"], "verified")
                 run_path = Path(locator["path"])
-                self.assertTrue(
-                    (run_path / "config" / "config.yml").exists()
-                )
+                self.assertTrue((run_path / "config" / "config.yml").exists())
                 config_locators = [
                     retained
                     for retained in cleanup["retained_objects"]
-                    if retained["label"]
-                    == "GitHub CLI private config.yml snapshot"
+                    if retained["label"] == "GitHub CLI private config.yml snapshot"
                 ]
                 self.assertEqual(len(config_locators), 1)
                 self.assertEqual(
@@ -9287,6 +9916,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
                     )
                     cleanup_error = None
                     try:
+
                         def drift_after_exec(
                             command: list[str],
                             **kwargs: object,
@@ -9325,8 +9955,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
                             for locator in cleanup_error.cleanup_failure[
                                 "retained_objects"
                             ]
-                            if locator["label"]
-                            == "GitHub CLI executable snapshot"
+                            if locator["label"] == "GitHub CLI executable snapshot"
                         ]
                         self.assertEqual(len(executable_locators), 1)
                         self.assertEqual(
@@ -9709,6 +10338,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
                     )
                     cleanup_error = None
                     try:
+
                         def drift_during_execution(
                             command: list[str],
                             **kwargs: object,

@@ -656,9 +656,7 @@ def _load_contract(contract: dict[str, Any]) -> dict[str, Any]:
 GROUP_SIGNAL_OPEN = "signal-open"
 GROUP_KILL_SENT_BEFORE_REAP = "kill-sent-before-reap"
 GROUP_MISSING_BEFORE_REAP = "group-missing-before-reap"
-GROUP_NO_SIGNALABLE_MEMBERS_BEFORE_REAP = (
-    "no-signalable-members-before-reap"
-)
+GROUP_NO_SIGNALABLE_MEMBERS_BEFORE_REAP = "no-signalable-members-before-reap"
 GROUP_DIRECT_PROCESS_ONLY = "direct-process-only"
 GROUP_SIGNAL_UNPROVEN_BEFORE_REAP = "signal-unproven-before-reap"
 SAFE_TERMINAL_GROUP_STATES = {
@@ -676,7 +674,7 @@ class _DeferredTerminationSignal(BaseException):
 
 
 class _TerminationSignalGuard:
-    """Defer process termination until a spawned child has a cleanup owner."""
+    """Defer termination across a credential-bearing client transaction."""
 
     def __init__(self) -> None:
         self._requested_signals = tuple(
@@ -700,6 +698,10 @@ class _TerminationSignalGuard:
     @property
     def errors(self) -> tuple[BaseException, ...]:
         return tuple(self._errors)
+
+    @property
+    def state(self) -> str:
+        return self._state
 
     def _record_signal(self, signal_number: int) -> None:
         if self._deferred_signal is None:
@@ -765,11 +767,37 @@ class _TerminationSignalGuard:
             self._state = "failed"
             raise
 
-    def publish(self, _managed: _ManagedProcess) -> None:
+    def activate(self) -> None:
         if self._state != "blocked" or self._original_mask is None:
-            raise RuntimeError("termination-signal guard publication is invalid")
+            raise RuntimeError("termination-signal guard activation is invalid")
         self._state = "running"
         signal.pthread_sigmask(signal.SIG_SETMASK, self._original_mask)
+        if self._deferred_signal is not None:
+            raise _DeferredTerminationSignal(self._deferred_signal)
+
+    def publish(self, _managed: _ManagedProcess) -> None:
+        self.activate()
+
+    def check_deferred(self) -> None:
+        if self._state == "blocked":
+            self._drain_pending()
+        if self._deferred_signal is not None:
+            raise _DeferredTerminationSignal(self._deferred_signal)
+
+    def prepare_publication(self) -> None:
+        if self._state != "running":
+            raise RuntimeError("termination-signal guard publication is invalid")
+        error_count = len(self._errors)
+        signal.pthread_sigmask(
+            signal.SIG_BLOCK,
+            set(self._requested_signals),
+        )
+        self._state = "blocked"
+        self._drain_pending()
+        if len(self._errors) != error_count:
+            raise OSError("termination-signal publication fence is inconclusive")
+        if self._deferred_signal is not None:
+            raise _DeferredTerminationSignal(self._deferred_signal)
 
     def _drain_pending(self) -> None:
         try:
@@ -864,10 +892,7 @@ def _leader_exited_without_reap(managed: _ManagedProcess) -> bool:
             )
         except (ChildProcessError, OSError):
             return False
-        return (
-            result is not None
-            and getattr(result, "si_pid", 0) == managed.pid
-        )
+        return result is not None and getattr(result, "si_pid", 0) == managed.pid
     if not (
         sys.platform == "darwin"
         and hasattr(select, "kqueue")
@@ -894,8 +919,7 @@ def _leader_exited_without_reap(managed: _ManagedProcess) -> bool:
             # an already-gone EVFILT_PROC target is this unreaped child.
             return True
         return any(
-            event.ident == managed.pid
-            and event.fflags & select.KQ_NOTE_EXIT
+            event.ident == managed.pid and event.fflags & select.KQ_NOTE_EXIT
             for event in events
         )
     except OSError:
@@ -1002,9 +1026,7 @@ def _terminate_drain_reap_impl(
     failures: list[str] = []
     process = managed.process
     streams = tuple(
-        stream
-        for stream in (process.stdout, process.stderr)
-        if stream is not None
+        stream for stream in (process.stdout, process.stderr) if stream is not None
     )
     open_stream_fds: set[int] = set()
     for stream in streams:
@@ -1237,16 +1259,24 @@ def _api_request_error(
     )
 
 
-def _sha256_fd_bounded(fd: int) -> tuple[str, int]:
+def _sha256_fd_bounded(
+    fd: int,
+    *,
+    deadline_check: Callable[[], None] | None = None,
+) -> tuple[str, int]:
     digest = hashlib.sha256()
     offset = 0
     while True:
+        if deadline_check is not None:
+            deadline_check()
         try:
             chunk = os.pread(
                 fd, min(64 * 1024, MAX_GH_EXECUTABLE_BYTES + 1 - offset), offset
             )
         except OSError:
             raise
+        if deadline_check is not None:
+            deadline_check()
         if not chunk:
             break
         offset += len(chunk)
@@ -1256,10 +1286,35 @@ def _sha256_fd_bounded(fd: int) -> tuple[str, int]:
     return digest.hexdigest(), offset
 
 
-def _read_fd_payload_bounded(fd: int, *, label: str, limit: int) -> bytes:
+def _file_content_generation(
+    status_value: os.stat_result,
+) -> tuple[int, int, int]:
+    """Return signals that require refreshing a cached content receipt.
+
+    Identity, size, and access policy are still validated independently.
+    A generation change is not itself a policy violation: it only forces a
+    bounded content reread so benign metadata churn can retain the receipt.
+    """
+
+    return (
+        status_value.st_size,
+        status_value.st_mtime_ns,
+        status_value.st_ctime_ns,
+    )
+
+
+def _read_fd_payload_bounded(
+    fd: int,
+    *,
+    label: str,
+    limit: int,
+    deadline_check: Callable[[], None] | None = None,
+) -> bytes:
     chunks: list[bytes] = []
     offset = 0
     while True:
+        if deadline_check is not None:
+            deadline_check()
         try:
             chunk = os.pread(fd, min(64 * 1024, limit + 1 - offset), offset)
         except OSError as error:
@@ -1267,6 +1322,8 @@ def _read_fd_payload_bounded(fd: int, *, label: str, limit: int) -> bytes:
                 "collector-unavailable",
                 f"{label} could not be read safely",
             ) from error
+        if deadline_check is not None:
+            deadline_check()
         if not chunk:
             break
         chunks.append(chunk)
@@ -1329,10 +1386,9 @@ def _verified_descriptor_path(fd: int) -> Optional[pathlib.Path]:
         path_status = os.stat(path, follow_symlinks=False)
     except OSError:
         return None
-    if (
-        _object_identity(descriptor) != _object_identity(path_status)
-        or stat.S_IFMT(descriptor.st_mode) != stat.S_IFMT(path_status.st_mode)
-    ):
+    if _object_identity(descriptor) != _object_identity(path_status) or stat.S_IFMT(
+        descriptor.st_mode
+    ) != stat.S_IFMT(path_status.st_mode):
         return None
     return path
 
@@ -1721,10 +1777,9 @@ class _BoundDirectory:
         try:
             for fd, expected in zip(self._fds, self._bindings):
                 current = os.fstat(fd)
-                if (
-                    not stat.S_ISDIR(current.st_mode)
-                    or _object_identity(current) != _binding_identity(expected)
-                ):
+                if not stat.S_ISDIR(current.st_mode) or _object_identity(
+                    current
+                ) != _binding_identity(expected):
                     raise self._inconclusive()
             for relation, expected in zip(self._relations, self._bindings[1:]):
                 parent_fd, component, child_fd = relation
@@ -1872,6 +1927,7 @@ class _BoundRegularFile:
             self.binding = binding
             self.access_policy_binding = access_policy_before
             self.sha256 = sha256
+            self.content_generation = _file_content_generation(descriptor_after)
             self.fd = local_fd
             local_fd = None
         except EnforcementDoctorError:
@@ -1888,9 +1944,15 @@ class _BoundRegularFile:
                 except OSError:
                     pass
 
-    def revalidate(self) -> None:
+    def revalidate(
+        self,
+        *,
+        deadline_check: Callable[[], None] | None = None,
+    ) -> None:
         if self.fd is None:
             raise self._inconclusive()
+        if deadline_check is not None:
+            deadline_check()
         self.parent.revalidate()
         try:
             descriptor_before = os.fstat(self.fd)
@@ -1900,16 +1962,26 @@ class _BoundRegularFile:
                 follow_symlinks=False,
             )
             access_policy_before = _stable_fd_access_policy_binding(self.fd)
-            first = _read_fd_payload_bounded(
-                self.fd,
-                label=self.label,
-                limit=self.max_bytes,
-            )
-            second = _read_fd_payload_bounded(
-                self.fd,
-                label=self.label,
-                limit=self.max_bytes,
-            )
+            generation_before = _file_content_generation(descriptor_before)
+            path_generation_before = _file_content_generation(path_before)
+            first: bytes | None = None
+            second: bytes | None = None
+            if (
+                generation_before != self.content_generation
+                or path_generation_before != self.content_generation
+            ):
+                first = _read_fd_payload_bounded(
+                    self.fd,
+                    label=self.label,
+                    limit=self.max_bytes,
+                    deadline_check=deadline_check,
+                )
+                second = _read_fd_payload_bounded(
+                    self.fd,
+                    label=self.label,
+                    limit=self.max_bytes,
+                    deadline_check=deadline_check,
+                )
             descriptor_after = os.fstat(self.fd)
             path_after = os.stat(
                 self.name,
@@ -1917,8 +1989,12 @@ class _BoundRegularFile:
                 follow_symlinks=False,
             )
             access_policy_after = _stable_fd_access_policy_binding(self.fd)
-        except EnforcementDoctorError:
-            raise self._inconclusive()
+            generation_after = _file_content_generation(descriptor_after)
+            path_generation_after = _file_content_generation(path_after)
+        except EnforcementDoctorError as error:
+            if error.reason_code == "api-timeout":
+                raise
+            raise self._inconclusive() from error
         except OSError as error:
             raise self._inconclusive() from error
         if (
@@ -1929,11 +2005,25 @@ class _BoundRegularFile:
             or _file_status(path_after) != self.binding
             or access_policy_before != self.access_policy_binding
             or access_policy_after != self.access_policy_binding
-            or first != second
-            or hashlib.sha256(first).hexdigest() != self.sha256
+            or generation_before != path_generation_before
+            or generation_after != path_generation_after
+            or generation_before != generation_after
+            or (first is None and generation_after != self.content_generation)
+            or (
+                first is not None
+                and (
+                    first != second or hashlib.sha256(first).hexdigest() != self.sha256
+                )
+            )
         ):
             raise self._inconclusive()
+        if first is not None:
+            self.content_generation = generation_after
+        if deadline_check is not None:
+            deadline_check()
         self.parent.revalidate()
+        if deadline_check is not None:
+            deadline_check()
 
     def _inconclusive(self) -> EnforcementDoctorError:
         return _blocked(
@@ -2379,15 +2469,14 @@ def _bounded_subprocess_supervised(
     endpoint_class: str,
     process_registry: dict[int, _ManagedProcess],
     process_registered: Callable[[_ManagedProcess], None],
-    timeout_seconds: int,
+    timeout_seconds: float,
     stdout_limit: int,
     stderr_limit: int,
+    absolute_deadline: float | None = None,
 ) -> tuple[int, bytes, bytes]:
     if os.name == "posix":
         try:
-            sigchld_is_default = (
-                signal.getsignal(signal.SIGCHLD) == signal.SIG_DFL
-            )
+            sigchld_is_default = signal.getsignal(signal.SIGCHLD) == signal.SIG_DFL
         except (OSError, ValueError):
             sigchld_is_default = False
         if not sigchld_is_default or threading.active_count() != 1:
@@ -2400,6 +2489,16 @@ def _bounded_subprocess_supervised(
                     failure_kind="process-supervision",
                 ),
             )
+    if absolute_deadline is not None and absolute_deadline - time.monotonic() <= 0:
+        raise _blocked(
+            "api-timeout",
+            "GitHub evidence collection exceeded its total deadline",
+            api_failure=_api_failure(
+                endpoint_class,
+                http_status=None,
+                failure_kind="timeout",
+            ),
+        )
     try:
         process = subprocess.Popen(
             command,
@@ -2431,6 +2530,8 @@ def _bounded_subprocess_supervised(
         chunks: dict[str, list[bytes]] = {"stdout": [], "stderr": []}
         retained: dict[str, int] = {"stdout": 0, "stderr": 0}
         deadline = time.monotonic() + timeout_seconds
+        if absolute_deadline is not None:
+            deadline = min(deadline, absolute_deadline)
         if process.stdout is None or process.stderr is None:
             raise OSError("collector pipes are unavailable")
         selector = selectors.DefaultSelector()
@@ -2601,20 +2702,50 @@ def _bounded_subprocess(
     execution_cwd: str,
     endpoint_class: str,
     process_registry: dict[int, _ManagedProcess],
-    timeout_seconds: int,
+    timeout_seconds: float,
     stdout_limit: int,
     stderr_limit: int,
     termination_cleanup: Callable[[], None] | None = None,
+    lifecycle_signal_guard: _TerminationSignalGuard | None = None,
+    absolute_deadline: float | None = None,
 ) -> tuple[int, bytes, bytes]:
-    signal_guard = _TerminationSignalGuard()
-    try:
-        signal_guard.start()
-    except Exception as error:
-        raise _process_supervision_error(
-            endpoint_class,
-            "GitHub API collector termination-signal supervision is unavailable",
-            unavailable=True,
-        ) from error
+    owns_signal_guard = lifecycle_signal_guard is None
+    signal_guard = lifecycle_signal_guard or _TerminationSignalGuard()
+    if owns_signal_guard:
+        try:
+            signal_guard.start()
+        except Exception as error:
+            raise _process_supervision_error(
+                endpoint_class,
+                "GitHub API collector termination-signal supervision is unavailable",
+                unavailable=True,
+            ) from error
+    else:
+        try:
+            signal_guard.prepare_publication()
+        except _DeferredTerminationSignal:
+            if termination_cleanup is not None:
+                termination_cleanup()
+            raise
+        except Exception as error:
+            cleanup_error: BaseException | None = None
+            if termination_cleanup is not None:
+                try:
+                    termination_cleanup()
+                except BaseException as cleanup_failure:
+                    cleanup_error = cleanup_failure
+            supervision_error = _process_supervision_error(
+                endpoint_class,
+                "GitHub API collector termination-signal publication is unavailable",
+                unavailable=False,
+            )
+            if cleanup_error is not None:
+                raise supervision_error from cleanup_error
+            raise _process_supervision_error(
+                endpoint_class,
+                "GitHub API collector termination-signal publication is unavailable",
+                unavailable=False,
+            ) from error
 
     process_result: tuple[int, bytes, bytes] | None = None
     primary_error: BaseException | None = None
@@ -2630,11 +2761,21 @@ def _bounded_subprocess(
                 timeout_seconds=timeout_seconds,
                 stdout_limit=stdout_limit,
                 stderr_limit=stderr_limit,
+                absolute_deadline=absolute_deadline,
             )
         except BaseException as error:
             primary_error = error
         finally:
-            signal_guard.begin_cleanup()
+            if owns_signal_guard:
+                signal_guard.begin_cleanup()
+            elif signal_guard.state == "blocked":
+                try:
+                    signal_guard.activate()
+                except BaseException as error:
+                    if primary_error is None or isinstance(
+                        error, _DeferredTerminationSignal
+                    ):
+                        primary_error = error
     except BaseException as error:
         if primary_error is None:
             primary_error = error
@@ -2642,10 +2783,38 @@ def _bounded_subprocess(
     deferred_signal = signal_guard.deferred_signal
     credential_cleanup_error: BaseException | None = None
     if deferred_signal is not None and termination_cleanup is not None:
-        try:
+        if not owns_signal_guard:
             termination_cleanup()
-        except BaseException as error:
-            credential_cleanup_error = error
+        else:
+            try:
+                termination_cleanup()
+            except BaseException as error:
+                credential_cleanup_error = error
+    if not owns_signal_guard:
+        if deferred_signal is not None:
+            deferred = _DeferredTerminationSignal(deferred_signal)
+            secondary_error = credential_cleanup_error or (
+                primary_error
+                if not isinstance(primary_error, _DeferredTerminationSignal)
+                else None
+            )
+            if secondary_error is not None:
+                raise deferred from secondary_error
+            raise deferred
+        if signal_guard.errors:
+            supervision_error = _process_supervision_error(
+                endpoint_class,
+                "GitHub API collector termination-signal state is inconclusive",
+                unavailable=False,
+            )
+            if primary_error is not None:
+                raise supervision_error from primary_error
+            raise supervision_error
+        if primary_error is not None:
+            raise primary_error
+        assert process_result is not None
+        return process_result
+
     signal_guard.finish()
 
     supervision_error = None
@@ -2708,6 +2877,11 @@ class GitHubApiClient:
         self._snapshot_fd: Optional[int] = None
         self._source_access_policy_binding: Optional[tuple[str, int, str]] = None
         self._snapshot_access_policy_binding: Optional[tuple[str, int, str]] = None
+        self._source_content_generation: Optional[tuple[int, int, int]] = None
+        self._snapshot_content_generation: Optional[tuple[int, int, int]] = None
+        self._termination_signal_guard = _TerminationSignalGuard()
+        self._termination_transaction_finished = False
+        self._termination_transaction_finishing = False
         self._closed = False
         self._collector_inconclusive_reported = False
         self._pinned = False
@@ -2724,6 +2898,14 @@ class GitHubApiClient:
                 "collector-unavailable",
                 "expected GitHub CLI SHA-256 is invalid",
             )
+        try:
+            self._termination_signal_guard.start()
+        except Exception as error:
+            raise _process_supervision_error(
+                "authentication-preflight",
+                "GitHub client termination-signal supervision is unavailable",
+                unavailable=True,
+            ) from error
         try:
             selected_runtime_parent = runtime_parent or _default_gh_runtime_parent()
             self._runtime_parent = _BoundDirectory(
@@ -2747,14 +2929,15 @@ class GitHubApiClient:
             self._config_snapshot_directory.set_owner_mode(0o500)
             self._executable_snapshot_directory.set_owner_mode(0o500)
             self._revalidate_snapshot()
+            self.calls = 0
+            self.total_bytes = 0
+            self.deadline = time.monotonic() + MAX_COLLECTION_SECONDS
+            self._termination_signal_guard.check_deferred()
         except BaseException as initialization_error:
             cleanup_error = self._cleanup_noexcept()
             if cleanup_error is not None:
                 raise cleanup_error from initialization_error
             raise
-        self.calls = 0
-        self.total_bytes = 0
-        self.deadline = time.monotonic() + MAX_COLLECTION_SECONDS
 
     def _create_run_directory(self) -> None:
         if self._runtime_parent is None:
@@ -3050,6 +3233,7 @@ class GitHubApiClient:
                 "uid": source_after.st_uid,
             }
             self._source_access_policy_binding = source_access_policy_after
+            self._source_content_generation = _file_content_generation(source_after)
             os.fchmod(snapshot_write_fd, 0o500)
             os.fsync(snapshot_write_fd)
             snapshot_status = os.fstat(snapshot_write_fd)
@@ -3101,6 +3285,7 @@ class GitHubApiClient:
                 "uid": pinned_status.st_uid,
             }
             self._snapshot_access_policy_binding = pinned_access_policy
+            self._snapshot_content_generation = _file_content_generation(pinned_status)
             self.executable = os.fspath(snapshot_path)
             self._source_fd = source_fd
             source_fd = None
@@ -3130,7 +3315,30 @@ class GitHubApiClient:
             "pinned GitHub CLI snapshot could not be revalidated",
         )
 
-    def _revalidate_snapshot(self) -> None:
+    @staticmethod
+    def _require_deadline_remaining(
+        absolute_deadline: float,
+        endpoint_class: str,
+    ) -> float:
+        remaining = absolute_deadline - time.monotonic()
+        if remaining <= 0:
+            raise _blocked(
+                "api-timeout",
+                "GitHub evidence collection exceeded its total deadline",
+                api_failure=_api_failure(
+                    endpoint_class,
+                    http_status=None,
+                    failure_kind="timeout",
+                ),
+            )
+        return remaining
+
+    def _revalidate_snapshot(
+        self,
+        *,
+        absolute_deadline: float | None = None,
+        endpoint_class: str = "github-api",
+    ) -> None:
         if (
             not self._pinned
             or self._closed
@@ -3138,6 +3346,8 @@ class GitHubApiClient:
             or self._snapshot_fd is None
             or self._source_access_policy_binding is None
             or self._snapshot_access_policy_binding is None
+            or self._source_content_generation is None
+            or self._snapshot_content_generation is None
             or not self.executable
             or self._runtime_parent is None
             or self._run_directory is None
@@ -3149,39 +3359,97 @@ class GitHubApiClient:
             or self._snapshot_global_config_file is None
         ):
             raise self._collector_inconclusive()
+
+        def check_deadline() -> None:
+            if absolute_deadline is not None:
+                self._require_deadline_remaining(
+                    absolute_deadline,
+                    endpoint_class,
+                )
+
         try:
+            check_deadline()
             self._runtime_parent.revalidate()
+            check_deadline()
             self._run_directory.revalidate()
+            check_deadline()
             self._executable_snapshot_directory.revalidate()
+            check_deadline()
             self._config_snapshot_directory.revalidate()
+            check_deadline()
             self._source_config_directory.revalidate()
-            self._source_hosts_file.revalidate()
+            self._source_hosts_file.revalidate(deadline_check=check_deadline)
             if self._source_global_config_file is not None:
-                self._source_global_config_file.revalidate()
-            self._snapshot_hosts_file.revalidate()
-            self._snapshot_global_config_file.revalidate()
+                self._source_global_config_file.revalidate(
+                    deadline_check=check_deadline
+                )
+            self._snapshot_hosts_file.revalidate(deadline_check=check_deadline)
+            self._snapshot_global_config_file.revalidate(deadline_check=check_deadline)
+            check_deadline()
             source_descriptor_before = os.fstat(self._source_fd)
             source_path_before = os.lstat(self._source_path)
             source_access_policy_before = _stable_fd_access_policy_binding(
                 self._source_fd
             )
-            source_digest, source_retained = _sha256_fd_bounded(self._source_fd)
+            source_generation_before = _file_content_generation(
+                source_descriptor_before
+            )
+            source_path_generation_before = _file_content_generation(source_path_before)
+            source_digest: str | None = None
+            source_retained: int | None = None
+            if (
+                source_generation_before != self._source_content_generation
+                or source_path_generation_before != self._source_content_generation
+            ):
+                source_digest, source_retained = _sha256_fd_bounded(
+                    self._source_fd,
+                    deadline_check=check_deadline,
+                )
             source_descriptor_after = os.fstat(self._source_fd)
             source_path_after = os.lstat(self._source_path)
             source_access_policy_after = _stable_fd_access_policy_binding(
                 self._source_fd
             )
+            source_generation_after = _file_content_generation(source_descriptor_after)
+            source_path_generation_after = _file_content_generation(source_path_after)
+            check_deadline()
             snapshot_descriptor_before = os.fstat(self._snapshot_fd)
             snapshot_path_before = os.lstat(self._snapshot_path)
             snapshot_access_policy_before = _stable_fd_access_policy_binding(
                 self._snapshot_fd
             )
-            snapshot_digest, snapshot_retained = _sha256_fd_bounded(self._snapshot_fd)
+            snapshot_generation_before = _file_content_generation(
+                snapshot_descriptor_before
+            )
+            snapshot_path_generation_before = _file_content_generation(
+                snapshot_path_before
+            )
+            snapshot_digest: str | None = None
+            snapshot_retained: int | None = None
+            if (
+                snapshot_generation_before != self._snapshot_content_generation
+                or snapshot_path_generation_before != self._snapshot_content_generation
+            ):
+                snapshot_digest, snapshot_retained = _sha256_fd_bounded(
+                    self._snapshot_fd,
+                    deadline_check=check_deadline,
+                )
             snapshot_descriptor_after = os.fstat(self._snapshot_fd)
             snapshot_path_after = os.lstat(self._snapshot_path)
             snapshot_access_policy_after = _stable_fd_access_policy_binding(
                 self._snapshot_fd
             )
+            snapshot_generation_after = _file_content_generation(
+                snapshot_descriptor_after
+            )
+            snapshot_path_generation_after = _file_content_generation(
+                snapshot_path_after
+            )
+            check_deadline()
+        except EnforcementDoctorError as error:
+            if error.reason_code == "api-timeout":
+                raise
+            raise self._collector_inconclusive() from error
         except (OSError, ValueError):
             raise self._collector_inconclusive()
 
@@ -3202,10 +3470,22 @@ class GitHubApiClient:
             or _file_status(source_path_before) != source_expected
             or _file_status(source_descriptor_after) != source_expected
             or _file_status(source_path_after) != source_expected
-            or source_retained != self._source_binding["size"]
-            or source_digest != self._source_binding["sha256"]
             or source_access_policy_before != self._source_access_policy_binding
             or source_access_policy_after != self._source_access_policy_binding
+            or source_generation_before != source_path_generation_before
+            or source_generation_after != source_path_generation_after
+            or source_generation_before != source_generation_after
+            or (
+                source_digest is None
+                and source_generation_after != self._source_content_generation
+            )
+            or (
+                source_digest is not None
+                and (
+                    source_retained != self._source_binding["size"]
+                    or source_digest != self._source_binding["sha256"]
+                )
+            )
             or not stat.S_ISREG(snapshot_descriptor_before.st_mode)
             or not stat.S_ISREG(snapshot_path_before.st_mode)
             or not stat.S_ISREG(snapshot_descriptor_after.st_mode)
@@ -3214,15 +3494,40 @@ class GitHubApiClient:
             or _file_status(snapshot_path_before) != snapshot_expected
             or _file_status(snapshot_descriptor_after) != snapshot_expected
             or _file_status(snapshot_path_after) != snapshot_expected
-            or snapshot_retained != self._snapshot_binding["size"]
-            or snapshot_digest != self._snapshot_binding["sha256"]
             or snapshot_access_policy_before != self._snapshot_access_policy_binding
             or snapshot_access_policy_after != self._snapshot_access_policy_binding
+            or snapshot_generation_before != snapshot_path_generation_before
+            or snapshot_generation_after != snapshot_path_generation_after
+            or snapshot_generation_before != snapshot_generation_after
+            or (
+                snapshot_digest is None
+                and snapshot_generation_after != self._snapshot_content_generation
+            )
+            or (
+                snapshot_digest is not None
+                and (
+                    snapshot_retained != self._snapshot_binding["size"]
+                    or snapshot_digest != self._snapshot_binding["sha256"]
+                )
+            )
         ):
             raise self._collector_inconclusive()
+        if source_digest is not None:
+            self._source_content_generation = source_generation_after
+        if snapshot_digest is not None:
+            self._snapshot_content_generation = snapshot_generation_after
+        check_deadline()
 
     def revalidate_for_admission(self) -> None:
-        self._revalidate_snapshot()
+        try:
+            self._activate_termination_transaction()
+            self._revalidate_snapshot(
+                absolute_deadline=self.deadline,
+                endpoint_class="admission-revalidation",
+            )
+        except BaseException as error:
+            self._close_after_termination(error)
+            raise
 
     def _cleanup_file_binding(
         self,
@@ -3598,7 +3903,7 @@ class GitHubApiClient:
                 retained.append(locator)
         return retained
 
-    def close(self) -> None:
+    def _close_resources(self) -> None:
         if self._closed:
             return
         cleanup_failures: list[str] = []
@@ -3613,9 +3918,7 @@ class GitHubApiClient:
                 unresolved_processes.append(
                     {
                         "pid": process_id,
-                        "process_group": (
-                            process_id if os.name == "posix" else None
-                        ),
+                        "process_group": (process_id if os.name == "posix" else None),
                         "quiescence": "unproven",
                     }
                 )
@@ -3630,9 +3933,7 @@ class GitHubApiClient:
                 active_processes.pop(process_id)
         process_cleanup_unproven = bool(unresolved_processes)
         if self._pinned:
-            previously_reported_inconclusive = (
-                self._collector_inconclusive_reported
-            )
+            previously_reported_inconclusive = self._collector_inconclusive_reported
             try:
                 self._revalidate_snapshot()
             except Exception:
@@ -3661,10 +3962,7 @@ class GitHubApiClient:
                     cleanup_proofs.append(True)
                 return True
 
-        if (
-            not process_cleanup_unproven
-            and self._config_snapshot_directory is not None
-        ):
+        if not process_cleanup_unproven and self._config_snapshot_directory is not None:
             attempt(
                 "config-directory-owner-mode",
                 lambda: self._prepare_directory_for_cleanup(
@@ -3793,13 +4091,9 @@ class GitHubApiClient:
 
         cleanup_proven = all(cleanup_proofs)
         retained_locator = (
-            None
-            if run_directory_removed
-            else self._retained_runtime_locator()
+            None if run_directory_removed else self._retained_runtime_locator()
         )
-        retained_objects = (
-            [] if cleanup_proven else self._retained_cleanup_objects()
-        )
+        retained_objects = [] if cleanup_proven else self._retained_cleanup_objects()
 
         for managed in active_processes.values():
             process_resource_failures = _close_process_resources(
@@ -3853,9 +4147,7 @@ class GitHubApiClient:
             self._runtime_parent = None
         if cleanup_failures or not cleanup_proven:
             cleanup_failure: dict[str, Any] = {
-                "cleanup_proof": (
-                    "complete" if cleanup_proven else "inconclusive"
-                ),
+                "cleanup_proof": ("complete" if cleanup_proven else "inconclusive"),
                 "failed_operations": sorted(set(cleanup_failures)),
             }
             if retained_locator is not None:
@@ -3870,6 +4162,94 @@ class GitHubApiClient:
                 cleanup_failure=cleanup_failure,
             )
 
+    def close(self) -> None:
+        signal_guard = getattr(self, "_termination_signal_guard", None)
+        if signal_guard is None:
+            self._close_resources()
+            return
+        if self._termination_transaction_finished:
+            return
+        if self._termination_transaction_finishing:
+            self._close_resources()
+            return
+
+        self._termination_transaction_finishing = True
+        cleanup_error: BaseException | None = None
+        finish_error: BaseException | None = None
+        try:
+            signal_guard.begin_cleanup()
+            try:
+                self._close_resources()
+            except BaseException as error:
+                cleanup_error = error
+            try:
+                signal_guard.finish()
+            except BaseException as error:
+                finish_error = error
+            self._termination_transaction_finished = True
+        finally:
+            self._termination_transaction_finishing = False
+
+        if finish_error is not None:
+            if cleanup_error is not None:
+                raise finish_error from cleanup_error
+            raise finish_error
+
+        supervision_error: EnforcementDoctorError | None = None
+        if signal_guard.errors:
+            supervision_error = _process_supervision_error(
+                "github-client-lifecycle",
+                "GitHub client termination-signal state could not be restored",
+                unavailable=False,
+            )
+        deferred_signal = signal_guard.deferred_signal
+        if deferred_signal is not None:
+            secondary_error = cleanup_error or supervision_error
+            if supervision_error is not None:
+                deferred = _DeferredTerminationSignal(deferred_signal)
+                if secondary_error is not None:
+                    raise deferred from secondary_error
+                raise deferred
+            _forward_deferred_termination_signal(
+                deferred_signal,
+                secondary_error,
+            )
+        if supervision_error is not None:
+            if cleanup_error is not None:
+                raise supervision_error from cleanup_error
+            raise supervision_error
+        if cleanup_error is not None:
+            raise cleanup_error
+
+    def _close_after_termination(self, error: BaseException) -> None:
+        signal_guard = getattr(self, "_termination_signal_guard", None)
+        if signal_guard is None:
+            return
+        if (
+            isinstance(error, _DeferredTerminationSignal)
+            or signal_guard.deferred_signal is not None
+        ):
+            self.close()
+
+    def _activate_termination_transaction(self) -> None:
+        signal_guard = getattr(self, "_termination_signal_guard", None)
+        if signal_guard is None or signal_guard.state == "running":
+            return
+        if signal_guard.state != "blocked":
+            raise _process_supervision_error(
+                "github-client-lifecycle",
+                "GitHub client termination-signal transaction is unavailable",
+                unavailable=False,
+            )
+        try:
+            signal_guard.activate()
+        except BaseException as error:
+            try:
+                self.close()
+            except BaseException as cleanup_or_signal_error:
+                raise cleanup_or_signal_error from error
+            raise
+
     def _cleanup_noexcept(self) -> Optional[EnforcementDoctorError]:
         try:
             self.close()
@@ -3878,6 +4258,7 @@ class GitHubApiClient:
         return None
 
     def __enter__(self) -> GitHubApiClient:
+        self._activate_termination_transaction()
         return self
 
     def __exit__(
@@ -3897,6 +4278,7 @@ class GitHubApiClient:
         stdout_limit: int,
         authentication_preflight: bool = False,
     ) -> bytes:
+        self._activate_termination_transaction()
         if self.calls >= MAX_API_CALLS:
             raise _blocked(
                 "api-call-limit",
@@ -3907,37 +4289,47 @@ class GitHubApiClient:
                     failure_kind="call-limit",
                 ),
             )
-        remaining = self.deadline - time.monotonic()
-        if remaining <= 0:
-            raise _blocked(
-                "api-timeout",
-                "GitHub evidence collection exceeded its total deadline",
-                api_failure=_api_failure(
-                    endpoint_class,
-                    http_status=None,
-                    failure_kind="timeout",
-                ),
-            )
-        self.calls += 1
-        self._revalidate_snapshot()
         try:
+            self._require_deadline_remaining(self.deadline, endpoint_class)
+            self._revalidate_snapshot(
+                absolute_deadline=self.deadline,
+                endpoint_class=endpoint_class,
+            )
+            remaining = self._require_deadline_remaining(
+                self.deadline,
+                endpoint_class,
+            )
+            self.calls += 1
             process_result = _bounded_subprocess(
                 command,
                 environment=dict(self._environment),
                 execution_cwd=self._execution_cwd,
                 endpoint_class=endpoint_class,
                 process_registry=self._active_processes,
-                timeout_seconds=max(1, min(MAX_API_SECONDS, int(remaining))),
+                timeout_seconds=min(float(MAX_API_SECONDS), remaining),
                 stdout_limit=stdout_limit,
                 stderr_limit=MAX_API_STDERR_BYTES,
                 termination_cleanup=self.close,
+                lifecycle_signal_guard=getattr(
+                    self,
+                    "_termination_signal_guard",
+                    None,
+                ),
+                absolute_deadline=self.deadline,
             )
-        except BaseException:
-            if self._closed:
+        except BaseException as error:
+            self._close_after_termination(error)
+            if getattr(self, "_closed", False):
                 raise
-            self._revalidate_snapshot()
+            self._revalidate_snapshot(
+                absolute_deadline=self.deadline,
+                endpoint_class=endpoint_class,
+            )
             raise
-        self._revalidate_snapshot()
+        self._revalidate_snapshot(
+            absolute_deadline=self.deadline,
+            endpoint_class=endpoint_class,
+        )
         return_code, stdout, stderr = process_result
         if return_code != 0:
             raise _api_request_error(
@@ -3959,30 +4351,34 @@ class GitHubApiClient:
         return stdout
 
     def auth_preflight(self) -> dict[str, Any]:
-        self._run(
-            [
-                self.executable,
-                "auth",
-                "status",
-                "--hostname",
-                API_HOST,
-            ],
-            endpoint_class="authentication-preflight",
-            stdout_limit=MAX_API_STDERR_BYTES,
-            authentication_preflight=True,
-        )
-        user = self.get_json("/user")
-        user_object = _exact_dict(user, label="authenticated GitHub user")
-        return {
-            "id": _exact_positive_integer(
-                user_object.get("id"),
-                label="authenticated GitHub user ID",
-            ),
-            "login": _exact_string(
-                user_object.get("login"),
-                label="authenticated GitHub user login",
-            ),
-        }
+        try:
+            self._run(
+                [
+                    self.executable,
+                    "auth",
+                    "status",
+                    "--hostname",
+                    API_HOST,
+                ],
+                endpoint_class="authentication-preflight",
+                stdout_limit=MAX_API_STDERR_BYTES,
+                authentication_preflight=True,
+            )
+            user = self.get_json("/user")
+            user_object = _exact_dict(user, label="authenticated GitHub user")
+            return {
+                "id": _exact_positive_integer(
+                    user_object.get("id"),
+                    label="authenticated GitHub user ID",
+                ),
+                "login": _exact_string(
+                    user_object.get("login"),
+                    label="authenticated GitHub user login",
+                ),
+            }
+        except BaseException as error:
+            self._close_after_termination(error)
+            raise
 
     def get_json(
         self,
@@ -4030,9 +4426,18 @@ class GitHubApiClient:
             stdout_limit=MAX_API_RESPONSE_BYTES,
         )
         try:
-            return _parse_json_bytes(payload, label=f"GitHub API {endpoint_class}")
-        except EnforcementDoctorError as error:
-            if error.reason_code != "invalid-json":
+            parsed = _parse_json_bytes(
+                payload,
+                label=f"GitHub API {endpoint_class}",
+            )
+            self._require_deadline_remaining(self.deadline, endpoint_class)
+            return parsed
+        except BaseException as error:
+            self._close_after_termination(error)
+            if (
+                not isinstance(error, EnforcementDoctorError)
+                or error.reason_code != "invalid-json"
+            ):
                 raise
             raise _blocked(
                 "api-unavailable",
