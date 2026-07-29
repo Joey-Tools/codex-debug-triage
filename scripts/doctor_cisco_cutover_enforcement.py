@@ -26,7 +26,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
 CONTRACT_SCHEMA_VERSION = 4
-COLLECTOR_SCHEMA_VERSION = 3
+COLLECTOR_SCHEMA_VERSION = 4
 DOCTOR_SCHEMA_VERSION = 5
 AUTH_HOST = "github.com"
 API_ORIGIN_HOST = "api.github.com"
@@ -62,9 +62,10 @@ GH_PROCESS_DRAIN_CHUNKS_PER_TICK = 16
 GH_TERMINATION_SIGNAL_NAMES = ("SIGHUP", "SIGINT", "SIGQUIT", "SIGTERM")
 MAX_DARWIN_ACL_BYTES = 64 * 1024
 MAX_DARWIN_ACL_ENTRIES = 128
-GH_EXECUTABLE_ENVIRONMENT_PROFILE = "minimal-snapshotted-auth-v3"
+GH_EXECUTABLE_ENVIRONMENT_PROFILE = "minimal-snapshotted-auth-v4"
 GH_EXECUTION_SOURCE = "owner-private-snapshot"
 GH_RUNTIME_COMPONENTS = (".codex", "cisco-cutover-doctor")
+GH_TRUSTED_SYSTEM_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
 CURL_EXECUTABLE = pathlib.Path("/usr/bin/curl")
 CURL_OPERATION_TIMED_OUT_EXIT_CODE = 28
 CURL_WRITE_OUT_FORMAT = (
@@ -73,6 +74,25 @@ CURL_WRITE_OUT_FORMAT = (
 CURL_TRAILER_PATTERN = re.compile(
     rb"\nCISCO_STATUS=([0-9]{3})\nCISCO_RATE=([0-9]*)\n\Z"
 )
+GRAPHQL_WORKFLOW_RUN_DEFINITION_QUERY = """\
+query WorkflowRunDefinition($id: ID!) {
+  node(id: $id) {
+    __typename
+    ... on WorkflowRun {
+      databaseId
+      event
+      file {
+        id
+        path
+        repositoryFileUrl
+        repositoryName
+      }
+      id
+      runAttempt
+    }
+  }
+}
+"""
 DARWIN_LIBSYSTEM_PATH = "/usr/lib/libSystem.B.dylib"
 DARWIN_ACL_TYPE_EXTENDED = 0x00000100
 DARWIN_ACL_EXTENDED_ALLOW = 1
@@ -325,6 +345,16 @@ def _exact_string(value: object, *, label: str) -> str:
     if type(value) is not str or not value:
         raise _blocked("invalid-evidence", f"{label} must be non-empty text")
     return value
+
+
+def _exact_graphql_node_id(value: object, *, label: str) -> str:
+    node_id = _exact_string(value, label=label)
+    if re.fullmatch(r"[A-Za-z0-9_+/=-]{1,512}", node_id) is None:
+        raise _blocked(
+            "invalid-evidence",
+            f"{label} must be a bounded GitHub GraphQL node ID",
+        )
+    return node_id
 
 
 def _exact_bool(value: object, *, label: str) -> bool:
@@ -3341,13 +3371,15 @@ class GitHubApiClient:
         ).hexdigest()
         _check_deadline(deadline_check)
         # Authentication is deliberately limited to the controlled minimal
-        # snapshot. No ambient HOME, TMPDIR, token, loader, proxy, CA, PATH, or
-        # other GH_* variables are inherited by the collector subprocess.
+        # snapshot. PATH is a fixed system-only helper interface so the macOS
+        # Keychain backend remains usable; no ambient HOME, TMPDIR, token,
+        # loader, proxy, CA, PATH, or other GH_* variables are inherited.
         self._environment = {
             "GH_CONFIG_DIR": os.fspath(self._config_snapshot_directory.path),
             "GH_NO_UPDATE_NOTIFIER": "1",
             "GH_PROMPT_DISABLED": "1",
             "LC_ALL": "C",
+            "PATH": GH_TRUSTED_SYSTEM_PATH,
         }
 
     @staticmethod
@@ -3611,9 +3643,7 @@ class GitHubApiClient:
             pinned_access_policy_before = _stable_fd_access_policy_binding(
                 self._snapshot_fd
             )
-            pinned_generation_before = _file_content_generation(
-                pinned_status_before
-            )
+            pinned_generation_before = _file_content_generation(pinned_status_before)
             pinned_path_generation_before = _file_content_generation(
                 pinned_path_status_before
             )
@@ -3711,10 +3741,7 @@ class GitHubApiClient:
                 "GitHub CLI executable could not be pinned safely",
             ) from error
         finally:
-            if (
-                snapshot_write_fd is not None
-                and not snapshot_cleanup_anchor_registered
-            ):
+            if snapshot_write_fd is not None and not snapshot_cleanup_anchor_registered:
                 try:
                     os.close(snapshot_write_fd)
                 except OSError:
@@ -4483,10 +4510,7 @@ class GitHubApiClient:
             )
             executable_cleanup_fd = self._snapshot_fd
             executable_cleanup_binding = getattr(self, "_snapshot_binding", None)
-            if (
-                executable_cleanup_fd is None
-                or executable_cleanup_binding is None
-            ):
+            if executable_cleanup_fd is None or executable_cleanup_binding is None:
                 (
                     provisional_fd,
                     provisional_binding,
@@ -4949,23 +4973,15 @@ class GitHubApiClient:
             self._close_after_termination(error)
             raise
 
-    def get_json(
+    def _request_json(
         self,
-        endpoint: str,
-        parameters: Optional[dict[str, object]] = None,
+        *,
+        endpoint_class: str,
+        method: str,
+        request_url: str,
+        request_body: Optional[bytes] = None,
     ) -> object:
         try:
-            if (
-                re.fullmatch(r"/[A-Za-z0-9._~/-]+", endpoint) is None
-                or endpoint.startswith("//")
-                or "//" in endpoint
-                or "/../" in f"{endpoint}/"
-                or "/./" in f"{endpoint}/"
-            ):
-                raise _blocked(
-                    "invalid-api-endpoint",
-                    "collector endpoint is not fixed",
-                )
             if self._snapshot_auth_header_file is None:
                 raise _blocked(
                     "blocked-authentication",
@@ -4976,25 +4992,6 @@ class GitHubApiClient:
                         failure_kind="authentication",
                     ),
                 )
-            query: list[tuple[str, str]] = []
-            for key, value in sorted((parameters or {}).items()):
-                if not re.fullmatch(r"[a-z_]+", key):
-                    raise _blocked(
-                        "invalid-api-endpoint",
-                        "collector query parameter name is not fixed",
-                    )
-                if type(value) not in (str, int, bool):
-                    raise _blocked(
-                        "invalid-api-endpoint",
-                        "collector query parameter value is invalid",
-                    )
-                rendered = str(value).lower() if type(value) is bool else str(value)
-                query.append((key, rendered))
-            endpoint_class = _api_endpoint_class(endpoint)
-            query_string = urllib.parse.urlencode(query)
-            request_url = f"{API_ROOT}{endpoint}"
-            if query_string:
-                request_url = f"{request_url}?{query_string}"
             remaining = self._require_deadline_remaining(
                 self.deadline,
                 endpoint_class,
@@ -5016,7 +5013,7 @@ class GitHubApiClient:
                 "--silent",
                 "--show-error",
                 "--request",
-                "GET",
+                method,
                 "--proto",
                 "=https",
                 "--proto-redir",
@@ -5037,11 +5034,24 @@ class GitHubApiClient:
                 f"Accept: {API_ACCEPT}",
                 "--header",
                 f"X-GitHub-Api-Version: {API_VERSION}",
-                "--write-out",
-                CURL_WRITE_OUT_FORMAT,
-                "--url",
-                request_url,
             ]
+            if request_body is not None:
+                command.extend(
+                    [
+                        "--header",
+                        "Content-Type: application/json",
+                        "--data-binary",
+                        request_body.decode("utf-8"),
+                    ]
+                )
+            command.extend(
+                [
+                    "--write-out",
+                    CURL_WRITE_OUT_FORMAT,
+                    "--url",
+                    request_url,
+                ]
+            )
             payload = self._run(
                 command,
                 endpoint_class=endpoint_class,
@@ -5116,6 +5126,72 @@ class GitHubApiClient:
                 ),
             ) from error
 
+    def get_json(
+        self,
+        endpoint: str,
+        parameters: Optional[dict[str, object]] = None,
+    ) -> object:
+        try:
+            if (
+                re.fullmatch(r"/[A-Za-z0-9._~/-]+", endpoint) is None
+                or endpoint.startswith("//")
+                or "//" in endpoint
+                or "/../" in f"{endpoint}/"
+                or "/./" in f"{endpoint}/"
+            ):
+                raise _blocked(
+                    "invalid-api-endpoint",
+                    "collector endpoint is not fixed",
+                )
+            query: list[tuple[str, str]] = []
+            for key, value in sorted((parameters or {}).items()):
+                if not re.fullmatch(r"[a-z_]+", key):
+                    raise _blocked(
+                        "invalid-api-endpoint",
+                        "collector query parameter name is not fixed",
+                    )
+                if type(value) not in (str, int, bool):
+                    raise _blocked(
+                        "invalid-api-endpoint",
+                        "collector query parameter value is invalid",
+                    )
+                rendered = str(value).lower() if type(value) is bool else str(value)
+                query.append((key, rendered))
+            query_string = urllib.parse.urlencode(query)
+            request_url = f"{API_ROOT}{endpoint}"
+            if query_string:
+                request_url = f"{request_url}?{query_string}"
+        except BaseException as error:
+            self._close_after_termination(error)
+            raise
+        return self._request_json(
+            endpoint_class=_api_endpoint_class(endpoint),
+            method="GET",
+            request_url=request_url,
+        )
+
+    def get_workflow_run_definition(self, node_id: str) -> object:
+        try:
+            normalized_node_id = _exact_graphql_node_id(
+                node_id,
+                label="workflow run GraphQL node ID",
+            )
+            request_body = _canonical_json_bytes(
+                {
+                    "query": GRAPHQL_WORKFLOW_RUN_DEFINITION_QUERY,
+                    "variables": {"id": normalized_node_id},
+                }
+            )
+        except BaseException as error:
+            self._close_after_termination(error)
+            raise
+        return self._request_json(
+            endpoint_class="workflow-run-definition",
+            method="POST",
+            request_body=request_body,
+            request_url=f"{API_ROOT}/graphql",
+        )
+
 
 def _record_object_read(
     trace: dict[str, Any],
@@ -5150,6 +5226,23 @@ def _get_object(
         endpoint=endpoint,
     )
     return value
+
+
+def _get_workflow_run_definition(
+    client: Any,
+    trace: dict[str, Any],
+    *,
+    phase: str,
+    node_id: str,
+) -> dict[str, Any]:
+    parsed = client.get_workflow_run_definition(node_id)
+    _record_object_read(
+        trace,
+        phase=phase,
+        label="selected workflow run executed file",
+        endpoint="/graphql",
+    )
+    return _normalize_workflow_run_definition(parsed)
 
 
 def _collect_pages(
@@ -5623,6 +5716,10 @@ def _normalize_run(value: dict[str, Any]) -> dict[str, Any]:
             label="workflow run HTML URL",
         ),
         "id": _exact_positive_integer(value.get("id"), label="workflow run ID"),
+        "node_id": _exact_graphql_node_id(
+            value.get("node_id"),
+            label="workflow run GraphQL node ID",
+        ),
         "jobs_url": _exact_string(
             value.get("jobs_url"),
             label="workflow run jobs URL",
@@ -5660,6 +5757,86 @@ def _normalize_run(value: dict[str, Any]) -> dict[str, Any]:
             value.get("workflow_url"),
             label="workflow run workflow URL",
         ),
+    }
+
+
+def _normalize_workflow_run_definition(value: object) -> dict[str, Any]:
+    response = _exact_dict(value, label="workflow run definition response")
+    _exact_keys(response, {"data"}, label="workflow run definition response")
+    data = _exact_dict(
+        response.get("data"),
+        label="workflow run definition response data",
+    )
+    _exact_keys(data, {"node"}, label="workflow run definition response data")
+    run = _exact_dict(data.get("node"), label="workflow run definition")
+    _exact_keys(
+        run,
+        {
+            "__typename",
+            "databaseId",
+            "event",
+            "file",
+            "id",
+            "runAttempt",
+        },
+        label="workflow run definition",
+    )
+    if run["__typename"] != "WorkflowRun":
+        raise _blocked(
+            "workflow-definition-mismatch",
+            "GraphQL node is not the selected workflow run",
+        )
+    file = _exact_dict(
+        run.get("file"),
+        label="executed workflow run file",
+    )
+    _exact_keys(
+        file,
+        {
+            "id",
+            "path",
+            "repositoryFileUrl",
+            "repositoryName",
+        },
+        label="executed workflow run file",
+    )
+    return {
+        "file": {
+            "id": _exact_graphql_node_id(
+                file.get("id"),
+                label="executed workflow file GraphQL node ID",
+            ),
+            "path": _exact_string(
+                file.get("path"),
+                label="executed workflow file path",
+            ),
+            "repository_file_url": _exact_string(
+                file.get("repositoryFileUrl"),
+                label="executed workflow repository file URL",
+            ),
+            "repository_name": _exact_string(
+                file.get("repositoryName"),
+                label="executed workflow repository name",
+            ),
+        },
+        "run": {
+            "database_id": _exact_positive_integer(
+                run.get("databaseId"),
+                label="workflow run GraphQL database ID",
+            ),
+            "event": _exact_string(
+                run.get("event"),
+                label="workflow run GraphQL event",
+            ),
+            "id": _exact_graphql_node_id(
+                run.get("id"),
+                label="workflow run GraphQL node ID",
+            ),
+            "run_attempt": _exact_positive_integer(
+                run.get("runAttempt"),
+                label="workflow run GraphQL attempt",
+            ),
+        },
     }
 
 
@@ -6267,11 +6444,26 @@ def _collect_snapshot(
                     relevant_jobs.append(_normalize_job(raw_job, run_attempt=attempt))
     relevant_run_ids = {job["run_id"] for job in relevant_jobs}
     relevant_runs = [run for run in all_runs if run["id"] in relevant_run_ids]
+    selected_definition_runs = [
+        run for run in relevant_runs if run["id"] == expected_run_id
+    ]
+    if len(selected_definition_runs) != 1:
+        raise _blocked(
+            "selected-run-attempt-missing",
+            "administrator-pinned workflow run is unavailable for definition proof",
+        )
+    workflow_run_definition = _get_workflow_run_definition(
+        client,
+        trace,
+        phase=phase,
+        node_id=selected_definition_runs[0]["node_id"],
+    )
     snapshot = dict(partial_snapshot)
     snapshot.update(
         {
             "check_runs": same_name_checks,
             "jobs": relevant_jobs,
+            "workflow_run_definition": workflow_run_definition,
             "workflow_runs": relevant_runs,
         }
     )
@@ -6467,6 +6659,114 @@ def _run_path_matches(path: str, workflow_path: str, workflow_ref: str) -> bool:
     )
 
 
+def _validate_workflow_run_definition(
+    definition_value: object,
+    *,
+    contract: dict[str, Any],
+    expected_run_attempt: int,
+    expected_run_id: int,
+    expected_workflow_sha: str,
+    selected_run: dict[str, Any],
+) -> dict[str, Any]:
+    definition = _exact_dict(
+        definition_value,
+        label="workflow run definition evidence",
+    )
+    _exact_keys(
+        definition,
+        {"file", "run"},
+        label="workflow run definition evidence",
+    )
+    run = _exact_dict(
+        definition.get("run"),
+        label="workflow run definition identity",
+    )
+    _exact_keys(
+        run,
+        {"database_id", "event", "id", "run_attempt"},
+        label="workflow run definition identity",
+    )
+    file = _exact_dict(
+        definition.get("file"),
+        label="executed workflow file identity",
+    )
+    _exact_keys(
+        file,
+        {
+            "id",
+            "path",
+            "repository_file_url",
+            "repository_name",
+        },
+        label="executed workflow file identity",
+    )
+    run = {
+        "database_id": _exact_positive_integer(
+            run["database_id"],
+            label="workflow run definition database ID",
+        ),
+        "event": _exact_string(
+            run["event"],
+            label="workflow run definition event",
+        ),
+        "id": _exact_graphql_node_id(
+            run["id"],
+            label="workflow run definition GraphQL node ID",
+        ),
+        "run_attempt": _exact_positive_integer(
+            run["run_attempt"],
+            label="workflow run definition attempt",
+        ),
+    }
+    file = {
+        "id": _exact_graphql_node_id(
+            file["id"],
+            label="executed workflow file GraphQL node ID",
+        ),
+        "path": _exact_string(
+            file["path"],
+            label="executed workflow file path",
+        ),
+        "repository_file_url": _exact_string(
+            file["repository_file_url"],
+            label="executed workflow repository file URL",
+        ),
+        "repository_name": _exact_string(
+            file["repository_name"],
+            label="executed workflow repository name",
+        ),
+    }
+    workflow_contract = contract["required_workflow"]
+    repository_name = workflow_contract["repository_full_name"]
+    workflow_path = workflow_contract["path"]
+    expected_file_url = (
+        "https://github.com/"
+        f"{urllib.parse.quote(repository_name, safe='/')}/blob/"
+        f"{expected_workflow_sha}/"
+        f"{urllib.parse.quote(workflow_path, safe='/')}"
+    )
+    if (
+        run["database_id"] != expected_run_id
+        or run["database_id"] != selected_run["id"]
+        or run["id"] != selected_run["node_id"]
+        or run["run_attempt"] != expected_run_attempt
+        or run["run_attempt"] != selected_run["run_attempt"]
+        or run["event"] != workflow_contract["event"]
+        or run["event"] != selected_run["event"]
+        or file["repository_name"] != repository_name
+        or file["path"] != workflow_path
+        or file["repository_file_url"] != expected_file_url
+    ):
+        raise _blocked(
+            "workflow-definition-mismatch",
+            "selected run did not execute the ruleset-pinned workflow file and SHA",
+        )
+    return {
+        "file": file,
+        "run": run,
+    }
+
+
 def _validate_candidate_evidence(
     snapshot: dict[str, Any],
     *,
@@ -6474,6 +6774,7 @@ def _validate_candidate_evidence(
     expected_run_attempt: int,
     expected_run_id: int,
     expected_workflow_id: int,
+    expected_workflow_sha: str,
     candidate_head_sha: str,
 ) -> dict[str, Any]:
     workflow_contract = contract["required_workflow"]
@@ -6644,6 +6945,14 @@ def _validate_candidate_evidence(
             "trusted-check-failed",
             "trusted workflow check is incomplete or not successful",
         )
+    workflow_run_definition = _validate_workflow_run_definition(
+        snapshot["workflow_run_definition"],
+        contract=contract,
+        expected_run_attempt=expected_run_attempt,
+        expected_run_id=expected_run_id,
+        expected_workflow_sha=expected_workflow_sha,
+        selected_run=run,
+    )
     selected_attempt = _exact_dict(
         snapshot["selected_run_attempt"],
         label="selected workflow run attempt",
@@ -6697,6 +7006,7 @@ def _validate_candidate_evidence(
         },
         "job": selected["job"],
         "run": selected["run"],
+        "workflow_run_definition": workflow_run_definition,
         "same_name_lineage": sorted(
             full_lineage,
             key=lambda value: (
@@ -6735,6 +7045,7 @@ def _validate_snapshot_enforcement(
             "workflow_source_repository",
             "workflow",
             "workflow_source_commit",
+            "workflow_run_definition",
             "workflow_runs",
             "jobs",
             "check_runs",
@@ -6766,6 +7077,7 @@ def _validate_snapshot_enforcement(
         expected_run_attempt=expected_run_attempt,
         expected_run_id=expected_run_id,
         expected_workflow_id=expected_workflow_id,
+        expected_workflow_sha=expected_workflow_sha,
         candidate_head_sha=candidate_head_sha,
     )
     protected = {
@@ -6778,6 +7090,7 @@ def _validate_snapshot_enforcement(
         "workflow_source_repository": snapshot["workflow_source_repository"],
         "workflow": snapshot["workflow"],
         "workflow_source_commit": snapshot["workflow_source_commit"],
+        "workflow_run_definition": trusted["workflow_run_definition"],
         "same_name_lineage": trusted["same_name_lineage"],
     }
     return {
@@ -6924,7 +7237,7 @@ def _collect_and_validate_static(
             "execution_source": getattr(client, "execution_source", "test-double"),
             "sha256": getattr(client, "executable_sha256", None),
         },
-        "mode": "live-gh-rest",
+        "mode": "live-github-rest-graphql",
         "object_reads": trace["object_reads"],
         "page_bounds": trace["page_bounds"],
         "schema_version": COLLECTOR_SCHEMA_VERSION,

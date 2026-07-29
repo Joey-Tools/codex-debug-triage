@@ -412,9 +412,12 @@ base URL, endpoint, and transport overrides are rejected rather than copied.
 The generated files are `0400` and their configuration directory becomes
 `0500` before execution. Every invocation
 uses only `LC_ALL=C`, `GH_PROMPT_DISABLED=1`,
-`GH_NO_UPDATE_NOTIFIER=1`, and the generated snapshot `GH_CONFIG_DIR`; ambient
-`PATH`, `HOME`, `TMPDIR`, token, loader, proxy, CA, and other `GH_*` variables
-are absent. `gh` is not the HTTP transport. A token already present in the
+`GH_NO_UPDATE_NOTIFIER=1`, the generated snapshot `GH_CONFIG_DIR`, and the
+fixed system-only `PATH=/usr/bin:/bin:/usr/sbin:/sbin`; ambient `PATH`, `HOME`,
+`TMPDIR`, token, loader, proxy, CA, and other `GH_*` variables are absent.
+The fixed path preserves the standard macOS Keychain helper lookup needed by
+`gh auth token` without admitting a user-controlled ambient executable
+directory. `gh` is not the HTTP transport. A token already present in the
 admitted active `github.com` mapping is copied directly into an owner-private
 `0400` header file; a keyring-only token is obtained with the sole fixed local
 command `gh auth token --hostname github.com`. The token never enters the API
@@ -431,6 +434,18 @@ root-owned, non-writable ancestor are rebound before and after the request;
 the authorization-header file is included in the same descriptor-safe
 pre/post revalidation and verified cleanup transaction as the generated
 configuration.
+
+One additional fixed GraphQL `POST` reads the selected Actions
+`WorkflowRun.file` object through the same curl, origin, header, proxy, timer,
+and no-redirect controls. The query text is a source constant and its only
+variable is the bounded node ID returned for the selected REST workflow run.
+Admission requires GraphQL's run database ID, node ID, current attempt, and
+event to equal the selected REST lineage. It also requires the executed file's
+repository and path to equal the ruleset binding and its provider-authored
+`repositoryFileUrl` to be the exact
+`https://github.com/<repository>/blob/<expected-workflow-SHA>/<path>` URL.
+This binds a successful check to the immutable workflow definition it actually
+executed instead of merely accepting the same workflow ID, path, and event.
 
 The source executable/config and snapshot path/descriptor identities, sizes,
 owners, groups, links, modes, and access-policy bindings are revalidated before
@@ -473,7 +488,9 @@ The same process:
   `pull_request_target`
 - binds the GitHub Actions provider app ID/slug, status, conclusion, workflow
   ID/path, ruleset ref/SHA, source workflow repository ID, and native API URLs;
-  the receipt also preserves GitHub's corresponding HTML URLs
+  then binds the selected run's GraphQL executed-file identity and exact
+  repository-file URL at that same SHA; the receipt also preserves GitHub's
+  corresponding HTML URLs
 - collects and validates the protected snapshot twice; organization,
   repository, PR head/base, ruleset content/scope, workflow source, or
   same-name execution-lineage changes block admission, while timestamps alone
@@ -491,16 +508,19 @@ candidate-authored duplicate cannot compensate for a red or absent trusted
 workflow run. Multiple executions or rerun attempts on the same frozen head are
 not ambiguous by themselves: the administrator must pin one exact run ID and
 its current attempt number, every collected same-name lineage must still bind
-to the trusted workflow identity, and only the pinned lineage's run, job, and
-check must be complete and successful. A later attempt supersedes an older
-attempt of the same run.
+to the trusted workflow identity and its ruleset-pinned executed-file SHA, and
+only the pinned lineage's run, job, and check must be complete and successful.
+A later attempt supersedes an older attempt of the same run. The GraphQL run
+attempt must equal that current REST attempt, so rerun selection cannot weaken
+the definition binding.
 
 The live preflight is read-only. It invokes only the local `gh auth token`
 credential lookup when the admitted config has no inline token and fixed
-GitHub REST `GET` endpoints through the no-redirect curl profile; it does not
-create, update, evaluate, disable, or delete a ruleset, rerun a workflow, post
-a comment, or mutate the PR. The active credential needs read access to the
-repository, Actions, checks, and organization ruleset metadata.
+GitHub REST `GET` endpoints plus the single fixed workflow-run GraphQL `POST`
+through the no-redirect curl profile; it does not create, update, evaluate,
+disable, or delete a ruleset, rerun a workflow, post a comment, or mutate the
+PR. The active credential needs read access to the repository, Actions,
+checks, and organization ruleset metadata.
 Authentication, permission, pagination, and API-limit failures remain
 `blocked_until_trusted`.
 

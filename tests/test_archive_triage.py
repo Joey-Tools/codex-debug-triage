@@ -2789,10 +2789,7 @@ class ArchiveTriageTests(unittest.TestCase):
                 "spec.loader.exec_module(module)",
                 "fd = sys.stderr.fileno()",
                 "original_flags = module._fcntl_get_flags(fd)",
-                (
-                    "module._fcntl_set_flags("
-                    "fd, original_flags | os.O_NONBLOCK)"
-                ),
+                ("module._fcntl_set_flags(fd, original_flags | os.O_NONBLOCK)"),
                 "try:",
                 "    while True:",
                 "        os.write(fd, b'x' * 4096)",
@@ -2860,10 +2857,7 @@ class ArchiveTriageTests(unittest.TestCase):
                     "        raise AssertionError("
                     "'worker recovery failure was not raised')"
                 ),
-                (
-                    "assert deadline._regex_spawn_state "
-                    "== module.REGEX_SPAWN_FENCED"
-                ),
+                ("assert deadline._regex_spawn_state == module.REGEX_SPAWN_FENCED"),
                 "module._emit_error(captured_error, deadline=deadline)",
                 "assert not deadline.timer_backed_diagnostics_safe()",
                 (
@@ -5596,6 +5590,8 @@ class BugTriageDocumentationTests(unittest.TestCase):
         base_sha = pull_request["base"]["sha"]
         run_url = f"{repository_api}/actions/runs/10101"
         check_url = f"{repository_api}/check-runs/20202"
+        run_node_id = "WFR_kwDOFixture10101"
+        workflow_file_node_id = "WFRF_kwDOFixture10101"
         run_started_at = "2026-07-24T12:05:00Z"
         completed_at = "2026-07-24T12:06:00Z"
         run = {
@@ -5612,6 +5608,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
                 f"https://github.com/{repository['full_name']}/actions/runs/10101"
             ),
             "id": 10101,
+            "node_id": run_node_id,
             "jobs_url": f"{run_url}/jobs",
             "path": f"{workflow['path']}@master",
             "pull_requests": [self._copy_json(pull_request_link)],
@@ -5752,6 +5749,24 @@ class BugTriageDocumentationTests(unittest.TestCase):
                     f"{self._workflow_source_commit}"
                 ),
             },
+            "workflow_run_definition": {
+                "file": {
+                    "id": workflow_file_node_id,
+                    "path": workflow["path"],
+                    "repository_file_url": (
+                        "https://github.com/"
+                        f"{workflow['repository_full_name']}/blob/"
+                        f"{self._workflow_source_commit}/{workflow['path']}"
+                    ),
+                    "repository_name": workflow["repository_full_name"],
+                },
+                "run": {
+                    "database_id": 10101,
+                    "event": workflow["event"],
+                    "id": run_node_id,
+                    "run_attempt": 1,
+                },
+            },
             "workflow_runs": [run],
             "selected_run_attempt": {
                 "id": 10101,
@@ -5816,6 +5831,28 @@ class BugTriageDocumentationTests(unittest.TestCase):
             {"values": evidence["cutover_input_variables"]}
         )["values"]
         selected_run_attempt = self._copy_json(evidence["selected_run_attempt"])
+        normalized_definition = evidence["workflow_run_definition"]
+        workflow_run_definition = {
+            "data": {
+                "node": {
+                    "__typename": "WorkflowRun",
+                    "databaseId": normalized_definition["run"]["database_id"],
+                    "event": normalized_definition["run"]["event"],
+                    "file": {
+                        "id": normalized_definition["file"]["id"],
+                        "path": normalized_definition["file"]["path"],
+                        "repositoryFileUrl": normalized_definition["file"][
+                            "repository_file_url"
+                        ],
+                        "repositoryName": normalized_definition["file"][
+                            "repository_name"
+                        ],
+                    },
+                    "id": normalized_definition["run"]["id"],
+                    "runAttempt": normalized_definition["run"]["run_attempt"],
+                }
+            }
+        }
         ruleset_summaries = [
             {
                 field: ruleset[field]
@@ -5837,9 +5874,11 @@ class BugTriageDocumentationTests(unittest.TestCase):
                 *,
                 objects: dict[str, object],
                 collections: dict[str, dict[str, object]],
+                workflow_run_definition: dict[str, object],
             ) -> None:
                 self.objects = objects
                 self.collections = collections
+                self.workflow_run_definition = workflow_run_definition
                 self.auth_calls = 0
                 self.calls: list[tuple[str, dict[str, object]]] = []
                 self.executable_sha256 = "a" * 64
@@ -5889,6 +5928,10 @@ class BugTriageDocumentationTests(unittest.TestCase):
                     "total_count": total_count,
                     item_key: copied_items,
                 }
+
+            def get_workflow_run_definition(self, node_id: str) -> object:
+                self.calls.append(("/graphql", {"id": node_id}))
+                return json.loads(json.dumps(self.workflow_run_definition))
 
         objects = {
             f"/orgs/{contract['source_organization']['login']}": evidence[
@@ -5944,6 +5987,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
         return FixtureApiClient(
             objects=objects,
             collections=collections,
+            workflow_run_definition=workflow_run_definition,
         )
 
     def _collect_live_snapshot(self, client: object) -> dict[str, object]:
@@ -6956,8 +7000,11 @@ class BugTriageDocumentationTests(unittest.TestCase):
             pull_request_number=7,
         )
 
-        self.assertEqual(receipt["schema_version"], 3)
-        self.assertEqual(receipt["collector"]["mode"], "live-gh-rest")
+        self.assertEqual(receipt["schema_version"], 4)
+        self.assertEqual(
+            receipt["collector"]["mode"],
+            "live-github-rest-graphql",
+        )
         self.assertEqual(
             receipt["collector"]["gh_executable"],
             {
@@ -7006,10 +7053,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
             },
         )
         self.assertTrue(
-            all(
-                bound["parameters"] == {"filter": "all"}
-                for bound in suite_bounds
-            )
+            all(bound["parameters"] == {"filter": "all"} for bound in suite_bounds)
         )
         check_run_bounds = [
             bound
@@ -7021,10 +7065,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
             all(bound["terminal_empty_page"] == 2 for bound in check_run_bounds)
         )
         self.assertTrue(
-            all(
-                bound["parameters"] == {"filter": "all"}
-                for bound in check_run_bounds
-            )
+            all(bound["parameters"] == {"filter": "all"} for bound in check_run_bounds)
         )
 
     def test_enforcement_live_collector_requests_all_check_suites(
@@ -7034,9 +7075,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
         target_name = "Joey-Tools/codex-debug-triage"
         base_sha = "9" * 40
         suite_endpoint = f"/repos/{target_name}/commits/{base_sha}/check-suites"
-        older_suite = self._copy_json(
-            client.collections[suite_endpoint]["pages"][0][0]
-        )
+        older_suite = self._copy_json(client.collections[suite_endpoint]["pages"][0][0])
         latest_suite = {
             "head_sha": base_sha,
             "id": 40_404,
@@ -7084,18 +7123,14 @@ class BugTriageDocumentationTests(unittest.TestCase):
             if endpoint.endswith("/check-suites")
         ]
         self.assertTrue(suite_calls)
-        self.assertTrue(
-            all(query["filter"] == "all" for query in suite_calls)
-        )
+        self.assertTrue(all(query["filter"] == "all" for query in suite_calls))
         check_run_calls = [
             query
             for endpoint, query in client.calls
             if "/check-suites/" in endpoint and endpoint.endswith("/check-runs")
         ]
         self.assertTrue(check_run_calls)
-        self.assertTrue(
-            all(query["filter"] == "all" for query in check_run_calls)
-        )
+        self.assertTrue(all(query["filter"] == "all" for query in check_run_calls))
 
     def test_enforcement_live_collector_reads_more_than_one_thousand_suites(
         self,
@@ -7187,9 +7222,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
     ) -> None:
         client = self._matching_live_api_client()
         target_name = "Joey-Tools/codex-debug-triage"
-        suite_endpoint = (
-            f"/repos/{target_name}/commits/{'9' * 40}/check-suites"
-        )
+        suite_endpoint = f"/repos/{target_name}/commits/{'9' * 40}/check-suites"
         client.collections[suite_endpoint]["pages"][0].append(
             {"head_sha": "9" * 40, "id": 40_404}
         )
@@ -7207,8 +7240,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
     ) -> None:
         client = self._matching_live_api_client()
         endpoint = (
-            "/repos/Joey-Tools/codex-debug-triage/commits/"
-            f"{'9' * 40}/check-suites"
+            f"/repos/Joey-Tools/codex-debug-triage/commits/{'9' * 40}/check-suites"
         )
 
         with (
@@ -7233,8 +7265,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
     ) -> None:
         client = self._matching_live_api_client()
         endpoint = (
-            "/repos/Joey-Tools/codex-debug-triage/commits/"
-            f"{'9' * 40}/check-suites"
+            f"/repos/Joey-Tools/codex-debug-triage/commits/{'9' * 40}/check-suites"
         )
         original_get_json = client.get_json
 
@@ -7251,9 +7282,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
             return result
 
         client.get_json = partial_get_json
-        with self.assertRaises(
-            ENFORCEMENT_MODULE.EnforcementDoctorError
-        ) as raised:
+        with self.assertRaises(ENFORCEMENT_MODULE.EnforcementDoctorError) as raised:
             ENFORCEMENT_MODULE._collect_pages(
                 client,
                 {"object_reads": [], "page_bounds": []},
@@ -8100,6 +8129,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
                             "GH_NO_UPDATE_NOTIFIER": "1",
                             "GH_PROMPT_DISABLED": "1",
                             "LC_ALL": "C",
+                            "PATH": ENFORCEMENT_MODULE.GH_TRUSTED_SYSTEM_PATH,
                         },
                     )
                     self.assertEqual(client.executable_sha256, expected_digest)
@@ -8109,7 +8139,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
                     )
                     self.assertEqual(
                         client.environment_profile,
-                        "minimal-snapshotted-auth-v3",
+                        "minimal-snapshotted-auth-v4",
                     )
                     self.assertEqual(
                         client.transport_profile,
@@ -8155,6 +8185,155 @@ class BugTriageDocumentationTests(unittest.TestCase):
                         token_output,
                         f"{SYNTHETIC_ACCESS_TOKEN}\n".encode("ascii"),
                     )
+
+    def test_enforcement_auth_uses_fixed_keychain_helper_path(
+        self,
+    ) -> None:
+        with owner_controlled_temp_root() as temp_root:
+            trusted_helper_dir = temp_root / "trusted-system-bin"
+            malicious_helper_dir = temp_root / "ambient-bin"
+            trusted_helper_dir.mkdir(mode=0o700)
+            malicious_helper_dir.mkdir(mode=0o700)
+            trusted_marker = temp_root / "trusted-security.marker"
+            malicious_marker = temp_root / "malicious-security.marker"
+
+            trusted_security = trusted_helper_dir / "security"
+            trusted_security.write_text(
+                "#!/bin/sh\n"
+                'if [ "$1" != "find-generic-password" ]; then exit 97; fi\n'
+                f"printf '%s\\n' trusted > {shlex.quote(str(trusted_marker))}\n"
+                f"printf '%s\\n' {shlex.quote(SYNTHETIC_ACCESS_TOKEN)}\n",
+                encoding="utf-8",
+            )
+            trusted_security.chmod(0o700)
+            malicious_security = malicious_helper_dir / "security"
+            malicious_security.write_text(
+                "#!/bin/sh\n"
+                f"printf '%s\\n' malicious > {shlex.quote(str(malicious_marker))}\n"
+                "exit 99\n",
+                encoding="utf-8",
+            )
+            malicious_security.chmod(0o700)
+
+            trusted_gh = temp_root / "trusted-gh"
+            trusted_payload = (
+                b"#!/bin/sh\nexec security find-generic-password -w github.com\n"
+            )
+            trusted_gh.write_bytes(trusted_payload)
+            trusted_gh.chmod(0o700)
+            config_dir, runtime_parent = self._make_private_gh_config(
+                temp_root,
+                hosts_payload=(
+                    "github.com:\n"
+                    "    git_protocol: https\n"
+                    "    users:\n"
+                    "        fixture-admin:\n"
+                    "    user: fixture-admin\n"
+                ),
+            )
+
+            with mock.patch.object(
+                ENFORCEMENT_MODULE,
+                "GH_TRUSTED_SYSTEM_PATH",
+                str(trusted_helper_dir),
+            ):
+                with mock.patch.dict(
+                    os.environ,
+                    {"PATH": str(malicious_helper_dir)},
+                    clear=False,
+                ):
+                    with ENFORCEMENT_MODULE.GitHubApiClient(
+                        trusted_gh,
+                        hashlib.sha256(trusted_payload).hexdigest(),
+                        config_dir,
+                        runtime_parent=runtime_parent,
+                    ) as client:
+                        self.assertIsNone(client._snapshot_auth_header_file)
+                        with mock.patch.object(
+                            client,
+                            "get_json",
+                            return_value={"id": 4242, "login": "fixture-admin"},
+                        ) as get_json:
+                            authenticated_user = client.auth_preflight()
+                        get_json.assert_called_once_with("/user")
+
+            self.assertEqual(
+                authenticated_user,
+                {"id": 4242, "login": "fixture-admin"},
+            )
+            self.assertTrue(trusted_marker.is_file())
+            self.assertFalse(malicious_marker.exists())
+
+    def test_enforcement_graphql_workflow_definition_query_is_fixed(
+        self,
+    ) -> None:
+        with owner_controlled_temp_root() as temp_root:
+            trusted_gh = temp_root / "trusted-gh"
+            trusted_payload = b"#!/bin/sh\nexit 0\n"
+            trusted_gh.write_bytes(trusted_payload)
+            trusted_gh.chmod(0o700)
+            config_dir, runtime_parent = self._make_private_gh_config(temp_root)
+            observed: dict[str, object] = {}
+            node_id = "WFR_kwDOFixture10101"
+
+            def graphql_result(
+                command: list[str],
+                **kwargs: object,
+            ) -> tuple[int, bytes, bytes]:
+                observed["command"] = command
+                observed["environment"] = kwargs["environment"]
+                payload = {
+                    "data": {
+                        "node": {
+                            "__typename": "WorkflowRun",
+                            "databaseId": 10101,
+                            "event": "pull_request_target",
+                            "file": {
+                                "id": "WFRF_kwDOFixture10101",
+                                "path": ".github/workflows/admission.yml",
+                                "repositoryFileUrl": (
+                                    "https://github.com/example/repo/blob/"
+                                    f"{'4' * 40}/.github/workflows/admission.yml"
+                                ),
+                                "repositoryName": "example/repo",
+                            },
+                            "id": node_id,
+                            "runAttempt": 1,
+                        }
+                    }
+                }
+                return 0, self._curl_response(json.dumps(payload).encode()), b""
+
+            with ENFORCEMENT_MODULE.GitHubApiClient(
+                trusted_gh,
+                hashlib.sha256(trusted_payload).hexdigest(),
+                config_dir,
+                runtime_parent=runtime_parent,
+            ) as client:
+                with mock.patch.object(
+                    ENFORCEMENT_MODULE,
+                    "_bounded_subprocess",
+                    side_effect=graphql_result,
+                ):
+                    response = client.get_workflow_run_definition(node_id)
+
+            self.assertEqual(response["data"]["node"]["id"], node_id)
+            command = observed["command"]
+            self.assertEqual(command[command.index("--request") + 1], "POST")
+            self.assertEqual(
+                command[command.index("--url") + 1],
+                "https://api.github.com/graphql",
+            )
+            request = json.loads(command[command.index("--data-binary") + 1])
+            self.assertEqual(request["variables"], {"id": node_id})
+            self.assertEqual(
+                request["query"],
+                ENFORCEMENT_MODULE.GRAPHQL_WORKFLOW_RUN_DEFINITION_QUERY,
+            )
+            self.assertEqual(
+                observed["environment"]["PATH"],
+                ENFORCEMENT_MODULE.GH_TRUSTED_SYSTEM_PATH,
+            )
 
     def test_enforcement_gh_pin_rejects_same_object_snapshot_rewrite(
         self,
@@ -8213,9 +8392,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
                     ENFORCEMENT_MODULE,
                     "_bounded_subprocess",
                 ) as spawned,
-                self.assertRaises(
-                    ENFORCEMENT_MODULE.EnforcementDoctorError
-                ) as raised,
+                self.assertRaises(ENFORCEMENT_MODULE.EnforcementDoctorError) as raised,
             ):
                 ENFORCEMENT_MODULE.GitHubApiClient(
                     trusted_gh,
@@ -8309,10 +8486,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
                             deadline_check: object = None,
                         ) -> bytes:
                             nonlocal expired, exercised
-                            if (
-                                label == "GitHub CLI source hosts.yml"
-                                and not exercised
-                            ):
+                            if label == "GitHub CLI source hosts.yml" and not exercised:
                                 self.assertIsNotNone(deadline_check)
                                 exercised = True
                                 expired = True
@@ -12596,6 +12770,15 @@ class BugTriageDocumentationTests(unittest.TestCase):
             f"{self._workflow_source_commit}"
         )
         evidence["workflow_runs"][0]["workflow_url"] = evidence["workflow"]["url"]
+        evidence["workflow_run_definition"]["file"].update(
+            {
+                "repository_file_url": (
+                    f"https://github.com/{source_name}/blob/"
+                    f"{self._workflow_source_commit}/{workflow['path']}"
+                ),
+                "repository_name": source_name,
+            }
+        )
         for ruleset in (
             evidence["effective_rulesets"][0],
             evidence["selected_ruleset"],
@@ -12884,6 +13067,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
         run = evidence["workflow_runs"][0]
         run["run_attempt"] = 2
         run["run_started_at"] = "2026-07-24T12:10:00Z"
+        evidence["workflow_run_definition"]["run"]["run_attempt"] = 2
         evidence["selected_run_attempt"].update(
             {
                 "run_attempt": 2,
@@ -13015,6 +13199,43 @@ class BugTriageDocumentationTests(unittest.TestCase):
                     "blocked_until_trusted",
                 )
                 self.assertEqual(outcome["reason_code"], reason_code)
+
+    def test_enforcement_doctor_binds_executed_workflow_file_to_ruleset_sha(
+        self,
+    ) -> None:
+        evidence = self._matching_enforcement_evidence()
+
+        admission = self._validate_static_enforcement(evidence)
+        self.assertEqual(
+            admission["protected"]["workflow_run_definition"],
+            evidence["workflow_run_definition"],
+        )
+
+        cases = {
+            "stale-definition-sha": lambda value: value["workflow_run_definition"][
+                "file"
+            ].update(
+                {
+                    "repository_file_url": value["workflow_run_definition"]["file"][
+                        "repository_file_url"
+                    ].replace(self._workflow_source_commit, "5" * 40)
+                }
+            ),
+            "wrong-rerun-attempt": lambda value: value["workflow_run_definition"][
+                "run"
+            ].update({"run_attempt": 2}),
+        }
+        for label, mutate in cases.items():
+            with self.subTest(definition=label):
+                mismatched = self._copy_json(evidence)
+                mutate(mismatched)
+                result = self._run_enforcement_doctor(mismatched)
+
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertEqual(
+                    json.loads(result.stdout)["reason_code"],
+                    "workflow-definition-mismatch",
+                )
 
     def test_enforcement_doctor_rejects_mutable_or_wrong_workflow_binding(
         self,

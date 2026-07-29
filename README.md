@@ -81,6 +81,9 @@ the group mode bits and repeats that check after each owner-only `fchmod`;
 other platforms fail closed rather than claiming Darwin ACL coverage.
 Only the active `github.com` authentication entry enters the generated
 configuration snapshot, whose global config contains no transport redirect.
+Credential lookup receives only the fixed system helper path
+`/usr/bin:/bin:/usr/sbin:/sbin`, so the macOS Keychain backend remains
+available without inheriting an ambient executable directory.
 Source and snapshot identities and access policy are revalidated before and
 after each invocation and before admission. Content receipts bind the exact
 SHA-256 to descriptor/path identity plus size, `mtime_ns`, and `ctime_ns`;
@@ -115,6 +118,9 @@ suite with `filter=all`, with aggregate suite/run capacities, unique IDs, exact
 head/suite linkage, stable totals, and explicit empty terminal pages required
 before same-name lineage is called complete. Older or additional same-name
 lineage is allowed only when it comes from the same trusted workflow identity.
+For the selected run, one fixed GraphQL query also binds the provider-authored
+executed workflow repository, path, current attempt, and exact repository-file
+URL at the ruleset-pinned workflow SHA.
 Sanitized failures
 retain a fixed endpoint class, HTTP status when available, and stable reason
 code without raw response bodies, headers, environment, or tokens. Fixed curl
