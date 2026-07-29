@@ -6129,7 +6129,7 @@ def _collect_snapshot(
             phase=phase,
             label=f"selected PR {check_head_sha} check suites",
             endpoint=f"/repos/{target_name}/commits/{check_head_sha}/check-suites",
-            parameters={},
+            parameters={"filter": "all"},
             item_key="check_suites",
             result_cap=MAX_CHECK_SUITES,
         )

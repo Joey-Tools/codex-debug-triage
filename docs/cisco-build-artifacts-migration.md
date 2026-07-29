@@ -460,10 +460,10 @@ The same process:
   pinned source commit
 - lists every effective target-repository ruleset with
   `includes_parents=true`; fully paginates every check suite for both the frozen
-  PR head and the `pull_request_target` base commit without an app filter; then
-  fully paginates every check run for each discovered suite with `filter=all`,
-  every workflow run for each selected-PR same-name check-suite ID, and every
-  job for every observed run attempt
+  PR head and the `pull_request_target` base commit with `filter=all` and no app
+  filter; then fully paginates every check run for each discovered suite with
+  `filter=all`, every workflow run for each selected-PR same-name check-suite
+  ID, and every job for every observed run attempt
 - uses `per_page=100`, continues even after a short non-empty page, and stops
   only after requesting an explicit empty terminal page; object endpoints and
   page bounds are recorded in the receipt

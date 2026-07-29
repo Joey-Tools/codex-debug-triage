@@ -109,12 +109,13 @@ check run. Pointer admission additionally requires an exact authority
 repository/workflow/run/current-attempt/artifact locator and twice-stable live
 reads of the scoped current state and active merge lease; artifact name or
 latest-run discovery is not an authority. For both the frozen PR head and its
-`pull_request_target` base, it first fully paginates check suites and then fully
-paginates the check runs of every suite, with aggregate suite/run capacities,
-unique IDs, exact head/suite linkage, stable totals, and explicit empty terminal
-pages required before same-name lineage is called complete. Older or additional
-same-name lineage is allowed only when it comes from the same trusted workflow
-identity. Sanitized failures
+`pull_request_target` base, it first fully paginates check suites with
+`filter=all` and no app filter, then fully paginates the check runs of every
+suite with `filter=all`, with aggregate suite/run capacities, unique IDs, exact
+head/suite linkage, stable totals, and explicit empty terminal pages required
+before same-name lineage is called complete. Older or additional same-name
+lineage is allowed only when it comes from the same trusted workflow identity.
+Sanitized failures
 retain a fixed endpoint class, HTTP status when available, and stable reason
 code without raw response bodies, headers, environment, or tokens. Fixed curl
 exit 28 is classified as `api-timeout`, including when curl's own timeout

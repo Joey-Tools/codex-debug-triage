@@ -6855,7 +6855,12 @@ class BugTriageDocumentationTests(unittest.TestCase):
                 ),
             },
         )
-        self.assertTrue(all(bound["parameters"] == {} for bound in suite_bounds))
+        self.assertTrue(
+            all(
+                bound["parameters"] == {"filter": "all"}
+                for bound in suite_bounds
+            )
+        )
         check_run_bounds = [
             bound
             for bound in receipt["collector"]["page_bounds"]
@@ -6864,6 +6869,82 @@ class BugTriageDocumentationTests(unittest.TestCase):
         self.assertEqual(len(check_run_bounds), 2)
         self.assertTrue(
             all(bound["terminal_empty_page"] == 2 for bound in check_run_bounds)
+        )
+        self.assertTrue(
+            all(
+                bound["parameters"] == {"filter": "all"}
+                for bound in check_run_bounds
+            )
+        )
+
+    def test_enforcement_live_collector_requests_all_check_suites(
+        self,
+    ) -> None:
+        client = self._matching_live_api_client()
+        target_name = "Joey-Tools/codex-debug-triage"
+        base_sha = "9" * 40
+        suite_endpoint = f"/repos/{target_name}/commits/{base_sha}/check-suites"
+        older_suite = self._copy_json(
+            client.collections[suite_endpoint]["pages"][0][0]
+        )
+        latest_suite = {
+            "head_sha": base_sha,
+            "id": 40_404,
+        }
+        client.collections[suite_endpoint]["pages"] = [
+            [latest_suite, older_suite],
+        ]
+        client.collections[
+            f"/repos/{target_name}/check-suites/{latest_suite['id']}/check-runs"
+        ] = {
+            "item_key": "check_runs",
+            "pages": [[]],
+        }
+        original_get_json = client.get_json
+
+        def filter_sensitive_get_json(
+            endpoint: str,
+            parameters: dict[str, object] | None = None,
+        ) -> object:
+            query = dict(parameters or {})
+            if endpoint == suite_endpoint and query.get("filter", "latest") != "all":
+                page_items = [latest_suite] if query["page"] == 1 else []
+                return {
+                    "total_count": 1,
+                    "check_suites": self._copy_json(page_items),
+                }
+            return original_get_json(endpoint, parameters)
+
+        client.get_json = filter_sensitive_get_json
+        default_page = client.get_json(
+            suite_endpoint,
+            {"page": 1, "per_page": ENFORCEMENT_MODULE.API_PER_PAGE},
+        )
+        self.assertEqual(
+            [suite["id"] for suite in default_page["check_suites"]],
+            [latest_suite["id"]],
+        )
+
+        snapshot = self._collect_live_snapshot(client)
+
+        self.assertEqual([check["id"] for check in snapshot["check_runs"]], [20202])
+        suite_calls = [
+            query
+            for endpoint, query in client.calls
+            if endpoint.endswith("/check-suites")
+        ]
+        self.assertTrue(suite_calls)
+        self.assertTrue(
+            all(query["filter"] == "all" for query in suite_calls)
+        )
+        check_run_calls = [
+            query
+            for endpoint, query in client.calls
+            if "/check-suites/" in endpoint and endpoint.endswith("/check-runs")
+        ]
+        self.assertTrue(check_run_calls)
+        self.assertTrue(
+            all(query["filter"] == "all" for query in check_run_calls)
         )
 
     def test_enforcement_live_collector_reads_more_than_one_thousand_suites(
