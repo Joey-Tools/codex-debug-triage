@@ -1504,7 +1504,13 @@ def _fixed_curl_trust_binding(
         ):
             raise _blocked(
                 "collector-unavailable",
-                "fixed curl trust-root directory is replaceable",
+                "fixed curl trust-root directory is replaceable: "
+                f"path={directory} "
+                f"uid={directory_status.st_uid} "
+                f"gid={directory_status.st_gid} "
+                f"mode={stat.S_IMODE(directory_status.st_mode):04o} "
+                f"is_directory={stat.S_ISDIR(directory_status.st_mode)} "
+                f"is_symlink={stat.S_ISLNK(directory_status.st_mode)}",
             )
 
     flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)

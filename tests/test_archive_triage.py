@@ -12354,6 +12354,36 @@ class BugTriageDocumentationTests(unittest.TestCase):
         spawned.assert_called_once()
         self.assertEqual(response["login"], "linux-fixture")
 
+    def test_enforcement_fixed_curl_reports_replaceable_trust_root_identity(
+        self,
+    ) -> None:
+        root_status_fields = list(os.lstat("/"))
+        root_status_fields[0] = stat.S_IFDIR | 0o775
+        root_status_fields[4] = 0
+        root_status_fields[5] = 0
+        replaceable_root = os.stat_result(root_status_fields)
+
+        with mock.patch.object(
+            ENFORCEMENT_MODULE.os,
+            "lstat",
+            return_value=replaceable_root,
+        ):
+            with self.assertRaises(ENFORCEMENT_MODULE.EnforcementDoctorError) as raised:
+                ENFORCEMENT_MODULE._fixed_curl_trust_binding()
+
+        self.assertEqual(
+            raised.exception.reason_code,
+            "collector-unavailable",
+        )
+        self.assertEqual(
+            str(raised.exception),
+            (
+                "fixed curl trust-root directory is replaceable: "
+                "path=/ uid=0 gid=0 mode=0775 "
+                "is_directory=True is_symlink=False"
+            ),
+        )
+
     def test_enforcement_gh_pin_rejects_initial_digest_mismatch(self) -> None:
         with owner_controlled_temp_root() as temp_root:
             trusted_gh = temp_root / "trusted-gh"
