@@ -12719,6 +12719,28 @@ class BugTriageDocumentationTests(unittest.TestCase):
     def test_enforcement_gh_linux_host_fixed_curl_policy_is_enforced(
         self,
     ) -> None:
+        fixed_curl = ENFORCEMENT_MODULE.CURL_EXECUTABLE
+        directory_chain = [Path("/")]
+        current = Path("/")
+        for component in fixed_curl.parts[1:-1]:
+            current /= component
+            directory_chain.append(current)
+        directory_statuses = [
+            os.stat(path, follow_symlinks=False) for path in directory_chain
+        ]
+        file_status = os.stat(fixed_curl, follow_symlinks=False)
+        host_chain_is_safe = all(
+            stat.S_ISDIR(status.st_mode)
+            and status.st_uid == 0
+            and stat.S_IMODE(status.st_mode) & 0o022 == 0
+            for status in directory_statuses
+        ) and (
+            stat.S_ISREG(file_status.st_mode)
+            and file_status.st_uid == 0
+            and stat.S_IMODE(file_status.st_mode) & 0o022 == 0
+            and stat.S_IMODE(file_status.st_mode) & 0o111 != 0
+        )
+
         with owner_controlled_temp_root() as temp_root:
             trusted_gh = temp_root / "trusted-gh"
             trusted_payload = b"#!/bin/sh\nexit 0\n"
@@ -12755,6 +12777,10 @@ class BugTriageDocumentationTests(unittest.TestCase):
                     ) as client:
                         response = client.get_json("/user")
                 except ENFORCEMENT_MODULE.EnforcementDoctorError as error:
+                    self.assertFalse(
+                        host_chain_is_safe,
+                        f"independently safe fixed-curl chain was rejected: {error}",
+                    )
                     self.assertEqual(error.reason_code, "collector-unavailable")
                     self.assertRegex(
                         str(error),
@@ -12766,6 +12792,10 @@ class BugTriageDocumentationTests(unittest.TestCase):
                     )
                     spawned.assert_not_called()
                 else:
+                    self.assertTrue(
+                        host_chain_is_safe,
+                        "independently unsafe fixed-curl chain was accepted",
+                    )
                     spawned.assert_called_once()
                     self.assertEqual(response["login"], "linux-fixture")
 
