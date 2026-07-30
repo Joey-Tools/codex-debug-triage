@@ -61,4 +61,5 @@ jobs:
             tests.test_archive_triage.BugTriageDocumentationTests.test_enforcement_gh_acl_rejects_inherited_source_token_read_grant \
             tests.test_archive_triage.BugTriageDocumentationTests.test_enforcement_gh_acl_drift_discards_command_output \
             tests.test_archive_triage.BugTriageDocumentationTests.test_enforcement_gh_acl_restrictive_deny_churn_is_benign \
-            tests.test_archive_triage.BugTriageDocumentationTests.test_enforcement_gh_acl_drift_is_revalidated_after_spawn_failure
+            tests.test_archive_triage.BugTriageDocumentationTests.test_enforcement_gh_acl_drift_is_revalidated_after_spawn_failure \
+            tests.test_archive_triage.BugTriageDocumentationTests.test_enforcement_fixed_curl_rejects_directory_acl_with_safe_mode
