@@ -485,11 +485,19 @@ endpoint and typed query. The argv starts with `--disable`, disables proxy use,
 admits only HTTPS, contains neither `--location` nor `--location-trusted`, and
 sets `--max-redirs 0`. Therefore every `300` through `399` response is terminal:
 the doctor neither parses nor follows `Location`, regardless of same-host,
-cross-host, scheme, port, or multi-hop shape. The curl executable and each
-root-owned, non-writable ancestor are rebound before and after the request;
-the authorization-header file is included in the same descriptor-safe
-pre/post revalidation and verified cleanup transaction as the generated
-configuration.
+cross-host, scheme, port, or multi-hop shape. The curl executable and every
+ancestor from `/` through `/usr/bin` are opened by descriptor-relative,
+no-follow traversal. Their exact object identities, root ownership, mode
+policy, and descriptor ACL policies are bound before `Popen`, revalidated
+immediately after `Popen` returns, and retained through final request
+revalidation. On Darwin, only `ENOENT` from `acl_get_fd_np` proves that an
+extended ACL is absent; unsupported, unreadable, and every other query failure
+fail closed. An extended allow on an ancestor is rejected even when its mode is
+`0755`. The retained descriptors do not claim to pin bytes already mapped by
+`exec`; under the admitted access policy they prove that a non-owner could not
+replace the curl path during the launch window. The authorization-header file
+is included in the same descriptor-safe pre/post revalidation and verified
+cleanup transaction as the generated configuration.
 
 One additional fixed GraphQL `POST` reads the selected Actions
 `WorkflowRun.file` object through the same curl, origin, header, proxy, timer,

@@ -1479,74 +1479,6 @@ def _file_status(status_value: os.stat_result) -> dict[str, int]:
     }
 
 
-def _fixed_curl_trust_binding(
-    *,
-    deadline_check: Callable[[], None] | None = None,
-) -> tuple[dict[str, int], tuple[str, int, str]]:
-    for directory in (
-        pathlib.Path("/"),
-        pathlib.Path("/usr"),
-        CURL_EXECUTABLE.parent,
-    ):
-        _check_deadline(deadline_check)
-        try:
-            directory_status = os.lstat(directory)
-        except OSError as error:
-            raise _blocked(
-                "collector-unavailable",
-                "fixed curl trust-root directory is unavailable",
-            ) from error
-        if (
-            stat.S_ISLNK(directory_status.st_mode)
-            or not stat.S_ISDIR(directory_status.st_mode)
-            or directory_status.st_uid != 0
-            or stat.S_IMODE(directory_status.st_mode) & 0o022
-        ):
-            raise _blocked(
-                "collector-unavailable",
-                "fixed curl trust-root directory is replaceable: "
-                f"path={directory} "
-                f"uid={directory_status.st_uid} "
-                f"gid={directory_status.st_gid} "
-                f"mode={stat.S_IMODE(directory_status.st_mode):04o} "
-                f"is_directory={stat.S_ISDIR(directory_status.st_mode)} "
-                f"is_symlink={stat.S_ISLNK(directory_status.st_mode)}",
-            )
-
-    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
-    descriptor: int | None = None
-    try:
-        _check_deadline(deadline_check)
-        descriptor = os.open(CURL_EXECUTABLE, flags)
-        descriptor_status = os.fstat(descriptor)
-        path_status = os.lstat(CURL_EXECUTABLE)
-        access_policy = _stable_fd_access_policy_binding(descriptor)
-        _check_deadline(deadline_check)
-    except EnforcementDoctorError:
-        raise
-    except OSError as error:
-        raise _blocked(
-            "collector-unavailable",
-            "fixed curl transport is unavailable",
-        ) from error
-    finally:
-        if descriptor is not None:
-            os.close(descriptor)
-    if (
-        not stat.S_ISREG(descriptor_status.st_mode)
-        or not stat.S_ISREG(path_status.st_mode)
-        or descriptor_status.st_uid != 0
-        or stat.S_IMODE(descriptor_status.st_mode) & 0o022
-        or stat.S_IMODE(descriptor_status.st_mode) & 0o111 == 0
-        or _file_status(descriptor_status) != _file_status(path_status)
-    ):
-        raise _blocked(
-            "collector-unavailable",
-            "fixed curl transport identity or access policy is invalid",
-        )
-    return _file_status(descriptor_status), access_policy
-
-
 def _object_identity(status_value: os.stat_result) -> tuple[int, int]:
     return (status_value.st_dev, status_value.st_ino)
 
@@ -1626,6 +1558,9 @@ class _DarwinAclRuntime:
         acl = self._libc.acl_get_fd_np(fd, DARWIN_ACL_TYPE_EXTENDED)
         if not acl:
             error_number = ctypes.get_errno()
+            # Darwin reports ENOENT when this descriptor has no extended ACL.
+            # ENOTSUP, EACCES, and every other query failure are not evidence
+            # of absence and therefore fail closed.
             if error_number == errno.ENOENT:
                 return (
                     DARWIN_ACL_PROFILE,
@@ -1759,6 +1694,322 @@ def _stable_fd_access_policy_binding(fd: int) -> tuple[str, int, str]:
             "descriptor access policy changed while it was inspected",
         )
     return first
+
+
+def _fixed_curl_directory_status_is_safe(status_value: os.stat_result) -> bool:
+    return (
+        stat.S_ISDIR(status_value.st_mode)
+        and status_value.st_uid == 0
+        and stat.S_IMODE(status_value.st_mode) & 0o022 == 0
+    )
+
+
+def _fixed_curl_file_status_is_safe(status_value: os.stat_result) -> bool:
+    mode = stat.S_IMODE(status_value.st_mode)
+    return (
+        stat.S_ISREG(status_value.st_mode)
+        and status_value.st_uid == 0
+        and mode & 0o022 == 0
+        and mode & 0o111 != 0
+    )
+
+
+class _FixedCurlTrustBinding:
+    """Retain the fixed curl namespace and policy through process launch.
+
+    The protected property is the exact object identity of every directory
+    component and the executable, plus an access policy that excludes
+    non-owner mutation. The retained descriptors do not pin bytes already
+    mapped by exec; they prove that, under the accepted root-owned policy, an
+    untrusted principal could not replace the path during the launch window.
+    """
+
+    def __init__(
+        self,
+        *,
+        executable: pathlib.Path | None = None,
+        deadline_check: Callable[[], None] | None = None,
+    ) -> None:
+        self.executable = CURL_EXECUTABLE if executable is None else executable
+        self._deadline_check = deadline_check
+        self._directory_fds: list[int] = []
+        self._directory_bindings: list[dict[str, int]] = []
+        self._directory_access_policies: list[tuple[str, int, str]] = []
+        self._directory_relations: list[tuple[int, str, int]] = []
+        self._file_fd: int | None = None
+        self._file_binding: dict[str, int] | None = None
+        self._file_access_policy: tuple[str, int, str] | None = None
+        self._closed = False
+        if (
+            not self.executable.is_absolute()
+            or self.executable == pathlib.Path("/")
+            or any(part in ("", ".", "..") for part in self.executable.parts[1:])
+            or len(self.executable.parts) < 2
+        ):
+            raise _blocked(
+                "collector-unavailable",
+                "fixed curl transport path must be normalized and absolute",
+            )
+        missing_flags = [
+            name
+            for name in ("O_DIRECTORY", "O_NOFOLLOW", "O_NONBLOCK")
+            if not hasattr(os, name)
+        ]
+        if missing_flags:
+            raise _blocked(
+                "collector-unavailable",
+                "fixed curl descriptor-walk flags are unavailable",
+            )
+        directory_flags = (
+            os.O_RDONLY
+            | os.O_DIRECTORY
+            | os.O_NOFOLLOW
+            | os.O_NONBLOCK
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+        file_flags = (
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
+        )
+        try:
+            _check_deadline(deadline_check)
+            root_fd = os.open("/", directory_flags)
+            self._directory_fds.append(root_fd)
+            self._bind_directory(
+                root_fd,
+                pathlib.Path("/"),
+                deadline_check=deadline_check,
+            )
+            parent_fd = root_fd
+            current_path = pathlib.Path("/")
+            for component in self.executable.parts[1:-1]:
+                _check_deadline(deadline_check)
+                child_fd = os.open(component, directory_flags, dir_fd=parent_fd)
+                self._directory_fds.append(child_fd)
+                current_path /= component
+                self._bind_directory(
+                    child_fd,
+                    current_path,
+                    deadline_check=deadline_check,
+                )
+                child_path_status = os.stat(
+                    component,
+                    dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+                if _directory_status(child_path_status) != self._directory_bindings[-1]:
+                    raise _blocked(
+                        "collector-unavailable",
+                        "fixed curl trust-root directory identity is unstable",
+                    )
+                self._directory_relations.append((parent_fd, component, child_fd))
+                parent_fd = child_fd
+
+            _check_deadline(deadline_check)
+            file_name = self.executable.name
+            file_fd = os.open(file_name, file_flags, dir_fd=parent_fd)
+            self._file_fd = file_fd
+            descriptor_status = os.fstat(file_fd)
+            path_status = os.stat(
+                file_name,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+            access_policy = _stable_fd_access_policy_binding(file_fd)
+            _check_deadline(deadline_check)
+            if not _fixed_curl_file_status_is_safe(descriptor_status) or _file_status(
+                descriptor_status
+            ) != _file_status(path_status):
+                raise _blocked(
+                    "collector-unavailable",
+                    "fixed curl transport identity or access policy is invalid",
+                )
+            self._file_binding = _file_status(descriptor_status)
+            self._file_access_policy = access_policy
+            self.receipt = self._receipt()
+            self.revalidate(deadline_check=deadline_check)
+        except EnforcementDoctorError as error:
+            cleanup_errors = self.close()
+            if cleanup_errors:
+                raise error from self._cleanup_error()
+            raise
+        except OSError as error:
+            primary = _blocked(
+                "collector-unavailable",
+                "fixed curl transport or ancestor cannot be bound safely",
+            )
+            cleanup_errors = self.close()
+            if cleanup_errors:
+                raise primary from self._cleanup_error()
+            raise primary from error
+        except BaseException as error:
+            cleanup_errors = self.close()
+            if cleanup_errors:
+                raise error from self._cleanup_error()
+            raise
+
+    def _bind_directory(
+        self,
+        fd: int,
+        path: pathlib.Path,
+        *,
+        deadline_check: Callable[[], None] | None,
+    ) -> None:
+        descriptor_status = os.fstat(fd)
+        if not _fixed_curl_directory_status_is_safe(descriptor_status):
+            raise _blocked(
+                "collector-unavailable",
+                "fixed curl trust-root directory is replaceable: "
+                f"path={path} "
+                f"uid={descriptor_status.st_uid} "
+                f"gid={descriptor_status.st_gid} "
+                f"mode={stat.S_IMODE(descriptor_status.st_mode):04o} "
+                f"is_directory={stat.S_ISDIR(descriptor_status.st_mode)} "
+                "is_symlink=False",
+            )
+        access_policy = _stable_fd_access_policy_binding(fd)
+        _check_deadline(deadline_check)
+        self._directory_bindings.append(_directory_status(descriptor_status))
+        self._directory_access_policies.append(access_policy)
+
+    def _receipt(self) -> tuple[object, ...]:
+        if self._file_binding is None or self._file_access_policy is None:
+            raise self._inconclusive()
+        return (
+            tuple(
+                tuple(sorted(binding.items())) for binding in self._directory_bindings
+            ),
+            tuple(self._directory_access_policies),
+            tuple(sorted(self._file_binding.items())),
+            self._file_access_policy,
+        )
+
+    def revalidate(
+        self,
+        *,
+        deadline_check: Callable[[], None] | None = None,
+    ) -> None:
+        if deadline_check is None:
+            deadline_check = self._deadline_check
+        _check_deadline(deadline_check)
+        if (
+            self._closed
+            or not self._directory_fds
+            or self._file_fd is None
+            or self._file_binding is None
+            or self._file_access_policy is None
+        ):
+            raise self._inconclusive()
+        try:
+            for fd, expected, expected_access_policy in zip(
+                self._directory_fds,
+                self._directory_bindings,
+                self._directory_access_policies,
+            ):
+                _check_deadline(deadline_check)
+                current = os.fstat(fd)
+                if (
+                    not _fixed_curl_directory_status_is_safe(current)
+                    or _directory_status(current) != expected
+                    or _stable_fd_access_policy_binding(fd) != expected_access_policy
+                ):
+                    raise self._inconclusive()
+            for relation, expected in zip(
+                self._directory_relations,
+                self._directory_bindings[1:],
+            ):
+                _check_deadline(deadline_check)
+                parent_fd, component, child_fd = relation
+                child_descriptor = os.fstat(child_fd)
+                child_path = os.stat(
+                    component,
+                    dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+                if (
+                    _directory_status(child_descriptor) != expected
+                    or _directory_status(child_path) != expected
+                ):
+                    raise self._inconclusive()
+            file_descriptor = os.fstat(self._file_fd)
+            file_path = os.stat(
+                self.executable.name,
+                dir_fd=self._directory_fds[-1],
+                follow_symlinks=False,
+            )
+            if (
+                not _fixed_curl_file_status_is_safe(file_descriptor)
+                or _file_status(file_descriptor) != self._file_binding
+                or _file_status(file_path) != self._file_binding
+                or _stable_fd_access_policy_binding(self._file_fd)
+                != self._file_access_policy
+            ):
+                raise self._inconclusive()
+            _check_deadline(deadline_check)
+        except EnforcementDoctorError:
+            raise
+        except OSError as error:
+            raise self._inconclusive() from error
+
+    def _inconclusive(self) -> EnforcementDoctorError:
+        return _blocked(
+            "collector-inconclusive",
+            "fixed curl transport identity or access policy changed",
+        )
+
+    @staticmethod
+    def _cleanup_error() -> EnforcementDoctorError:
+        return _blocked(
+            "collector-inconclusive",
+            "fixed curl trust descriptors could not be closed safely",
+            cleanup_failure={
+                "cleanup_proof": "inconclusive",
+                "failed_operations": ["close-fixed-curl-trust-descriptor"],
+            },
+        )
+
+    def close(self) -> list[OSError]:
+        if self._closed:
+            return []
+        self._closed = True
+        errors: list[OSError] = []
+        file_fd = self._file_fd
+        self._file_fd = None
+        if file_fd is not None:
+            try:
+                os.close(file_fd)
+            except OSError as error:
+                errors.append(error)
+        for fd in reversed(self._directory_fds):
+            try:
+                os.close(fd)
+            except OSError as error:
+                errors.append(error)
+        self._directory_fds = []
+        return errors
+
+    def __enter__(self) -> _FixedCurlTrustBinding:
+        return self
+
+    def __exit__(
+        self,
+        exception_type: object,
+        exception: BaseException | None,
+        traceback: object,
+    ) -> bool:
+        cleanup_errors = self.close()
+        if not cleanup_errors:
+            return False
+        cleanup_error = self._cleanup_error()
+        if exception is not None:
+            raise exception.with_traceback(traceback) from cleanup_error
+        raise cleanup_error from cleanup_errors[0]
+
+
+def _fixed_curl_trust_binding(
+    *,
+    deadline_check: Callable[[], None] | None = None,
+) -> _FixedCurlTrustBinding:
+    return _FixedCurlTrustBinding(deadline_check=deadline_check)
 
 
 def _require_safe_directory_status(
@@ -2977,6 +3228,7 @@ def _bounded_subprocess_supervised(
     stdout_limit: int,
     stderr_limit: int,
     absolute_deadline: float | None = None,
+    process_launch_binding: _FixedCurlTrustBinding | None = None,
 ) -> tuple[int, bytes, bytes]:
     if os.name == "posix":
         try:
@@ -3003,6 +3255,13 @@ def _bounded_subprocess_supervised(
                 failure_kind="timeout",
             ),
         )
+    if process_launch_binding is not None:
+        if not command or command[0] != os.fspath(process_launch_binding.executable):
+            raise _blocked(
+                "collector-unavailable",
+                "fixed curl launch binding does not match the process executable",
+            )
+        process_launch_binding.revalidate()
     try:
         process = subprocess.Popen(
             command,
@@ -3031,6 +3290,8 @@ def _bounded_subprocess_supervised(
             raise OSError("collector process identity is already registered")
         process_registry[process.pid] = managed
         process_registered(managed)
+        if process_launch_binding is not None:
+            process_launch_binding.revalidate()
         chunks: dict[str, list[bytes]] = {"stdout": [], "stderr": []}
         retained: dict[str, int] = {"stdout": 0, "stderr": 0}
         deadline = time.monotonic() + timeout_seconds
@@ -3212,6 +3473,7 @@ def _bounded_subprocess(
     termination_cleanup: Callable[[], None] | None = None,
     lifecycle_signal_guard: _TerminationSignalGuard | None = None,
     absolute_deadline: float | None = None,
+    process_launch_binding: _FixedCurlTrustBinding | None = None,
 ) -> tuple[int, bytes, bytes]:
     owns_signal_guard = lifecycle_signal_guard is None
     signal_guard = lifecycle_signal_guard or _TerminationSignalGuard()
@@ -3266,6 +3528,7 @@ def _bounded_subprocess(
                 stdout_limit=stdout_limit,
                 stderr_limit=stderr_limit,
                 absolute_deadline=absolute_deadline,
+                process_launch_binding=process_launch_binding,
             )
         except BaseException as error:
             primary_error = error
@@ -3385,6 +3648,7 @@ class GitHubApiClient:
         self._snapshot_access_policy_binding: Optional[tuple[str, int, str]] = None
         self._source_content_generation: Optional[tuple[int, int, int]] = None
         self._snapshot_content_generation: Optional[tuple[int, int, int]] = None
+        self._curl_trust_receipt: tuple[object, ...] | None = None
         self._termination_signal_guard = _TerminationSignalGuard()
         self._termination_transaction_finished = False
         self._termination_transaction_finishing = False
@@ -3460,9 +3724,10 @@ class GitHubApiClient:
                 deadline_check=initialization_check,
             )
             initialization_check()
-            self._curl_trust_binding = _fixed_curl_trust_binding(
+            with _fixed_curl_trust_binding(
                 deadline_check=initialization_check,
-            )
+            ) as curl_binding:
+                self._curl_trust_receipt = curl_binding.receipt
             initialization_check()
             self._config_snapshot_directory.set_owner_mode(
                 0o500,
@@ -5085,6 +5350,7 @@ class GitHubApiClient:
         endpoint_class: str,
         stdout_limit: int,
         authentication_preflight: bool = False,
+        process_launch_binding: _FixedCurlTrustBinding | None = None,
     ) -> bytes:
         self._activate_termination_transaction()
         try:
@@ -5125,6 +5391,7 @@ class GitHubApiClient:
                         None,
                     ),
                     absolute_deadline=self.deadline,
+                    process_launch_binding=process_launch_binding,
                 )
             except BaseException as error:
                 self._close_after_termination(error)
@@ -5163,6 +5430,36 @@ class GitHubApiClient:
         except BaseException as error:
             self._close_after_termination(error)
             raise
+
+    def _run_fixed_curl(
+        self,
+        command: list[str],
+        *,
+        endpoint_class: str,
+        stdout_limit: int,
+    ) -> bytes:
+        def deadline_check() -> None:
+            self._require_deadline_remaining(self.deadline, endpoint_class)
+
+        with _fixed_curl_trust_binding(
+            deadline_check=deadline_check,
+        ) as curl_binding:
+            if (
+                self._curl_trust_receipt is None
+                or curl_binding.receipt != self._curl_trust_receipt
+            ):
+                raise _blocked(
+                    "collector-inconclusive",
+                    "fixed curl transport identity or access policy changed",
+                )
+            payload = self._run(
+                command,
+                endpoint_class=endpoint_class,
+                stdout_limit=stdout_limit,
+                process_launch_binding=curl_binding,
+            )
+            curl_binding.revalidate(deadline_check=deadline_check)
+            return payload
 
     def _install_authentication_header(self, token_output: bytes) -> None:
         if self._snapshot_auth_header_file is not None:
@@ -5271,12 +5568,6 @@ class GitHubApiClient:
                 self.deadline,
                 endpoint_class,
             )
-            curl_binding_before = _fixed_curl_trust_binding()
-            if curl_binding_before != self._curl_trust_binding:
-                raise _blocked(
-                    "collector-inconclusive",
-                    "fixed curl transport identity or access policy changed",
-                )
             header_path = (
                 self._transport_directory.path / "authorization.headers"
                 if self._transport_directory is not None
@@ -5327,17 +5618,11 @@ class GitHubApiClient:
                     request_url,
                 ]
             )
-            payload = self._run(
+            payload = self._run_fixed_curl(
                 command,
                 endpoint_class=endpoint_class,
                 stdout_limit=MAX_API_RESPONSE_BYTES + 128,
             )
-            curl_binding_after = _fixed_curl_trust_binding()
-            if curl_binding_after != curl_binding_before:
-                raise _blocked(
-                    "collector-inconclusive",
-                    "fixed curl transport identity or access policy changed",
-                )
             trailer = CURL_TRAILER_PATTERN.search(payload)
             if trailer is None:
                 raise _blocked(

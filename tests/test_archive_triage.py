@@ -9245,6 +9245,34 @@ class BugTriageDocumentationTests(unittest.TestCase):
             ),
         )
 
+    def test_enforcement_darwin_acl_only_enoent_proves_absence(self) -> None:
+        runtime = object.__new__(ENFORCEMENT_MODULE._DarwinAclRuntime)
+        runtime._libc = mock.Mock()
+
+        def missing_acl(error_number: int) -> object:
+            def query(_fd: int, _acl_type: int) -> None:
+                ctypes.set_errno(error_number)
+                return None
+
+            return query
+
+        runtime._libc.acl_get_fd_np.side_effect = missing_acl(errno.ENOENT)
+        self.assertEqual(
+            runtime.binding(17),
+            (
+                "darwin-fd-no-extended-grants-v1",
+                0,
+                "no-extended-grants-or-inheritance",
+            ),
+        )
+
+        for error_number in (errno.ENOTSUP, errno.EACCES):
+            with self.subTest(error_number=error_number):
+                runtime._libc.acl_get_fd_np.side_effect = missing_acl(error_number)
+                with self.assertRaises(OSError) as raised:
+                    runtime.binding(17)
+                self.assertEqual(raised.exception.errno, error_number)
+
     @unittest.skipUnless(
         sys.platform == "darwin",
         "requires Darwin extended ACLs",
@@ -10407,21 +10435,29 @@ class BugTriageDocumentationTests(unittest.TestCase):
                     original_transport_binding = (
                         ENFORCEMENT_MODULE._fixed_curl_trust_binding
                     )
-                    transport_binding_calls = 0
+                    transport_revalidation_calls = 0
 
                     def interrupt_transport_postvalidation(
                         *_args: object,
                         **_kwargs: object,
                     ) -> object:
-                        nonlocal transport_binding_calls
-                        result = original_transport_binding()
-                        transport_binding_calls += 1
-                        if transport_binding_calls == 2:
-                            client._termination_signal_guard._handle_signal(
-                                signal.SIGTERM,
-                                None,
-                            )
-                        return result
+                        binding = original_transport_binding()
+                        original_binding_revalidate = binding.revalidate
+
+                        def interrupt_final_revalidation(
+                            **kwargs: object,
+                        ) -> None:
+                            nonlocal transport_revalidation_calls
+                            original_binding_revalidate(**kwargs)
+                            transport_revalidation_calls += 1
+                            if transport_revalidation_calls == 1:
+                                client._termination_signal_guard._handle_signal(
+                                    signal.SIGTERM,
+                                    None,
+                                )
+
+                        binding.revalidate = interrupt_final_revalidation
+                        return binding
 
                     trailer_pattern = mock.Mock()
 
@@ -12595,7 +12631,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
     def test_enforcement_fixed_curl_reports_replaceable_trust_root_identity(
         self,
     ) -> None:
-        root_status_fields = list(os.lstat("/"))
+        root_status_fields = list(os.stat("/"))
         root_status_fields[0] = stat.S_IFDIR | 0o775
         root_status_fields[4] = 0
         root_status_fields[5] = 0
@@ -12603,7 +12639,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
 
         with mock.patch.object(
             ENFORCEMENT_MODULE.os,
-            "lstat",
+            "fstat",
             return_value=replaceable_root,
         ):
             with self.assertRaises(ENFORCEMENT_MODULE.EnforcementDoctorError) as raised:
@@ -12620,6 +12656,314 @@ class BugTriageDocumentationTests(unittest.TestCase):
                 "path=/ uid=0 gid=0 mode=0775 "
                 "is_directory=True is_symlink=False"
             ),
+        )
+
+    @unittest.skipUnless(
+        sys.platform == "darwin",
+        "requires Darwin extended ACLs",
+    )
+    def test_enforcement_fixed_curl_rejects_directory_acl_with_safe_mode(
+        self,
+    ) -> None:
+        with owner_controlled_temp_root() as temp_root:
+            ancestor = temp_root / "fixed-curl"
+            bin_directory = ancestor / "bin"
+            bin_directory.mkdir(parents=True, mode=0o755)
+            ancestor.chmod(0o755)
+            bin_directory.chmod(0o755)
+            executable = bin_directory / "curl"
+            executable.write_bytes(b"#!/bin/sh\nexit 0\n")
+            executable.chmod(0o755)
+            real_fstat = os.fstat
+            real_stat = os.stat
+
+            def root_owned(status_value: os.stat_result) -> os.stat_result:
+                fields = list(status_value)
+                fields[4] = 0
+                fields[5] = 0
+                return os.stat_result(fields)
+
+            def root_owned_fstat(fd: int) -> os.stat_result:
+                return root_owned(real_fstat(fd))
+
+            def root_owned_stat(
+                path: object,
+                *,
+                dir_fd: int | None = None,
+                follow_symlinks: bool = True,
+            ) -> os.stat_result:
+                return root_owned(
+                    real_stat(
+                        path,
+                        dir_fd=dir_fd,
+                        follow_symlinks=follow_symlinks,
+                    )
+                )
+
+            self._set_darwin_acl(
+                bin_directory,
+                "everyone allow list,search,add_file,delete_child",
+            )
+            try:
+                with (
+                    mock.patch.object(
+                        ENFORCEMENT_MODULE.os,
+                        "fstat",
+                        side_effect=root_owned_fstat,
+                    ),
+                    mock.patch.object(
+                        ENFORCEMENT_MODULE.os,
+                        "stat",
+                        side_effect=root_owned_stat,
+                    ),
+                    self.assertRaises(
+                        ENFORCEMENT_MODULE.EnforcementDoctorError
+                    ) as raised,
+                ):
+                    ENFORCEMENT_MODULE._FixedCurlTrustBinding(executable=executable)
+            finally:
+                self._clear_darwin_acl(bin_directory)
+
+            self.assertEqual(
+                raised.exception.reason_code,
+                "collector-unavailable",
+            )
+            self.assertEqual(stat.S_IMODE(bin_directory.stat().st_mode), 0o755)
+
+            with (
+                mock.patch.object(
+                    ENFORCEMENT_MODULE.os,
+                    "fstat",
+                    side_effect=root_owned_fstat,
+                ),
+                mock.patch.object(
+                    ENFORCEMENT_MODULE.os,
+                    "stat",
+                    side_effect=root_owned_stat,
+                ),
+                ENFORCEMENT_MODULE._FixedCurlTrustBinding(
+                    executable=executable
+                ) as safe_binding,
+            ):
+                safe_binding.revalidate()
+                self.assertEqual(
+                    safe_binding.executable,
+                    executable,
+                )
+
+    def test_enforcement_fixed_curl_identity_drift_stops_before_spawn(
+        self,
+    ) -> None:
+        with ENFORCEMENT_MODULE._fixed_curl_trust_binding() as binding:
+            target_fd = binding._directory_fds[-1]
+            real_fstat = os.fstat
+            target_status = real_fstat(target_fd)
+            drift_fields = list(target_status)
+            drift_fields[1] += 1
+            drift_status = os.stat_result(drift_fields)
+
+            def drifted_fstat(fd: int) -> os.stat_result:
+                if fd == target_fd:
+                    return drift_status
+                return real_fstat(fd)
+
+            with (
+                mock.patch.object(
+                    ENFORCEMENT_MODULE.os,
+                    "fstat",
+                    side_effect=drifted_fstat,
+                ),
+                mock.patch.object(
+                    ENFORCEMENT_MODULE.subprocess,
+                    "Popen",
+                ) as spawned,
+                self.assertRaises(ENFORCEMENT_MODULE.EnforcementDoctorError) as raised,
+            ):
+                ENFORCEMENT_MODULE._bounded_subprocess_supervised(
+                    [str(binding.executable), "--version"],
+                    environment={"LC_ALL": "C"},
+                    execution_cwd=str(REPO_ROOT),
+                    endpoint_class="fixture",
+                    process_registry={},
+                    process_registered=lambda _managed: None,
+                    timeout_seconds=5,
+                    stdout_limit=1024,
+                    stderr_limit=1024,
+                    process_launch_binding=binding,
+                )
+
+        spawned.assert_not_called()
+        self.assertEqual(
+            raised.exception.reason_code,
+            "collector-inconclusive",
+        )
+
+    def test_enforcement_fixed_curl_access_drift_stops_before_spawn(
+        self,
+    ) -> None:
+        with ENFORCEMENT_MODULE._fixed_curl_trust_binding() as binding:
+            target_fd = binding._directory_fds[-1]
+            real_policy = ENFORCEMENT_MODULE._stable_fd_access_policy_binding
+
+            def drifted_policy(fd: int) -> tuple[str, int, str]:
+                if fd == target_fd:
+                    return ("fixture-expanded-policy-v1", 1, "expanded")
+                return real_policy(fd)
+
+            with (
+                mock.patch.object(
+                    ENFORCEMENT_MODULE,
+                    "_stable_fd_access_policy_binding",
+                    side_effect=drifted_policy,
+                ),
+                mock.patch.object(
+                    ENFORCEMENT_MODULE.subprocess,
+                    "Popen",
+                ) as spawned,
+                self.assertRaises(ENFORCEMENT_MODULE.EnforcementDoctorError) as raised,
+            ):
+                ENFORCEMENT_MODULE._bounded_subprocess_supervised(
+                    [str(binding.executable), "--version"],
+                    environment={"LC_ALL": "C"},
+                    execution_cwd=str(REPO_ROOT),
+                    endpoint_class="fixture",
+                    process_registry={},
+                    process_registered=lambda _managed: None,
+                    timeout_seconds=5,
+                    stdout_limit=1024,
+                    stderr_limit=1024,
+                    process_launch_binding=binding,
+                )
+
+        spawned.assert_not_called()
+        self.assertEqual(
+            raised.exception.reason_code,
+            "collector-inconclusive",
+        )
+
+    def test_enforcement_fixed_curl_binding_cannot_guard_another_executable(
+        self,
+    ) -> None:
+        with (
+            ENFORCEMENT_MODULE._fixed_curl_trust_binding() as binding,
+            mock.patch.object(
+                ENFORCEMENT_MODULE.subprocess,
+                "Popen",
+            ) as spawned,
+            self.assertRaises(ENFORCEMENT_MODULE.EnforcementDoctorError) as raised,
+        ):
+            ENFORCEMENT_MODULE._bounded_subprocess_supervised(
+                [sys.executable, "-I", "-B", "-c", "pass"],
+                environment={"LC_ALL": "C"},
+                execution_cwd=str(REPO_ROOT),
+                endpoint_class="fixture",
+                process_registry={},
+                process_registered=lambda _managed: None,
+                timeout_seconds=5,
+                stdout_limit=1024,
+                stderr_limit=1024,
+                process_launch_binding=binding,
+            )
+
+        spawned.assert_not_called()
+        self.assertEqual(
+            raised.exception.reason_code,
+            "collector-unavailable",
+        )
+
+    def test_enforcement_fixed_curl_descriptors_span_popen_return(
+        self,
+    ) -> None:
+        binding = ENFORCEMENT_MODULE._fixed_curl_trust_binding()
+        retained_fds = tuple(binding._directory_fds) + (binding._file_fd,)
+        real_popen = subprocess.Popen
+
+        def inspect_popen(*args: object, **kwargs: object) -> subprocess.Popen[bytes]:
+            for fd in retained_fds:
+                os.fstat(fd)
+            process = real_popen(*args, **kwargs)
+            for fd in retained_fds:
+                os.fstat(fd)
+            return process
+
+        try:
+            with (
+                mock.patch.object(
+                    ENFORCEMENT_MODULE.subprocess,
+                    "Popen",
+                    side_effect=inspect_popen,
+                ),
+                mock.patch.object(
+                    binding,
+                    "revalidate",
+                    wraps=binding.revalidate,
+                ) as revalidated,
+            ):
+                return_code, stdout, stderr = (
+                    ENFORCEMENT_MODULE._bounded_subprocess_supervised(
+                        [str(binding.executable), "--version"],
+                        environment={"LC_ALL": "C"},
+                        execution_cwd=str(REPO_ROOT),
+                        endpoint_class="fixture",
+                        process_registry={},
+                        process_registered=lambda _managed: None,
+                        timeout_seconds=5,
+                        stdout_limit=4096,
+                        stderr_limit=4096,
+                        process_launch_binding=binding,
+                    )
+                )
+            self.assertEqual(return_code, 0)
+            self.assertTrue(stdout.startswith(b"curl "))
+            self.assertEqual(stderr, b"")
+            self.assertEqual(revalidated.call_count, 2)
+            for fd in retained_fds:
+                os.fstat(fd)
+        finally:
+            close_errors = binding.close()
+            self.assertEqual(close_errors, [])
+
+        for fd in retained_fds:
+            with self.assertRaises(OSError) as closed:
+                os.fstat(fd)
+            self.assertEqual(closed.exception.errno, errno.EBADF)
+
+    def test_enforcement_fixed_curl_close_preserves_primary_error(
+        self,
+    ) -> None:
+        binding = ENFORCEMENT_MODULE._fixed_curl_trust_binding()
+        failed_fd = binding._file_fd
+        self.assertIsNotNone(failed_fd)
+        real_close = os.close
+        primary = RuntimeError("fixture primary failure")
+
+        def fail_one_close(fd: int) -> None:
+            if fd == failed_fd:
+                raise OSError(errno.EIO, "fixture close failure")
+            real_close(fd)
+
+        try:
+            with (
+                mock.patch.object(
+                    ENFORCEMENT_MODULE.os,
+                    "close",
+                    side_effect=fail_one_close,
+                ),
+                self.assertRaises(RuntimeError) as raised,
+            ):
+                with binding:
+                    raise primary
+        finally:
+            real_close(failed_fd)
+
+        self.assertIs(raised.exception, primary)
+        self.assertIsInstance(
+            raised.exception.__cause__,
+            ENFORCEMENT_MODULE.EnforcementDoctorError,
+        )
+        self.assertEqual(
+            raised.exception.__cause__.reason_code,
+            "collector-inconclusive",
         )
 
     def test_enforcement_gh_pin_rejects_initial_digest_mismatch(self) -> None:

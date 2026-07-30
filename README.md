@@ -102,6 +102,14 @@ configuration snapshot, whose global config contains no transport redirect.
 Credential lookup receives only the fixed system helper path
 `/usr/bin:/bin:/usr/sbin:/sbin`, so the macOS Keychain backend remains
 available without inheriting an ambient executable directory.
+The fixed `/usr/bin/curl` transport separately retains descriptor-relative
+bindings for `/`, `/usr`, `/usr/bin`, and the executable across the exact
+`Popen` launch. Root ownership and mode are insufficient on Darwin: every
+ancestor uses the same no-extended-allow ACL policy, with only `ENOENT`
+accepted as proof that no extended ACL exists. The binding is revalidated
+before launch, immediately after `Popen` returns, and after the request; it
+proves non-owner non-replacement under that policy, not that post-`exec`
+mapped bytes remain pinned.
 Source and snapshot identities and access policy are revalidated before and
 after each invocation and before admission. Content receipts bind the exact
 SHA-256 to descriptor/path identity plus size, `mtime_ns`, and `ctime_ns`;
