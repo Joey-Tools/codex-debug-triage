@@ -140,6 +140,7 @@ REGEX_CLEANUP_IDLE = "idle"
 REGEX_CLEANUP_DEFERRING = "deferring"
 REGEX_CLEANUP_MASKED = "masked"
 REGEX_CLEANUP_RESTORING = "restoring"
+REGEX_CLEANUP_FENCED = "fenced"
 REGEX_SPAWN_IDLE = "idle"
 REGEX_SPAWN_DEFERRING = "deferring"
 REGEX_SPAWN_MASKED = "masked"
@@ -517,12 +518,15 @@ class ArchiveCommandDeadline:
 
         interrupted_error = self._begin_regex_cleanup()
         previous_mask: set[signal.Signals] | None = None
+        mask_attempted = False
+        mask_restored = False
         setup_error: BaseException | None = None
         cleanup_error: BaseException | None = None
         restore_error: BaseException | None = None
         try:
             try:
                 self._require_signal_support()
+                mask_attempted = True
                 previous_mask = signal.pthread_sigmask(
                     signal.SIG_BLOCK,
                     {signal.SIGALRM},
@@ -542,7 +546,14 @@ class ArchiveCommandDeadline:
                     signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
                 except BaseException as error:
                     restore_error = error
-            self._regex_cleanup_state = REGEX_CLEANUP_IDLE
+                else:
+                    mask_restored = True
+            # Timer-backed diagnostics are safe only after proving that the
+            # cleanup transaction restored the signal mask it observed.
+            if mask_attempted and not mask_restored:
+                self._regex_cleanup_state = REGEX_CLEANUP_FENCED
+            else:
+                self._regex_cleanup_state = REGEX_CLEANUP_IDLE
 
         deadline_error = interrupted_error or self._regex_cleanup_deadline_error
         if deadline_error is None and time.monotonic() >= self.deadline:

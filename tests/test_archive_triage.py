@@ -2892,6 +2892,133 @@ class ArchiveTriageTests(unittest.TestCase):
         with self.assertRaises(ProcessLookupError):
             os.killpg(worker_pgid, 0)
 
+    def test_regex_cleanup_initial_mask_failure_retains_diagnostic_fence(
+        self,
+    ) -> None:
+        deadline = MODULE.ArchiveCommandDeadline()
+        deadline._armed = True
+        deadline._diagnostic_timer_safe = True
+        mask_error = OSError(errno.EIO, "injected initial mask failure")
+        cleanup = mock.Mock()
+
+        with (
+            mock.patch.object(deadline, "_require_signal_support"),
+            mock.patch.object(
+                MODULE.signal,
+                "pthread_sigmask",
+                side_effect=mask_error,
+            ),
+            self.assertRaises(OSError) as raised,
+        ):
+            deadline.run_regex_worker_cleanup(cleanup)
+
+        self.assertIs(raised.exception, mask_error)
+        cleanup.assert_not_called()
+        self.assertEqual(
+            deadline._regex_cleanup_state,
+            MODULE.REGEX_CLEANUP_FENCED,
+        )
+        self.assertFalse(deadline.timer_backed_diagnostics_safe())
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_publish_terminal_line_without_timer",
+                return_value=False,
+            ) as publisher,
+            redirect_stderr(io.StringIO()),
+        ):
+            MODULE._emit_error(raised.exception, deadline=deadline)
+        publisher.assert_called_once()
+
+    def test_regex_cleanup_restore_failure_preserves_primary_and_fences(
+        self,
+    ) -> None:
+        deadline = MODULE.ArchiveCommandDeadline()
+        deadline._armed = True
+        deadline._diagnostic_timer_safe = True
+        cleanup_error = RuntimeError("injected cleanup failure")
+        restore_error = OSError(errno.EIO, "injected mask restore failure")
+        mask_calls = 0
+
+        def change_mask(
+            _operation: int,
+            _signals: object,
+        ) -> set[signal.Signals]:
+            nonlocal mask_calls
+            mask_calls += 1
+            if mask_calls == 2:
+                raise restore_error
+            return set()
+
+        def fail_cleanup() -> None:
+            raise cleanup_error
+
+        with (
+            mock.patch.object(deadline, "_require_signal_support"),
+            mock.patch.object(
+                MODULE.signal,
+                "pthread_sigmask",
+                side_effect=change_mask,
+            ),
+            self.assertRaises(RuntimeError) as raised,
+        ):
+            deadline.run_regex_worker_cleanup(fail_cleanup)
+
+        self.assertIs(raised.exception, cleanup_error)
+        self.assertIs(raised.exception.__cause__, restore_error)
+        self.assertEqual(
+            deadline._regex_cleanup_state,
+            MODULE.REGEX_CLEANUP_FENCED,
+        )
+        self.assertFalse(deadline.timer_backed_diagnostics_safe())
+
+        with (
+            mock.patch.object(
+                MODULE,
+                "_publish_terminal_line_without_timer",
+                return_value=False,
+            ) as publisher,
+            redirect_stderr(io.StringIO()),
+        ):
+            MODULE._emit_error(raised.exception, deadline=deadline)
+        publisher.assert_called_once()
+
+    def test_regex_cleanup_restored_mask_returns_to_idle(self) -> None:
+        deadline = MODULE.ArchiveCommandDeadline()
+        deadline._armed = True
+        deadline._diagnostic_timer_safe = True
+        mask_operations: list[int] = []
+        cleanup = mock.Mock()
+
+        def change_mask(
+            operation: int,
+            _signals: object,
+        ) -> set[signal.Signals]:
+            mask_operations.append(operation)
+            return set()
+
+        with (
+            mock.patch.object(deadline, "_require_signal_support"),
+            mock.patch.object(
+                MODULE.signal,
+                "pthread_sigmask",
+                side_effect=change_mask,
+            ),
+        ):
+            deadline.run_regex_worker_cleanup(cleanup)
+
+        cleanup.assert_called_once_with()
+        self.assertEqual(
+            mask_operations,
+            [signal.SIG_BLOCK, signal.SIG_SETMASK],
+        )
+        self.assertEqual(
+            deadline._regex_cleanup_state,
+            MODULE.REGEX_CLEANUP_IDLE,
+        )
+        self.assertTrue(deadline.timer_backed_diagnostics_safe())
+
     @unittest.skipUnless(
         os.name == "posix"
         and all(
@@ -3259,6 +3386,117 @@ class ArchiveTriageTests(unittest.TestCase):
             process.kill()
             process.communicate(timeout=2)
             self.fail("fenced diagnostic blocked on a full stderr pipe")
+        stdout, stderr = process.communicate(timeout=2)
+        elapsed = time.monotonic() - started
+
+        self.assertEqual(
+            process.returncode,
+            0,
+            stderr[-512:].decode("utf-8", errors="replace"),
+        )
+        self.assertEqual(stdout, b"")
+        self.assertLess(elapsed, 1.0)
+
+    @unittest.skipUnless(
+        os.name == "posix"
+        and MODULE.fcntl is not None
+        and hasattr(os, "O_NONBLOCK")
+        and hasattr(signal, "pthread_sigmask"),
+        "timerless fenced diagnostics require POSIX fcntl and signal masks",
+    )
+    def test_regex_cleanup_restore_failure_bounds_full_pipe_diagnostic(
+        self,
+    ) -> None:
+        launcher = "\n".join(
+            (
+                "import importlib.util",
+                "import os",
+                "import pathlib",
+                "import signal",
+                "import sys",
+                "from unittest import mock",
+                "path = pathlib.Path(sys.argv[1])",
+                (
+                    "spec = importlib.util.spec_from_file_location("
+                    "'archive_triage_cleanup_fence_test', path)"
+                ),
+                "module = importlib.util.module_from_spec(spec)",
+                "sys.modules[spec.name] = module",
+                "spec.loader.exec_module(module)",
+                "fd = sys.stderr.fileno()",
+                "original_flags = module._fcntl_get_flags(fd)",
+                "real_sigmask = signal.pthread_sigmask",
+                "original_mask = real_sigmask(signal.SIG_BLOCK, set())",
+                "module._fcntl_set_flags(fd, original_flags | os.O_NONBLOCK)",
+                "try:",
+                "    while True:",
+                "        os.write(fd, b'x' * 4096)",
+                "except BlockingIOError:",
+                "    pass",
+                "finally:",
+                "    module._fcntl_set_flags(fd, original_flags)",
+                "deadline = module.ArchiveCommandDeadline()",
+                "deadline._armed = True",
+                "deadline._diagnostic_timer_safe = True",
+                "cleanup_error = RuntimeError('injected cleanup failure')",
+                "restore_error = OSError('injected mask restore failure')",
+                "def cleanup():",
+                "    raise cleanup_error",
+                "def change_mask(operation, signals):",
+                "    if operation == signal.SIG_BLOCK:",
+                "        return real_sigmask(operation, signals)",
+                "    raise restore_error",
+                "try:",
+                "    with (",
+                ("        mock.patch.object(deadline, '_require_signal_support'),"),
+                (
+                    "        mock.patch.object("
+                    "module.signal, 'pthread_sigmask', "
+                    "side_effect=change_mask),"
+                ),
+                "    ):",
+                "        try:",
+                "            deadline.run_regex_worker_cleanup(cleanup)",
+                "        except RuntimeError as error:",
+                "            captured_error = error",
+                "        else:",
+                ("            raise AssertionError('cleanup failure was not raised')"),
+                "    assert captured_error is cleanup_error",
+                "    assert captured_error.__cause__ is restore_error",
+                (
+                    "    assert deadline._regex_cleanup_state "
+                    "== module.REGEX_CLEANUP_FENCED"
+                ),
+                "    assert not deadline.timer_backed_diagnostics_safe()",
+                "    module._emit_error(captured_error, deadline=deadline)",
+                (
+                    "    assert bool(module._fcntl_get_flags(fd) "
+                    "& os.O_NONBLOCK) "
+                    "== bool(original_flags & os.O_NONBLOCK)"
+                ),
+                "finally:",
+                "    real_sigmask(signal.SIG_SETMASK, original_mask)",
+            )
+        )
+        started = time.monotonic()
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                "-I",
+                "-B",
+                "-c",
+                launcher,
+                str(SCRIPT_PATH),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.communicate(timeout=2)
+            self.fail("fenced cleanup diagnostic blocked on a full stderr pipe")
         stdout, stderr = process.communicate(timeout=2)
         elapsed = time.monotonic() - started
 
