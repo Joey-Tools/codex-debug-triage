@@ -40,7 +40,10 @@ Python, but it cannot guarantee interruption of NFS, FUSE, File Provider,
 uninterruptible, or automatically restarted system calls. A private provider
 that requires a hard return deadline must launch the local helper in a
 terminate-able isolated process under an external wall-clock supervisor and
-must preserve or tighten the helper's size and count ceilings.
+must preserve or tighten the helper's size and count ceilings. The helper starts
+its separate regex budget only after archive preflight, stops selection and
+regex work as soon as bounded output is full, and still drains the raw member
+stream for complete integrity and source-stability validation.
 
 GitHub Actions and pull-request checks bypass both skills and stay with the
 GitHub provider workflow named in the generic skill's provider boundary.

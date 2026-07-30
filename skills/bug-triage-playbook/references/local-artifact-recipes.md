@@ -34,7 +34,7 @@ policy into the generic inspection commands below.
 Start with bounded metadata and candidate names:
 
 ```bash
-find "$artifact_dir" -type f -print | sed -n '1,80p'
+find "$artifact_dir" -type f -print | head -n 80
 wc -c "$artifact_dir/run.log"
 wc -l "$artifact_dir/run.log"
 rg -l -i 'ASSERT|ERROR|FAIL|Exception|Traceback|timeout' "$artifact_dir" | head -n 40
@@ -46,7 +46,7 @@ Then inspect one exact file and a small window:
 ```bash
 rg -n -i 'ASSERT|ERROR|FAIL|Exception|Traceback|timeout' \
   "$artifact_dir/run.log" | head -n 80
-sed -n '420,470p' "$artifact_dir/run.log"
+sed -n '420,470p;471q' "$artifact_dir/run.log"
 ```
 
 Do not run a broad line-producing search across unpacked archives, generated
@@ -121,6 +121,12 @@ File Provider, uninterruptible, or automatically restarted system calls. A
 caller that requires a hard return deadline must run the helper in a separate
 terminate-able process under an external wall-clock supervisor with
 process-group cleanup.
+
+The separate regex budget starts only after the archive has passed central
+directory and member-metadata validation. Once the output budget is exhausted,
+the helper stops selection and regex work immediately, but it still drains the
+raw member stream so CRC, size, line, and source-stability validation remain
+complete.
 
 The helper fails closed when the platform cannot provide the required POSIX
 timer/signal controls, when the main thread currently blocks `SIGALRM`, when an

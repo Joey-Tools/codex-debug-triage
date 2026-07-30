@@ -3734,13 +3734,15 @@ def _add_member_output(
         tail=args.tail,
     )
     try:
-        collecting_output = not output.truncated
-        for line_number, line in selected_lines:
-            archive_stream.check_deadline("member output selection")
-            safe_line = _escape_terminal_text(line)
-            rendered = f"{line_number}:{safe_line}" if args.line_numbers else safe_line
-            if collecting_output:
-                collecting_output = output.add(rendered)
+        if not output.truncated:
+            for line_number, line in selected_lines:
+                archive_stream.check_deadline("member output selection")
+                safe_line = _escape_terminal_text(line)
+                rendered = (
+                    f"{line_number}:{safe_line}" if args.line_numbers else safe_line
+                )
+                if not output.add(rendered):
+                    break
         for _ in line_iterator:
             archive_stream.check_deadline("member validation drain")
     except _archive_errors() as error:
@@ -3856,36 +3858,36 @@ def cmd_zip_list(args: argparse.Namespace) -> int:
         zip_path = pathlib.Path(args.zip_path)
         _validate_list_args(args)
         deadline.check("argument validation")
-        regex_budget = RegexMatchBudget()
-        with contextlib.ExitStack() as workers:
-            matcher = (
-                deadline.enter_regex_worker(
-                    workers,
-                    IsolatedRegexMatcher(
-                        args.match,
-                        ignore_case=args.ignore_case,
-                        budget=regex_budget,
-                        command_deadline=deadline,
-                    ),
-                )
-                if args.match
-                else None
+        with _open_pinned_archive(
+            zip_path,
+            args.max_archive_bytes,
+            deadline=deadline,
+        ) as archive_stream:
+            directory = _preflight_central_directory(
+                archive_stream,
+                max_archive_members=args.max_archive_members,
+                max_central_directory_bytes=args.max_central_directory_bytes,
             )
-            with _open_pinned_archive(
-                zip_path,
-                args.max_archive_bytes,
-                deadline=deadline,
-            ) as archive_stream:
-                directory = _preflight_central_directory(
-                    archive_stream,
-                    max_archive_members=args.max_archive_members,
-                    max_central_directory_bytes=args.max_central_directory_bytes,
+            with zipfile.ZipFile(archive_stream) as archive:
+                members = _validated_members(
+                    archive,
+                    directory,
+                    args.max_archive_members,
                 )
-                with zipfile.ZipFile(archive_stream) as archive:
-                    members = _validated_members(
-                        archive,
-                        directory,
-                        args.max_archive_members,
+                regex_budget = RegexMatchBudget()
+                with contextlib.ExitStack() as workers:
+                    matcher = (
+                        deadline.enter_regex_worker(
+                            workers,
+                            IsolatedRegexMatcher(
+                                args.match,
+                                ignore_case=args.ignore_case,
+                                budget=regex_budget,
+                                command_deadline=deadline,
+                            ),
+                        )
+                        if args.match
+                        else None
                     )
                     output = OutputBudget(args.limit, args.max_output_chars)
                     for member in members:
@@ -3898,7 +3900,7 @@ def cmd_zip_list(args: argparse.Namespace) -> int:
                             allow_line_truncation=False,
                         ):
                             break
-                archive_stream.validate_unchanged()
+            archive_stream.validate_unchanged()
         output.flush(deadline=deadline)
         if output.truncated:
             _emit_notice(
@@ -4013,49 +4015,49 @@ def cmd_zip_show(args: argparse.Namespace) -> int:
         zip_path = pathlib.Path(args.zip_path)
         _validate_show_args(args)
         deadline.check("argument validation")
-        regex_budget = RegexMatchBudget()
-        with contextlib.ExitStack() as workers:
-            member_matcher = (
-                deadline.enter_regex_worker(
-                    workers,
-                    IsolatedRegexMatcher(
-                        args.member,
-                        ignore_case=args.ignore_case,
-                        budget=regex_budget,
-                        command_deadline=deadline,
-                    ),
-                )
-                if args.regex
-                else None
+        with _open_pinned_archive(
+            zip_path,
+            args.max_archive_bytes,
+            deadline=deadline,
+        ) as archive_stream:
+            directory = _preflight_central_directory(
+                archive_stream,
+                max_archive_members=args.max_archive_members,
+                max_central_directory_bytes=args.max_central_directory_bytes,
             )
-            grep_matcher = (
-                deadline.enter_regex_worker(
-                    workers,
-                    IsolatedRegexMatcher(
-                        args.grep,
-                        ignore_case=args.ignore_case,
-                        budget=regex_budget,
-                        command_deadline=deadline,
-                    ),
+            with zipfile.ZipFile(archive_stream) as archive:
+                members = _validated_members(
+                    archive,
+                    directory,
+                    args.max_archive_members,
                 )
-                if args.grep
-                else None
-            )
-            with _open_pinned_archive(
-                zip_path,
-                args.max_archive_bytes,
-                deadline=deadline,
-            ) as archive_stream:
-                directory = _preflight_central_directory(
-                    archive_stream,
-                    max_archive_members=args.max_archive_members,
-                    max_central_directory_bytes=args.max_central_directory_bytes,
-                )
-                with zipfile.ZipFile(archive_stream) as archive:
-                    members = _validated_members(
-                        archive,
-                        directory,
-                        args.max_archive_members,
+                regex_budget = RegexMatchBudget()
+                with contextlib.ExitStack() as workers:
+                    member_matcher = (
+                        deadline.enter_regex_worker(
+                            workers,
+                            IsolatedRegexMatcher(
+                                args.member,
+                                ignore_case=args.ignore_case,
+                                budget=regex_budget,
+                                command_deadline=deadline,
+                            ),
+                        )
+                        if args.regex
+                        else None
+                    )
+                    grep_matcher = (
+                        deadline.enter_regex_worker(
+                            workers,
+                            IsolatedRegexMatcher(
+                                args.grep,
+                                ignore_case=args.ignore_case,
+                                budget=regex_budget,
+                                command_deadline=deadline,
+                            ),
+                        )
+                        if args.grep
+                        else None
                     )
                     matches = _find_members(
                         members,
@@ -4101,7 +4103,7 @@ def cmd_zip_show(args: argparse.Namespace) -> int:
                             output,
                             aggregate_budget,
                         )
-                archive_stream.validate_unchanged()
+            archive_stream.validate_unchanged()
         output.flush(deadline=deadline)
         if output.truncated:
             _emit_notice(

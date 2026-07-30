@@ -891,6 +891,53 @@ class ArchiveTriageTests(unittest.TestCase):
         self.assertLessEqual(len(stdout.getvalue()), 32)
         self.assertIn("notice=output truncated", stderr.getvalue())
 
+    def test_zip_show_stops_regex_selection_after_output_truncation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            archive_path = Path(temp_dir) / "truncated-grep.zip"
+            with zipfile.ZipFile(archive_path, "w") as archive:
+                archive.writestr(
+                    "logs/console.txt",
+                    "".join(f"matching line {index}\n" for index in range(100)),
+                )
+            args = self._show_args(
+                archive_path,
+                member="logs/console.txt",
+                grep="matching",
+                max_output_lines=1,
+            )
+            searched: list[str] = []
+
+            def bounded_search(
+                _matcher: MODULE.IsolatedRegexMatcher,
+                value: str,
+            ) -> bool:
+                searched.append(value)
+                if len(searched) > 1:
+                    raise AssertionError(
+                        "regex selection continued after output truncation"
+                    )
+                return True
+
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with (
+                mock.patch.object(
+                    MODULE.IsolatedRegexMatcher,
+                    "search",
+                    new=bounded_search,
+                ),
+                redirect_stdout(stdout),
+                redirect_stderr(stderr),
+            ):
+                rc = MODULE.cmd_zip_show(args)
+
+        self.assertEqual(rc, 0, stderr.getvalue())
+        self.assertEqual(len(searched), 1)
+        self.assertEqual(len(stdout.getvalue().splitlines()), 1)
+        self.assertIn('"name":"logs/console.txt"', stdout.getvalue())
+        self.assertNotIn("matching line", stdout.getvalue())
+        self.assertIn("notice=output truncated", stderr.getvalue())
+
     def test_zip_list_rejects_archive_over_member_count_cap(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             archive_path = self._make_archive(Path(temp_dir))
@@ -2590,6 +2637,72 @@ class ArchiveTriageTests(unittest.TestCase):
                         "regular expression per-match deadline exceeded",
                         stderr.getvalue(),
                     )
+
+    def test_regex_budget_starts_after_archive_preflight(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            archive_path = self._make_archive(Path(temp_dir))
+            cases = (
+                (
+                    "zip-list",
+                    self._list_args(archive_path, match="console"),
+                    MODULE.cmd_zip_list,
+                ),
+                (
+                    "zip-show",
+                    self._show_args(
+                        archive_path,
+                        member=r"logs/console\.txt",
+                        regex=True,
+                        grep="line",
+                    ),
+                    MODULE.cmd_zip_show,
+                ),
+            )
+            real_preflight = MODULE._preflight_central_directory
+            real_budget = MODULE.RegexMatchBudget
+
+            for label, args, command in cases:
+                with self.subTest(command=label):
+                    preflight_complete = False
+
+                    def complete_preflight(
+                        *preflight_args: object,
+                        **preflight_kwargs: object,
+                    ) -> MODULE.CentralDirectoryLayout:
+                        nonlocal preflight_complete
+                        result = real_preflight(
+                            *preflight_args,
+                            **preflight_kwargs,
+                        )
+                        preflight_complete = True
+                        return result
+
+                    def create_budget() -> MODULE.RegexMatchBudget:
+                        self.assertTrue(
+                            preflight_complete,
+                            "regex aggregate budget started before archive preflight",
+                        )
+                        return real_budget()
+
+                    stdout = io.StringIO()
+                    stderr = io.StringIO()
+                    with (
+                        mock.patch.object(
+                            MODULE,
+                            "_preflight_central_directory",
+                            side_effect=complete_preflight,
+                        ),
+                        mock.patch.object(
+                            MODULE,
+                            "RegexMatchBudget",
+                            side_effect=create_budget,
+                        ),
+                        redirect_stdout(stdout),
+                        redirect_stderr(stderr),
+                    ):
+                        rc = command(args)
+
+                    self.assertEqual(rc, 0, stderr.getvalue())
 
     def test_regex_timeout_reaps_worker(self) -> None:
         budget = MODULE.RegexMatchBudget()
@@ -6937,6 +7050,22 @@ class BugTriageDocumentationTests(unittest.TestCase):
         )
 
         self.assertIn("Start with bounded metadata and candidate names", recipe)
+        self.assertIn(
+            'find "$artifact_dir" -type f -print | head -n 80',
+            recipe,
+        )
+        self.assertNotIn(
+            'find "$artifact_dir" -type f -print | sed -n',
+            recipe,
+        )
+        self.assertIn(
+            "sed -n '420,470p;471q' \"$artifact_dir/run.log\"",
+            recipe,
+        )
+        self.assertNotIn(
+            "sed -n '420,470p' \"$artifact_dir/run.log\"",
+            recipe,
+        )
         self.assertIn("Use filenames and counts first", recipe)
         self.assertIn("scripts/archive_triage.py", recipe)
         self.assertIn("does not fetch URLs", recipe)
