@@ -7361,6 +7361,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
             "test_enforcement_gh_acl_drift_discards_command_output",
             "test_enforcement_gh_acl_restrictive_deny_churn_is_benign",
             "test_enforcement_gh_acl_drift_is_revalidated_after_spawn_failure",
+            "test_enforcement_fixed_curl_rejects_directory_acl_with_safe_mode",
         ):
             with self.subTest(test=test_name):
                 self.assertIn(test_name, workflow)
