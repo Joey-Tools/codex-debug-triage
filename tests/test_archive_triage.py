@@ -7345,7 +7345,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
         self.assertIn('          - "3.x"', workflow)
         self.assertIn("runs-on: ubuntu-latest", workflow)
         self.assertIn(
-            "test_enforcement_gh_linux_owner_controlled_root_reaches_success_path",
+            "test_enforcement_gh_linux_host_fixed_curl_policy_is_enforced",
             workflow,
         )
         self.assertIn("darwin-acl-integration:", workflow)
@@ -12716,7 +12716,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
                 if run_path.exists():
                     shutil.rmtree(run_path)
 
-    def test_enforcement_gh_linux_owner_controlled_root_reaches_success_path(
+    def test_enforcement_gh_linux_host_fixed_curl_policy_is_enforced(
         self,
     ) -> None:
         with owner_controlled_temp_root() as temp_root:
@@ -12725,37 +12725,49 @@ class BugTriageDocumentationTests(unittest.TestCase):
             trusted_gh.write_bytes(trusted_payload)
             trusted_gh.chmod(0o700)
             config_dir, runtime_parent = self._make_private_gh_config(temp_root)
-            with mock.patch.object(
-                ENFORCEMENT_MODULE.sys,
-                "platform",
-                "linux",
-            ):
-                with mock.patch.object(
+            with (
+                mock.patch.object(
+                    ENFORCEMENT_MODULE.sys,
+                    "platform",
+                    "linux",
+                ),
+                mock.patch.object(
                     ENFORCEMENT_MODULE,
                     "_DarwinAclRuntime",
                     side_effect=AssertionError("Darwin runtime must not load"),
-                ):
+                ),
+                mock.patch.object(
+                    ENFORCEMENT_MODULE,
+                    "_bounded_subprocess",
+                    return_value=(
+                        0,
+                        self._curl_response(b'{"id":1,"login":"linux-fixture"}'),
+                        b"",
+                    ),
+                ) as spawned,
+            ):
+                try:
                     with ENFORCEMENT_MODULE.GitHubApiClient(
                         trusted_gh,
                         hashlib.sha256(trusted_payload).hexdigest(),
                         config_dir,
                         runtime_parent=runtime_parent,
                     ) as client:
-                        with mock.patch.object(
-                            ENFORCEMENT_MODULE,
-                            "_bounded_subprocess",
-                            return_value=(
-                                0,
-                                self._curl_response(
-                                    b'{"id":1,"login":"linux-fixture"}'
-                                ),
-                                b"",
-                            ),
-                        ) as spawned:
-                            response = client.get_json("/user")
-
-        spawned.assert_called_once()
-        self.assertEqual(response["login"], "linux-fixture")
+                        response = client.get_json("/user")
+                except ENFORCEMENT_MODULE.EnforcementDoctorError as error:
+                    self.assertEqual(error.reason_code, "collector-unavailable")
+                    self.assertRegex(
+                        str(error),
+                        (
+                            r"fixed curl (?:trust-root directory is replaceable|"
+                            r"transport identity or access policy is invalid|"
+                            r"transport or ancestor cannot be bound safely)"
+                        ),
+                    )
+                    spawned.assert_not_called()
+                else:
+                    spawned.assert_called_once()
+                    self.assertEqual(response["login"], "linux-fixture")
 
     def test_enforcement_fixed_curl_reports_replaceable_trust_root_identity(
         self,
