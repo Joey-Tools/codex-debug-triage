@@ -1,8 +1,10 @@
 # Private `cisco-build-artifacts` Migration Contract
 
-This document records the private functionality intentionally removed from the
-public `bug-triage-playbook`. It is a handoff contract for a separately owned
-private `cisco-build-artifacts` skill, not an implementation or an installation
+This document records the private functionality planned for removal from the
+public `bug-triage-playbook` only after the cutover contract is satisfied. The
+current compatibility/bootstrap branch intentionally retains the public
+Jenkins entrypoint. This is a handoff contract for a separately owned private
+`cisco-build-artifacts` skill, not an implementation or an installation
 instruction.
 
 Keep actual Cisco hosts, job families, credential variable names, authentication
