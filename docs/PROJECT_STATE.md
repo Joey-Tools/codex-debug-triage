@@ -2,8 +2,11 @@
 
 ## Current State
 
-- Cisco cutover admission hardening is tracked in the project journal.
-- The live cutover remains blocked until a trusted pointer authority is configured.
+- Canonical `cisco-build-artifacts` implementation and generic-playbook
+  retirement are tracked in the project journal and PR #5.
+- The canonical checkout is not an installed overlay. Live cutover remains
+  blocked until the private catalog, `removed_links`, trusted release, pointer,
+  and base-change enforcement gates are admitted.
 
 ## Recovery Pointers
 

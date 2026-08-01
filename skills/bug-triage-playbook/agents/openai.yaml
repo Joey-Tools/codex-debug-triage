@@ -1,4 +1,6 @@
 interface:
   display_name: "Bug Triage Playbook"
-  short_description: "Investigate logs, regressions, and root-cause hypotheses."
-  default_prompt: "Use $bug-triage-playbook to structure root-cause analysis from logs, failures, or regressions."
+  short_description: "Optional explicit hypothesis-structuring reference"
+  default_prompt: "Explicitly use $bug-triage-playbook to structure hypotheses for this local debugging task."
+policy:
+  allow_implicit_invocation: false

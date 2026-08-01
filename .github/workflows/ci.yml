@@ -26,12 +26,12 @@ jobs:
       - name: Compile Python helpers
         run: |
           python3 -m py_compile \
-            skills/bug-triage-playbook/scripts/jenkins_artifact_probe.py \
-            skills/bug-triage-playbook/scripts/archive_triage.py \
+            skills/cisco-build-artifacts/scripts/cisco_build_artifacts.py \
+            skills/cisco-build-artifacts/scripts/archive_triage.py \
             scripts/doctor_cisco_cutover_enforcement.py \
             scripts/validate_cisco_cutover_receipt.py \
             tests/test_archive_triage.py \
-            tests/test_jenkins_artifact_probe.py
+            tests/test_cisco_build_artifacts.py
       - name: Run Linux fixed-curl policy integration
         run: |
           python3 -m unittest \
@@ -40,7 +40,7 @@ jobs:
         run: |
           python3 -m unittest \
             tests.test_archive_triage \
-            tests.test_jenkins_artifact_probe
+            tests.test_cisco_build_artifacts
 
   darwin-acl-integration:
     runs-on: macos-latest

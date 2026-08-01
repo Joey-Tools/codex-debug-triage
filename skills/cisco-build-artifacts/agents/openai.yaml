@@ -1,0 +1,4 @@
+interface:
+  display_name: "Cisco Build Artifacts"
+  short_description: "Safely fetch and inspect Cisco build artifacts"
+  default_prompt: "Use $cisco-build-artifacts to fetch and inspect this Cisco Jenkins build URL safely."

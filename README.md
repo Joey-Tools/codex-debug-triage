@@ -1,26 +1,34 @@
 # Codex Debug Triage
 
-An optional public playbook for turning logs, crash reports, test output, and
-build artifacts into ranked root-cause hypotheses.
+Canonical source for safe Cisco build-artifact acquisition and the optional
+explicit bug-triage reference.
 
-This bootstrap release deliberately retains the existing Jenkins entrypoint,
-reference, routing, and tests while adding the bounded local ZIP helper. The
-Jenkins route cannot be retired until the independently trusted cutover
-admission workflow is installed on the protected default branch.
+The canonical `cisco-build-artifacts` source now owns Cisco Jenkins build,
+`consoleText`, API, artifact-viewer, and archive URLs. Its remote helper
+enforces exact per-hop origin/profile authorization, a supervised producer
+deadline, bounded streaming, signed-query redaction, and descriptor-bound
+atomic no-clobber publication. The existing validated ZIP parser moved intact
+under the same skill; its archive/member/decompression/output ceilings did not
+change.
 
-After the admitted private cutover, `cisco-build-artifacts` owns Cisco fetch
-and bounded archive handling, while ordinary local diagnosis falls through to
-the base model without an installed skill route. This public repository and its
-local ZIP helper may remain available as optional source assets, but
-`bug-triage-playbook` is absent from the active private catalog and installed
-links.
+`bug-triage-playbook` is now an optional explicit reference with implicit
+invocation disabled. It owns no Cisco/Jenkins/remote-artifact route. Ordinary
+diagnosis falls through to the base model, and GitHub Actions stays with the
+GitHub provider.
 
 ## Private Migration
 
-The proposed authenticated Jenkins retirement and the contract for moving it to
-a separate private `cisco-build-artifacts` skill are documented in
+Canonical implementation is complete in this repository, but a merge changes
+source history only. It does not install the skill, update private
+`AGENTS.md` routing, change the private active catalog, add the
+`removed_links` retirement record, publish an immutable overlay release, or
+move any host's installed `current` pointer.
+
+Those remaining aggregate and installed-pointer gates are documented in
 [`docs/cisco-build-artifacts-migration.md`](docs/cisco-build-artifacts-migration.md).
-That private implementation is intentionally not part of this repository.
+Until the independently trusted cutover admission succeeds, the protected
+default branch and installed overlay retain their current compatibility route;
+this candidate PR must not be described as installed or cut over.
 `.github/workflows/cisco-cutover-admission.yml` is a self-contained
 `pull_request_target` gate with no candidate checkout or candidate code
 execution. A copy added by a pull request does not protect that same pull
@@ -219,13 +227,13 @@ the unavailable pointer gate, that same blocked receipt preserves
 
 ```bash
 python3 -m py_compile \
-  skills/bug-triage-playbook/scripts/jenkins_artifact_probe.py \
-  skills/bug-triage-playbook/scripts/archive_triage.py \
+  skills/cisco-build-artifacts/scripts/cisco_build_artifacts.py \
+  skills/cisco-build-artifacts/scripts/archive_triage.py \
   scripts/doctor_cisco_cutover_enforcement.py \
   scripts/validate_cisco_cutover_receipt.py \
   tests/test_archive_triage.py \
-  tests/test_jenkins_artifact_probe.py
+  tests/test_cisco_build_artifacts.py
 python3 -m unittest \
   tests.test_archive_triage \
-  tests.test_jenkins_artifact_probe
+  tests.test_cisco_build_artifacts
 ```

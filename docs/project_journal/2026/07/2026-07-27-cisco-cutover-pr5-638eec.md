@@ -3,7 +3,7 @@ id: 20260727-638eec
 title: Cisco Cutover Admission Hardening
 status: blocked
 created: 2026-07-27
-updated: 2026-07-30
+updated: 2026-08-01
 branch: codex/retire-active-generic-triage
 pr: https://github.com/Joey-Tools/codex-debug-triage/pull/5
 supersedes: []
@@ -14,11 +14,26 @@ superseded_by:
 
 ## Summary
 
-- PR #5 hardens the Cisco cutover enforcement doctor and bounded archive triage.
-- Static admission remains intentionally blocked until a trusted live pointer authority is configured.
+- PR #5 now contains the canonical `cisco-build-artifacts` provider,
+  redirect-safe bounded acquisition, the intact validated ZIP parser, and the
+  retirement of remote-provider ownership from `bug-triage-playbook`.
+- Canonical completion is source history only. Private overlay catalog,
+  `removed_links`, release publication, installed-pointer, pointer-authority,
+  and base-change-enforcement admission remain external blockers.
 
 ## Current State
 
+- `skills/cisco-build-artifacts` owns Cisco Jenkins build, console, API,
+  artifact-viewer, fetch, and bounded ZIP inspection interfaces. The network
+  producer has a hard wall deadline with TERM/KILL/reap classification; fetch
+  publication is dirfd-bound, no-follow, same-directory, atomic no-replace,
+  default no-clobber, and reports durability separately.
+- `bug-triage-playbook` is an explicitly invoked optional hypothesis
+  reference with implicit invocation disabled. It owns no Jenkins, Cisco,
+  remote-artifact, or GitHub Actions route; ordinary diagnosis falls through
+  to the base model and GitHub Actions stays with the GitHub provider.
+- This repository does not claim the provider is installed. The candidate PR
+  remains open and cutover admission remains blocked.
 - Directory mode-restoration failures make cleanup proof inconclusive even when all later removals succeed; retained-object evidence reflects only objects still locatable after cleanup.
 - Workflow ID and SHA Actions variables must match both the administrator-pinned inputs and the selected native workflow metadata.
 - Root-only DAC bypass and non-reaping PID 1 behavior no longer make the related tests host-dependent.
@@ -50,9 +65,15 @@ superseded_by:
 
 ## Next Steps
 
-- Configure the trusted live pointer authority and collect fresh live evidence before attempting cutover admission.
-- Supply and independently validate merge-queue or provider enforcement for the required `edited`-equivalent base-change reevaluation before activating the ruleset.
-- Preserve the exact workflow, ruleset, run-attempt, and candidate head/base bindings when refreshing evidence.
+- Sync the canonical provider into one validated private-overlay release with
+  matching routing, active catalog, and `removed_links` retirement state.
+- Configure the trusted live pointer authority and collect fresh live evidence
+  before attempting cutover admission.
+- Supply and independently validate merge-queue or provider enforcement for
+  the required `edited`-equivalent base-change reevaluation before
+  activating the ruleset.
+- Preserve the exact workflow, ruleset, run-attempt, and candidate head/base
+  bindings when refreshing evidence.
 
 ## Evidence
 
@@ -83,3 +104,6 @@ superseded_by:
 - Hosted Linux fixed-curl integration now independently classifies the actual `/usr/bin/curl` owner/type/mode chain before launch and requires exactly one outcome: an unsafe runner-owned chain must return `collector-unavailable` with zero transport launches, while a root-owned non-writable chain must exercise the successful request path.
 - The hosted macOS ACL integration now runs the fixed-curl directory-ACL regression explicitly, and the CI-selection contract test requires that entry, so Darwin descriptor-ACL enforcement cannot disappear while the Linux owner/type/mode integration still passes.
 - Claude lane temporarily waived by Joey before 2026-08-01 00:00 Asia/Shanghai; the lane was not run and is not classified as completed.
+- Canonical-provider precommit suites on Python 3.13.0 and system Python 3.9.6 each passed all 350 tests: 285 retained archive/cutover tests plus 65 remote acquisition, supervision, publication, packaging, and routing tests. Dual-runtime compilation also passed for every CI-listed helper and test.
+- A read-only implementation pre-audit found post-link receipt drift, name-based successful cleanup, post-exit-only pipe caps, direct-child/group overclaiming, and success-metadata terminal injection. The repair seals the stage read-only, closes the writable descriptor, uses Darwin `RENAME_EXCL` or Linux `RENAME_NOREPLACE`, revalidates destination identity and the complete receipt, drains both worker pipes under runtime byte caps, scopes reap labels to the direct producer, and escapes all metadata output.
+- Ruff 0.13.2 lint and format checks, actionlint 1.7.12, `git diff --check`, the installed OpenAI skill validator for both skills, and the project-journal validator passed for the canonical-provider candidate.

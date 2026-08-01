@@ -34,8 +34,9 @@ from typing import Any, Iterator
 from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-SKILL_ROOT = REPO_ROOT / "skills/bug-triage-playbook"
-SCRIPT_PATH = SKILL_ROOT / "scripts/archive_triage.py"
+CISCO_SKILL_ROOT = REPO_ROOT / "skills/cisco-build-artifacts"
+BUG_SKILL_ROOT = REPO_ROOT / "skills/bug-triage-playbook"
+SCRIPT_PATH = CISCO_SKILL_ROOT / "scripts/archive_triage.py"
 CUTOVER_VALIDATOR_PATH = REPO_ROOT / "scripts/validate_cisco_cutover_receipt.py"
 CUTOVER_ENFORCEMENT_DOCTOR_PATH = (
     REPO_ROOT / "scripts/doctor_cisco_cutover_enforcement.py"
@@ -6997,24 +6998,29 @@ class BugTriageDocumentationTests(unittest.TestCase):
             raise AssertionError(f"expected one cutover variable: {name}")
         return matches[0]
 
-    def test_bootstrap_retains_legacy_jenkins_entrypoint(self) -> None:
-        skill = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+    def test_canonical_skill_owns_jenkins_and_archive_entrypoints(self) -> None:
+        skill = (CISCO_SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        bug_skill = (BUG_SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        bug_agent = (BUG_SKILL_ROOT / "agents/openai.yaml").read_text(encoding="utf-8")
         readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
 
-        self.assertIn("jenkins_artifact_probe.py", skill)
+        self.assertIn("cisco_build_artifacts.py", skill)
         self.assertIn("scripts/archive_triage.py", skill)
         self.assertIn("references/local-artifact-recipes.md", skill)
         self.assertTrue(
-            (SKILL_ROOT / "references/jenkins-artifact-recipes.md").is_file()
+            (CISCO_SKILL_ROOT / "references/remote-artifact-recipes.md").is_file()
         )
-        self.assertTrue((SKILL_ROOT / "scripts/jenkins_artifact_probe.py").is_file())
-        self.assertTrue((REPO_ROOT / "tests/test_jenkins_artifact_probe.py").is_file())
-        self.assertIn("retains the existing Jenkins", readme)
+        self.assertTrue(
+            (CISCO_SKILL_ROOT / "scripts/cisco_build_artifacts.py").is_file()
+        )
+        self.assertTrue((REPO_ROOT / "tests/test_cisco_build_artifacts.py").is_file())
+        self.assertIn("does not own remote artifact acquisition", bug_skill)
+        self.assertIn("allow_implicit_invocation: false", bug_agent)
+        self.assertIn("canonical `cisco-build-artifacts` source", readme)
 
-    def test_local_archive_helper_has_no_remote_auth_contract(self) -> None:
+    def test_local_archive_parser_has_no_remote_auth_contract(self) -> None:
         local_files = [
-            SKILL_ROOT / "references/local-artifact-recipes.md",
-            SKILL_ROOT / "scripts/archive_triage.py",
+            CISCO_SKILL_ROOT / "scripts/archive_triage.py",
         ]
         local_text = "\n".join(path.read_text(encoding="utf-8") for path in local_files)
 
@@ -7045,7 +7051,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
                 self.assertNotIn(forbidden, source)
 
     def test_local_recipe_budgets_artifact_reads(self) -> None:
-        recipe = (SKILL_ROOT / "references/local-artifact-recipes.md").read_text(
+        recipe = (CISCO_SKILL_ROOT / "references/local-artifact-recipes.md").read_text(
             encoding="utf-8"
         )
 
@@ -7114,7 +7120,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
         self.assertIn("absence of trailing compressed data", recipe)
 
     def test_documented_member_regex_matches_literal_log_suffix(self) -> None:
-        recipe = (SKILL_ROOT / "references/local-artifact-recipes.md").read_text(
+        recipe = (CISCO_SKILL_ROOT / "references/local-artifact-recipes.md").read_text(
             encoding="utf-8"
         )
         pattern_line = next(
@@ -7334,7 +7340,7 @@ class BugTriageDocumentationTests(unittest.TestCase):
                     self.assertIn(f"{name}: ${{{{ vars.{name} }}}}", workflow)
                 self.assertIn(name, program)
         self.assertNotIn("CISCO_CUTOVER_", regular_ci)
-        self.assertIn("tests.test_jenkins_artifact_probe", regular_ci)
+        self.assertIn("tests.test_cisco_build_artifacts", regular_ci)
         self.assertIn("doctor_cisco_cutover_enforcement.py", regular_ci)
 
     def test_ci_exercises_linux_transport_and_real_darwin_acl_integration(
@@ -15558,13 +15564,13 @@ class BugTriageDocumentationTests(unittest.TestCase):
             encoding="utf-8"
         )
         handoff = migration.split("## Handoff To Base-Model Diagnosis", 1)[1].split(
-            "## Private Migration Tests",
+            "## Canonical Implementation And Private Cutover Tests",
             1,
         )[0]
         self.assertNotIn("explicitly invoke `$bug-triage-playbook`", handoff)
         self.assertIn("ordinary base-model diagnosis", handoff)
         self.assertIn("must not invoke or\nrecreate an installed", handoff)
-        self.assertIn("optional source tool", handoff)
+        self.assertIn("canonical checkout\nis source evidence only", handoff)
 
     def test_cutover_validator_without_receipt_remains_blocked(self) -> None:
         result = self._run_cutover_validator()

@@ -1,11 +1,13 @@
 # Local Artifact Recipes
 
-Use these recipes after the authoritative log or archive is already available
-on disk. Remote access, authentication, and provider-specific artifact
-selection stay with the provider owner.
+Use these recipes after `scripts/cisco_build_artifacts.py` has placed the
+authoritative Cisco log or archive on disk. Remote access, authentication, and
+artifact selection remain in that helper; this local helper never reads
+credentials or opens a network connection.
 
-Follow the provider boundaries in `SKILL.md`. Use the owning provider workflow
-first, then pass the resulting local path plus provenance into this playbook.
+Follow the ownership and handoff boundaries in `SKILL.md`, then pass the
+resulting bounded excerpt plus fetch provenance directly to base-model
+diagnosis.
 
 ## Contents
 
@@ -25,9 +27,10 @@ artifact_dir="$(mktemp -d /tmp/codex-artifact.XXXXXX)"
 trap 'rm -rf "$artifact_dir"' EXIT
 ```
 
-Copy or download artifacts into that directory through the provider-specific
-workflow. Do not put credentials, authorization headers, or private host
-policy into the generic inspection commands below.
+Download artifacts into that directory with the sibling
+`scripts/cisco_build_artifacts.py fetch-url` command. Do not put credentials,
+authorization headers, or private host policy into the local inspection
+commands below.
 
 ## 2. Orient Before Printing Lines
 
@@ -61,7 +64,7 @@ deciding whether a larger read is justified.
 List a bounded sample:
 
 ```bash
-python3 "<path-to-skill>/scripts/archive_triage.py" zip-list \
+python3 "<loaded-skill-dir>/scripts/archive_triage.py" zip-list \
   "$artifact_dir/run.zip" \
   --limit 80
 ```
@@ -69,7 +72,7 @@ python3 "<path-to-skill>/scripts/archive_triage.py" zip-list \
 Narrow to likely text evidence:
 
 ```bash
-python3 "<path-to-skill>/scripts/archive_triage.py" zip-list \
+python3 "<loaded-skill-dir>/scripts/archive_triage.py" zip-list \
   "$artifact_dir/run.zip" \
   --match 'console|error|fail|log' \
   --ignore-case \
@@ -81,7 +84,7 @@ python3 "<path-to-skill>/scripts/archive_triage.py" zip-list \
 Show a known member:
 
 ```bash
-python3 "<path-to-skill>/scripts/archive_triage.py" zip-show \
+python3 "<loaded-skill-dir>/scripts/archive_triage.py" zip-show \
   "$artifact_dir/run.zip" \
   'logs/console.txt' \
   --head 120 \
@@ -91,7 +94,7 @@ python3 "<path-to-skill>/scripts/archive_triage.py" zip-show \
 Select a member by regular expression and show matching lines with context:
 
 ```bash
-python3 "<path-to-skill>/scripts/archive_triage.py" zip-show \
+python3 "<loaded-skill-dir>/scripts/archive_triage.py" zip-show \
   "$artifact_dir/run.zip" \
   'error.*\.log' \
   --regex \
@@ -101,8 +104,8 @@ python3 "<path-to-skill>/scripts/archive_triage.py" zip-show \
   --line-numbers
 ```
 
-The helper only reads local ZIP members. It does not fetch URLs, choose a
-provider artifact, or handle credentials.
+The helper only reads local ZIP members. It does not fetch URLs, choose a Cisco
+artifact, or handle credentials.
 
 Its defaults reject archive files above 256 MiB, central directories above
 64 MiB, or archives above 10,000 members; cap member listings at 200 entries;
@@ -240,7 +243,7 @@ characters before output character accounting and publication.
 
 Prefer:
 
-- the local artifact path and its provider-supplied provenance
+- the local artifact path and acquisition-helper provenance
 - the member or file name inspected
 - five to ten key lines with line numbers
 - the leading hypothesis and strongest alternative

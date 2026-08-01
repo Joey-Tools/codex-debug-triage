@@ -1,38 +1,43 @@
-# Private `cisco-build-artifacts` Migration Contract
+# Cisco Build Artifacts Canonical And Private Cutover Contract
 
-This document records the private functionality planned for removal from the
-public `bug-triage-playbook` only after the cutover contract is satisfied. The
-current compatibility/bootstrap branch intentionally retains the public
-Jenkins entrypoint. This is a handoff contract for a separately owned private
-`cisco-build-artifacts` skill, not an implementation or an installation
-instruction.
+This repository now contains the canonical `skills/cisco-build-artifacts`
+implementation and the candidate retirement of remote-provider ownership from
+`bug-triage-playbook`. The validated ZIP parser moved intact; the new remote
+helper supplies redirect-safe authentication, supervised bounded streaming,
+and descriptor-bound atomic no-clobber publication.
 
-Keep actual Cisco hosts, job families, credential variable names, authentication
-profiles, approval prefixes, and private examples in the private repository.
+That canonical completion is not installation evidence. Actual Cisco hosts,
+job families, credential values, private examples, approval prefixes, active
+catalog membership, `removed_links`, release publication, and installed-pointer
+state remain owned by the private overlay and its independently trusted
+cutover.
 
 ## Ownership Boundary
 
-The private skill owns:
+The canonical skill source owns:
 
 - Cisco build and Jenkins URL recognition
-- exact HTTPS host allowlists
-- named authentication profiles and their credential sources
+- exact HTTPS host allowlists and profile-policy mechanisms
+- named authentication-profile interfaces and credential isolation
 - approval and network preflight
 - build, console, API, and artifact identity resolution
 - bounded remote reads and downloads
 - bounded archive validation, extraction, and evidence publication for fetched
   Cisco build artifacts
 - authentication and HTTP failure classification
-- private examples and job-family guidance
+- redaction-safe examples and failure classifications
 
-After cutover, ordinary local-log and local-artifact diagnosis returns directly
-to the base model; it has no installed skill route or catalog dependency. The
-public repository may retain `scripts/archive_triage.py`, references, and tests
-as optional source assets, but the installed private overlay neither links nor
-routes to `bug-triage-playbook`. When explicitly used from this source
-repository, the optional local helper performs no network or authentication
-work and keeps its own conservative size and count defaults as immutable hard
-ceilings. Its in-process
+The private overlay supplies the real exact host sets, profile-to-host
+authorization, credential values, private examples, and approval policy. It
+must sync the canonical implementation without weakening any immutable hard
+ceiling or protected property.
+
+After cutover, ordinary local-log diagnosis returns directly to the base model;
+it has no installed skill route or catalog dependency. Cisco archive
+inspection stays with the canonical provider. The installed private overlay
+neither links nor routes to `bug-triage-playbook`. The local archive parser
+performs no network or authentication work and keeps its conservative size and
+count defaults as immutable hard ceilings. Its in-process
 `ITIMER_REAL` budget is best effort: it covers central-directory validation,
 decompression, the post-selection validation drain, bounded output publication,
 and the underlying output flush when the operating system returns control to
@@ -836,9 +841,9 @@ live ruleset was changed during this audit. That unproved external
 administrator state is the rollout blocker. Do not weaken or skip it to
 collapse the merges into one.
 
-## Private Command Interface To Preserve
+## Canonical Command Interface
 
-Provide a private helper with these conceptual subcommands:
+The canonical helper provides these subcommands:
 
 ```text
 probe-url <url> [--method HEAD|GET] [--auth-profile <name>] [--timeout <seconds>] [--sniff-bytes <n>]
@@ -846,7 +851,7 @@ show-url <url> [--auth-profile <name>] [--timeout <seconds>] [--head <n> | --tai
 fetch-url <url> --output <path> [--auth-profile <name>] [--timeout <seconds>] [--max-body-bytes <n>]
 ```
 
-The private implementation should preserve these properties:
+The canonical implementation preserves these properties:
 
 1. Reject non-HTTPS URLs, inline URL credentials, and hosts outside the exact
    private allowlist before network access.
@@ -899,6 +904,10 @@ than copy its unbounded `response.read()` and direct `write_bytes()` behavior.
 - Enforce a hard downloaded-byte cap while streaming even when
   `Content-Length` is missing or false. Reject an oversized declared length
   before download, but never rely on that declaration alone.
+- Drain producer stdout and stderr incrementally under the same wall deadline;
+  terminate and reap the direct producer at the first byte beyond fixed 256
+  KiB stdout or 8 KiB stderr retained ceilings. Do not use a post-exit
+  `communicate()` size check that first materializes unbounded output.
 - Give direct text output independent byte, line, and line-length caps.
   Implement head with early termination, tail with a bounded deque, and
   grep/context with bounded state.
@@ -908,7 +917,8 @@ than copy its unbounded `response.read()` and direct `write_bytes()` behavior.
   persisted artifact bytes separately. Enforce wire and entity caps whenever
   content decoding is enabled, and report which representation is persisted.
 
-Before activating the private skill, define exact `DEFAULT_*` and
+Before activating the private overlay route, retain the canonical exact
+`DEFAULT_*` and
 `HARD_MAX_*` constants for redirects, connect/read/total timeouts, probe sniff
 bytes, wire/entity body bytes, download bytes, output lines/characters, and
 archive/member limits. Omitted values use the default; zero, negative, and
@@ -944,6 +954,16 @@ To preserve them:
 2. Create a private same-directory staging file relative to that held `dirfd`,
    with exclusive creation, no-follow semantics, and restrictive permissions.
    Hold its descriptor throughout streaming, verification, flush, and `fsync`.
+   Bind its initial owner, mode, and descriptor ACL. On Darwin, reject extended
+   allow and inherited/inheritable ACL entries; on Linux, bind the bounded raw
+   POSIX access ACL alongside the separately checked mode mask. Unsupported or
+   unreadable ACL inspection fails closed. Refuse publication and cleanup when
+   the staged object's later access-policy binding differs.
+   After the producer exits, verify its receipt, deliberately narrow mode
+   `0600` to `0400`, bind the narrowed ACL state, synchronize the writable
+   descriptor, reopen the same object read-only, and close the writable
+   descriptor. This expected narrowing is not content mutation; any object,
+   size, owner, link-count, or policy drift around it is a mismatch.
 3. Track the staged object through descriptor identity. Do not treat unrelated
    directory-entry churn or timestamps alone as content mutation; require
    object replacement, content change, or access-policy change to classify a
@@ -954,14 +974,20 @@ To preserve them:
    in an attacker-writable directory, require either the trusted-control
    precondition above or a platform primitive that publishes directly from the
    held staged object; otherwise block.
-4. Publish relative to the same held `dirfd` with an operating-system
-   no-replace atomic primitive. Do not use an `exists()` check followed by
+4. Consume the staging name relative to the same held `dirfd` with the
+   operating system's no-replace atomic primitive: an atomic rename using
+   `RENAME_EXCL` on Darwin or
+   `RENAME_NOREPLACE` on Linux). Do not use an `exists()` check followed by
    `os.replace()`, because that can overwrite a destination created in the race
-   window.
+   window. Reopen the visible destination without following symlinks or
+   blocking on a substituted special file, compare it to the retained
+   read-only descriptor, and recheck exact size and SHA-256 before reporting a
+   verified publication.
 5. Sync the held containing directory where the platform contract requires it.
-   Remove only the helper-owned staging entry through that same `dirfd` after a
-   failed publication, and never delete or overwrite the caller's existing
-   destination.
+   A successful rename leaves no separate staging entry. After a failed
+   publication, remove a staging name only while the trusted parent, held
+   object, pathname binding, owner/mode/ACL policy, and expected link count all
+   revalidate; never delete or overwrite the caller's existing destination.
 6. Report unreadable or failed revalidation separately from destination
    missing, destination already present, content mismatch, and policy mismatch.
 7. If no-replace publication succeeds but the containing-directory `fsync`
@@ -982,18 +1008,16 @@ bytes=<downloaded byte count>
 auth_profile=<profile label, never credential material>
 ```
 
-The private `cisco-build-artifacts` provider owns any required bounded archive
-inspection and then supplies the resulting local path or bounded excerpts plus
-this provenance to ordinary base-model diagnosis. The caller must not invoke or
-recreate an installed `$bug-triage-playbook` route. A maintainer may explicitly
-use the public repository's helper as an optional source tool, but that choice
-is not an active-catalog entry, installed link, receipt dependency, or generic
-diagnosis router. Base-model diagnosis must not infer or retry Cisco
-authentication.
+The installed `cisco-build-artifacts` provider owns required bounded archive
+inspection and supplies the resulting local path or bounded excerpts plus this
+provenance to ordinary base-model diagnosis. The caller must not invoke or
+recreate an installed `$bug-triage-playbook` route. The canonical checkout
+is source evidence only until the private catalog/link/pointer transaction
+installs it. Base-model diagnosis must not infer or retry Cisco authentication.
 
-## Private Migration Tests
+## Canonical Implementation And Private Cutover Tests
 
-Move or recreate private tests covering:
+Canonical tests cover:
 
 - HTTPS, host-allowlist, and inline-credential rejection before network access
 - redirect downgrade, disallowed cross-host hops, loops, and redirect-count caps
