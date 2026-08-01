@@ -28,6 +28,11 @@ superseded_by:
   producer has a hard wall deadline with TERM/KILL/reap classification; fetch
   publication is dirfd-bound, no-follow, same-directory, atomic no-replace,
   default no-clobber, and reports durability separately.
+- Fetch rejects a premature HTTP EOF whenever the exact declared
+  `Content-Length` was not received, so no partial staged body can reach
+  publication. The response read timeout is bound before `getresponse()` can
+  clear `connection.sock` for `Connection: close`; the producer supervisor
+  independently retains the hard total deadline.
 - `bug-triage-playbook` is an explicitly invoked optional hypothesis
   reference with implicit invocation disabled. It owns no Jenkins, Cisco,
   remote-artifact, or GitHub Actions route; ordinary diagnosis falls through
@@ -107,3 +112,6 @@ superseded_by:
 - Canonical-provider precommit suites on Python 3.13.0 and system Python 3.9.6 each passed all 350 tests: 285 retained archive/cutover tests plus 65 remote acquisition, supervision, publication, packaging, and routing tests. Dual-runtime compilation also passed for every CI-listed helper and test.
 - A read-only implementation pre-audit found post-link receipt drift, name-based successful cleanup, post-exit-only pipe caps, direct-child/group overclaiming, and success-metadata terminal injection. The repair seals the stage read-only, closes the writable descriptor, uses Darwin `RENAME_EXCL` or Linux `RENAME_NOREPLACE`, revalidates destination identity and the complete receipt, drains both worker pipes under runtime byte caps, scopes reap labels to the direct producer, and escapes all metadata output.
 - Ruff 0.13.2 lint and format checks, actionlint 1.7.12, `git diff --check`, the installed OpenAI skill validator for both skills, and the project-journal validator passed for the canonical-provider candidate.
+- The post-review real-HTTP regression suite passed 67 tests on Python 3.13.0,
+  including `Connection: close` body reads and premature `Content-Length` EOF
+  cleanup with no published destination.

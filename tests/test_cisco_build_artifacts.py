@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import errno
 import hashlib
+import http.client
 import importlib.util
 import io
 import os
 import pathlib
+import socket
 import subprocess
 import sys
 import tempfile
@@ -95,6 +97,35 @@ class FakeConnection:
 
     def close(self) -> None:
         self.closed = True
+
+
+class WireConnection:
+    def __init__(self, wire_response: bytes) -> None:
+        self.transport_socket, peer = socket.socketpair()
+        peer.sendall(wire_response)
+        peer.shutdown(socket.SHUT_WR)
+        peer.close()
+        self.sock: socket.socket | None = self.transport_socket
+        self.requests: list[tuple[str, str, dict[str, str]]] = []
+        self.timeout_before_headers: float | None = None
+
+    def request(self, method: str, target: str, *, headers: dict[str, str]) -> None:
+        self.requests.append((method, target, dict(headers)))
+
+    def getresponse(self) -> http.client.HTTPResponse:
+        assert self.sock is not None
+        self.timeout_before_headers = self.sock.gettimeout()
+        response = http.client.HTTPResponse(self.sock)
+        response.begin()
+        if response.will_close:
+            self.sock.close()
+            self.sock = None
+        return response
+
+    def close(self) -> None:
+        if self.sock is not None:
+            self.sock.close()
+            self.sock = None
 
 
 def base_payload(**overrides):
@@ -386,6 +417,46 @@ class RedirectPolicyTests(unittest.TestCase):
         self.assertIs(response, connection.response)
         self.assertIs(opened, connection)
 
+    def test_connection_close_preserves_bounded_body_reads(self) -> None:
+        connection = WireConnection(
+            b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 4\r\n\r\ndata"
+        )
+        with mock.patch.object(
+            MODULE,
+            "_make_https_connection",
+            return_value=connection,
+        ):
+            with mock.patch.object(MODULE.ssl, "create_default_context"):
+                response, opened, _, _, _ = MODULE._open_final_response(
+                    "https://jenkins.example.com/job/example",
+                    method="GET",
+                    auth_profile=None,
+                    max_redirects=5,
+                    connect_timeout=1,
+                    read_timeout=0.5,
+                    deadline=time.monotonic() + 5,
+                )
+        try:
+            self.assertIs(opened, connection)
+            self.assertIsNone(connection.sock)
+            self.assertIsNotNone(connection.timeout_before_headers)
+            assert connection.timeout_before_headers is not None
+            self.assertGreater(connection.timeout_before_headers, 0)
+            self.assertLessEqual(connection.timeout_before_headers, 0.5)
+            self.assertEqual(
+                b"".join(
+                    MODULE._response_chunks(
+                        response,
+                        max_bytes=4,
+                        deadline=time.monotonic() + 5,
+                    )
+                ),
+                b"data",
+            )
+        finally:
+            response.close()
+            connection.close()
+
 
 class StreamingBudgetTests(unittest.TestCase):
     def _show(self, response: FakeResponse, **overrides):
@@ -480,7 +551,13 @@ class StreamingBudgetTests(unittest.TestCase):
             with mock.patch.object(
                 MODULE,
                 "_open_final_response",
-                return_value=(response, connection, initial, 0, "absent"),
+                return_value=(
+                    response,
+                    connection,
+                    initial,
+                    0,
+                    "absent",
+                ),
             ):
                 with self.assertRaisesRegex(MODULE.CommandFailure, "byte cap"):
                     MODULE._worker_fetch(payload, time.monotonic() + 5)
@@ -509,7 +586,13 @@ class StreamingBudgetTests(unittest.TestCase):
             with mock.patch.object(
                 MODULE,
                 "_open_final_response",
-                return_value=(response, connection, initial, 0, "absent"),
+                return_value=(
+                    response,
+                    connection,
+                    initial,
+                    0,
+                    "absent",
+                ),
             ):
                 with self.assertRaisesRegex(MODULE.CommandFailure, "declared"):
                     MODULE._worker_fetch(payload, time.monotonic() + 5)
@@ -536,7 +619,13 @@ class StreamingBudgetTests(unittest.TestCase):
             with mock.patch.object(
                 MODULE,
                 "_open_final_response",
-                return_value=(response, connection, initial, 0, "absent"),
+                return_value=(
+                    response,
+                    connection,
+                    initial,
+                    0,
+                    "absent",
+                ),
             ):
                 result = MODULE._worker_fetch(payload, time.monotonic() + 5)
             self.assertEqual(result["persisted_bytes"], len(payload_bytes))
@@ -567,7 +656,13 @@ class StreamingBudgetTests(unittest.TestCase):
         with mock.patch.object(
             MODULE,
             "_open_final_response",
-            return_value=(response, connection, initial, 0, "present"),
+            return_value=(
+                response,
+                connection,
+                initial,
+                0,
+                "present",
+            ),
         ):
             with self.assertRaises(MODULE.CommandFailure) as raised:
                 MODULE._worker_show(payload, time.monotonic() + 5)
@@ -587,7 +682,13 @@ class StreamingBudgetTests(unittest.TestCase):
         with mock.patch.object(
             MODULE,
             "_open_final_response",
-            return_value=(response, connection, initial, 0, "absent"),
+            return_value=(
+                response,
+                connection,
+                initial,
+                0,
+                "absent",
+            ),
         ):
             with self.assertRaises(MODULE.CommandFailure) as raised:
                 MODULE._worker_show(payload, time.monotonic() + 5)
@@ -608,7 +709,13 @@ class StreamingBudgetTests(unittest.TestCase):
         with mock.patch.object(
             MODULE,
             "_open_final_response",
-            return_value=(response, connection, initial, 0, "absent"),
+            return_value=(
+                response,
+                connection,
+                initial,
+                0,
+                "absent",
+            ),
         ):
             result = MODULE._worker_probe(payload, time.monotonic() + 5)
         self.assertEqual(result["wire_bytes"], 4)
@@ -1201,6 +1308,50 @@ class AtomicPublicationTests(unittest.TestCase):
             self.assertEqual(error.cleanup, "term-reaped")
             self.assertEqual(error.metadata["producer_cleanup"], "term-reaped")
             self.assertEqual(error.metadata["staging_cleanup"], "complete")
+            self.assertFalse((workspace / "artifact.zip").exists())
+            self.assertEqual(
+                list(workspace.glob(".cisco-build-artifacts.*.tmp")),
+                [],
+            )
+
+    def test_early_content_length_eof_never_publishes_partial_content(self) -> None:
+        with workspace_directory() as workspace:
+            args = MODULE.build_parser().parse_args(
+                [
+                    "fetch-url",
+                    "https://jenkins.example.com/file.zip",
+                    "--output",
+                    "artifact.zip",
+                    "--read-timeout",
+                    "0.5",
+                ]
+            )
+            connection = WireConnection(
+                b"HTTP/1.1 200 OK\r\n"
+                b"Connection: close\r\n"
+                b"Content-Length: 10\r\n"
+                b"\r\n"
+                b"four"
+            )
+
+            def run_worker(payload, *, deadline, pass_fds=()):
+                self.assertEqual(pass_fds, (payload["stage_fd"],))
+                with mock.patch.object(
+                    MODULE,
+                    "_make_https_connection",
+                    return_value=connection,
+                ):
+                    with mock.patch.object(MODULE.ssl, "create_default_context"):
+                        return MODULE._worker_fetch(payload, deadline)
+
+            with mock.patch.object(MODULE, "_run_worker", side_effect=run_worker):
+                with self.assertRaises(MODULE.CommandFailure) as raised:
+                    MODULE._execute_fetch(args, time.monotonic() + 5)
+            error = raised.exception
+            self.assertEqual(error.classification, "remote-read-error")
+            self.assertEqual(error.cleanup, "complete")
+            self.assertEqual(error.metadata["consumed_bytes"], 4)
+            self.assertEqual(error.metadata["declared_bytes"], 10)
             self.assertFalse((workspace / "artifact.zip").exists())
             self.assertEqual(
                 list(workspace.glob(".cisco-build-artifacts.*.tmp")),

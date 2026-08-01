@@ -659,11 +659,16 @@ def _open_final_response(
         )
         try:
             connection.request(method, current.request_target, headers=headers)
+            socket_before_headers = getattr(connection, "sock", None)
+            if socket_before_headers is None:
+                raise OSError(errno.ENOTCONN, "HTTPS response socket is unavailable")
+            # http.client may clear connection.sock for Connection: close after
+            # getresponse(). Bind the body-read timeout before that transition;
+            # the parent supervisor independently enforces the hard wall clock.
+            socket_before_headers.settimeout(
+                min(read_timeout, _remaining(deadline, "response headers"))
+            )
             response = connection.getresponse()
-            if getattr(connection, "sock", None) is not None:
-                connection.sock.settimeout(
-                    min(read_timeout, _remaining(deadline, "response setup"))
-                )
         except (OSError, http.client.HTTPException, ssl.SSLError) as error:
             connection.close()
             raise CommandFailure(
@@ -719,17 +724,13 @@ def _open_final_response(
 
 def _response_chunks(
     response: Any,
-    connection: Any,
     *,
     max_bytes: int,
     deadline: float,
-    read_timeout: float,
 ) -> Iterator[bytes]:
     consumed = 0
     while True:
-        remaining = _remaining(deadline, "response read")
-        if getattr(connection, "sock", None) is not None:
-            connection.sock.settimeout(min(read_timeout, remaining))
+        _remaining(deadline, "response read")
         request_size = min(HTTP_CHUNK_BYTES, max_bytes - consumed + 1)
         try:
             chunk = response.read(request_size)
@@ -1031,10 +1032,8 @@ def _worker_probe(payload: dict[str, Any], deadline: float) -> dict[str, Any]:
             try:
                 for chunk in _response_chunks(
                     response,
-                    connection,
                     max_bytes=cap,
                     deadline=deadline,
-                    read_timeout=payload["read_timeout"],
                 ):
                     body.extend(chunk)
             except CommandFailure as error:
@@ -1105,10 +1104,8 @@ def _worker_show(payload: dict[str, Any], deadline: float) -> dict[str, Any]:
         try:
             for chunk in _response_chunks(
                 response,
-                connection,
                 max_bytes=payload["max_body_bytes"],
                 deadline=deadline,
-                read_timeout=payload["read_timeout"],
             ):
                 consumed += len(chunk)
                 selector.feed(chunk)
@@ -1205,14 +1202,22 @@ def _worker_fetch(payload: dict[str, Any], deadline: float) -> dict[str, Any]:
             )
         for chunk in _response_chunks(
             response,
-            connection,
             max_bytes=payload["max_body_bytes"],
             deadline=deadline,
-            read_timeout=payload["read_timeout"],
         ):
             _write_all(stage_fd, chunk)
             digest.update(chunk)
             consumed += len(chunk)
+        if declared is not None and consumed != declared:
+            raise CommandFailure(
+                "remote-read-error",
+                "response body length did not match declared Content-Length",
+                exit_code=EXIT_REMOTE,
+                metadata={
+                    "consumed_bytes": consumed,
+                    "declared_bytes": declared,
+                },
+            )
         result = _base_result(
             initial,
             final,
