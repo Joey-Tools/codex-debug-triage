@@ -1,0 +1,89 @@
+{
+  "schema_version": 4,
+  "source_organization": {
+    "id": 283943935,
+    "login": "Joey-Tools"
+  },
+  "target_repository": {
+    "id": 1242512092,
+    "full_name": "Joey-Tools/codex-debug-triage",
+    "default_branch": "master"
+  },
+  "ruleset": {
+    "source_type": "Organization",
+    "source": "Joey-Tools",
+    "target": "branch",
+    "enforcement": "active",
+    "conditions": {
+      "repository_id": {
+        "repository_ids": [
+          1242512092
+        ]
+      },
+      "ref_name": {
+        "include": [
+          "~DEFAULT_BRANCH"
+        ],
+        "exclude": []
+      }
+    },
+    "bypass_actors": []
+  },
+  "required_workflow": {
+    "repository_id": 1242512092,
+    "repository_full_name": "Joey-Tools/codex-debug-triage",
+    "path": ".github/workflows/cisco-cutover-admission.yml",
+    "ref": "refs/heads/master",
+    "state": "active",
+    "event": "pull_request_target",
+    "check_name": "cisco-cutover-admission",
+    "provider": {
+      "id": 15368,
+      "slug": "github-actions"
+    },
+    "do_not_enforce_on_create": false,
+    "require_exact_sha": true
+  },
+  "applicability_selector": {
+    "target_pr_number_variable": "CISCO_CUTOVER_TARGET_PR_NUMBER",
+    "target_head_sha_variable": "CISCO_CUTOVER_TARGET_HEAD_SHA",
+    "target_base_sha_variable": "CISCO_CUTOVER_TARGET_BASE_SHA",
+    "selector_job_name": "cisco-cutover-selector",
+    "target_job_name": "cisco-cutover-admission",
+    "neutral_job_name": "cisco-cutover-neutral",
+    "non_target_classification": "not_applicable"
+  },
+  "base_change_enforcement": {
+    "status": "unavailable",
+    "reason": "ruleset-workflow-default-activities-exclude-edited",
+    "event": "pull_request_target",
+    "required_activity": "edited",
+    "ruleset_dispatch_activities": [
+      "opened",
+      "synchronize",
+      "reopened"
+    ]
+  },
+  "cutover_input_variables": [
+    "CISCO_CUTOVER_TARGET_PR_NUMBER",
+    "CISCO_CUTOVER_TARGET_HEAD_SHA",
+    "CISCO_CUTOVER_TARGET_BASE_SHA",
+    "CISCO_CUTOVER_RECEIPT_BASE64",
+    "CISCO_CUTOVER_EXPECTED_CANONICAL_COMMIT",
+    "CISCO_CUTOVER_EXPECTED_PRIVATE_RELEASE_COMMIT",
+    "CISCO_CUTOVER_EXPECTED_RELEASE_MANIFEST_SHA256",
+    "CISCO_CUTOVER_EXPECTED_RECEIPT_SHA256",
+    "CISCO_CUTOVER_EXPECTED_WORKFLOW_ID",
+    "CISCO_CUTOVER_EXPECTED_WORKFLOW_SHA",
+    "CISCO_CUTOVER_EXPECTED_INSTALLATION_SCOPE_ID",
+    "CISCO_CUTOVER_EXPECTED_POINTER_GENERATION",
+    "CISCO_CUTOVER_EXPECTED_POINTER_STATE_SHA256"
+  ],
+  "pointer_authority": {
+    "status": "unavailable",
+    "reason": "private-live-authority-not-configured"
+  },
+  "disallowed_status_contexts": [
+    "cisco-cutover-admission"
+  ]
+}

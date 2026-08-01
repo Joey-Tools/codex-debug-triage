@@ -1,0 +1,144 @@
+{
+  "schema_version": 3,
+  "canonical_repository": "Joey-Tools/codex-debug-triage",
+  "canonical_merge_changes_installed_routing": false,
+  "private_aggregate_repository": "Joey-Tools/codex-private-workflows",
+  "activation": {
+    "release_kind": "immutable-private-overlay",
+    "atomic": true,
+    "provider": {
+      "source": "personal_codex/skills/cisco-build-artifacts",
+      "target": "skills/cisco-build-artifacts"
+    },
+    "routing_policy": {
+      "source": "personal_codex/AGENTS.md",
+      "target": "AGENTS.md",
+      "cisco_build_fetch_and_archive": "skills/cisco-build-artifacts",
+      "ordinary_local_diagnosis": "base-model-no-skill-route"
+    },
+    "catalog": {
+      "manifest": "personal_codex/private-sync-manifest.json",
+      "active_target": "skills/cisco-build-artifacts",
+      "removed_target": "skills/bug-triage-playbook"
+    },
+    "removed_link": {
+      "source": "personal_codex/skills/bug-triage-playbook",
+      "target": "skills/bug-triage-playbook",
+      "replacement_target": "skills/cisco-build-artifacts",
+      "replacement_scope": "cisco-build-fetch-and-archive-only"
+    },
+    "public_asset": {
+      "repository": "Joey-Tools/codex-debug-triage",
+      "status": "optional-source-only",
+      "installed_route": false
+    }
+  },
+  "trust_gates": [
+    "private-package-validation",
+    "private-overlay-verifier",
+    "immutable-release-published",
+    "installed-current-pointer-verified"
+  ],
+  "blocked_until_trusted": [
+    "canonical-bug-triage-retirement-pr",
+    "private-consumer-source-sync"
+  ],
+  "unproved_atomicity_fallback": "retain-bug-triage-compat",
+  "base_change_enforcement": {
+    "status": "unavailable",
+    "reason": "ruleset-workflow-default-activities-exclude-edited",
+    "event": "pull_request_target",
+    "required_activity": "edited",
+    "ruleset_dispatch_activities": [
+      "opened",
+      "synchronize",
+      "reopened"
+    ]
+  },
+  "retirement_state_machine": {
+    "phases": [
+      "bootstrap-workflow-merged",
+      "retirement-pr-head-frozen",
+      "private-release-receipt-published",
+      "repository-variables-configured",
+      "organization-ruleset-activated",
+      "target-workflow-observed",
+      "doctor-admitted",
+      "merge-readiness-revalidated",
+      "retirement-pr-merged"
+    ],
+    "head_change_transition": "retirement-pr-head-frozen",
+    "base_change_transition": "retirement-pr-head-frozen",
+    "mutation_authority": "explicit-repository-admin-or-organization-owner",
+    "automatic_mutation": false
+  },
+  "post_cutover_decommission": {
+    "trigger": "retirement-pr-merged-at-frozen-range",
+    "lease_variable": "CISCO_CUTOVER_DECOMMISSION_LEASE",
+    "cutover_input_variables": [
+      "CISCO_CUTOVER_TARGET_PR_NUMBER",
+      "CISCO_CUTOVER_TARGET_HEAD_SHA",
+      "CISCO_CUTOVER_TARGET_BASE_SHA",
+      "CISCO_CUTOVER_RECEIPT_BASE64",
+      "CISCO_CUTOVER_EXPECTED_CANONICAL_COMMIT",
+      "CISCO_CUTOVER_EXPECTED_PRIVATE_RELEASE_COMMIT",
+      "CISCO_CUTOVER_EXPECTED_RELEASE_MANIFEST_SHA256",
+      "CISCO_CUTOVER_EXPECTED_RECEIPT_SHA256",
+      "CISCO_CUTOVER_EXPECTED_WORKFLOW_ID",
+      "CISCO_CUTOVER_EXPECTED_WORKFLOW_SHA",
+      "CISCO_CUTOVER_EXPECTED_INSTALLATION_SCOPE_ID",
+      "CISCO_CUTOVER_EXPECTED_POINTER_GENERATION",
+      "CISCO_CUTOVER_EXPECTED_POINTER_STATE_SHA256"
+    ],
+    "compare_and_swap": {
+      "coordination": "create-if-absent-repository-variable-lease",
+      "observations": [
+        "ruleset-id-and-canonical-sha256",
+        "variable-name-value-sha256-and-updated-at",
+        "workflow-path-and-blob-sha"
+      ],
+      "unsafe-conditional-requests-supported": false,
+      "revalidate-before-each-mutation": true
+    },
+    "ordered_steps": [
+      "acquire-and-read-back-exclusive-lease",
+      "revalidate-merged-pr-range-and-doctor-receipt",
+      "disable-exact-ruleset-after-content-compare",
+      "prove-ruleset-is-not-effective",
+      "remove-workflow-in-separate-reviewed-pr",
+      "prove-workflow-absent-and-ruleset-still-inactive",
+      "delete-exact-cutover-variables-after-value-digest-and-updated-at-compare",
+      "delete-exact-inactive-ruleset-after-content-compare",
+      "prove-rule-variables-and-workflow-are-absent",
+      "delete-lease-last"
+    ],
+    "failure_policy": {
+      "before-ruleset-inactive": "leave-workflow-and-all-variables-intact",
+      "after-ruleset-inactive": "keep-ruleset-inactive-and-resume-cleanup",
+      "concurrent-drift": "abort-before-next-mutation"
+    },
+    "automatic_mutation": false
+  },
+  "receipt_admission": {
+    "status_without_receipt": "blocked_until_trusted",
+    "validator": "scripts/validate_cisco_cutover_receipt.py",
+    "receipt_schema_version": 3,
+    "receipt_max_bytes": 35840,
+    "producer_workflow": ".github/workflows/release.yml",
+    "pointer_name": "current",
+    "pointer_target_template": "releases/{private_release_commit}",
+    "required_exact_inputs": [
+      "expected_canonical_commit",
+      "expected_base_sha",
+      "expected_pull_request_number",
+      "expected_private_release_commit",
+      "expected_release_manifest_sha256",
+      "expected_receipt_sha256",
+      "expected_workflow_id",
+      "expected_workflow_sha",
+      "expected_installation_scope_id",
+      "expected_pointer_generation",
+      "expected_pointer_state_sha256"
+    ]
+  }
+}

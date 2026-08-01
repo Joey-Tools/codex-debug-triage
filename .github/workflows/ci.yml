@@ -12,14 +12,54 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version:
+          - "3.9"
+          - "3.x"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Compile Python helpers
+        run: |
+          python3 -m py_compile \
+            skills/cisco-build-artifacts/scripts/cisco_build_artifacts.py \
+            skills/cisco-build-artifacts/scripts/archive_triage.py \
+            scripts/doctor_cisco_cutover_enforcement.py \
+            scripts/validate_cisco_cutover_receipt.py \
+            tests/test_archive_triage.py \
+            tests/test_cisco_build_artifacts.py
+      - name: Run Linux fixed-curl policy integration
+        run: |
+          python3 -m unittest \
+            tests.test_archive_triage.BugTriageDocumentationTests.test_enforcement_gh_linux_host_fixed_curl_policy_is_enforced
+      - name: Run tests
+        run: |
+          python3 -m unittest \
+            tests.test_archive_triage \
+            tests.test_cisco_build_artifacts
+
+  darwin-acl-integration:
+    runs-on: macos-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.x"
-      - name: Compile Python helpers
+      - name: Run Darwin ACL integration tests
         run: |
-          python3 -m py_compile skills/bug-triage-playbook/scripts/jenkins_artifact_probe.py tests/test_jenkins_artifact_probe.py
-      - name: Run tests
-        run: |
-          python3 -m unittest tests.test_jenkins_artifact_probe
+          python3 -m unittest \
+            tests.test_archive_triage.ArchiveTriageTests.test_snapshot_rejects_inherited_allow_acl_before_copy \
+            tests.test_archive_triage.ArchiveTriageTests.test_source_darwin_acl_drift_after_copy_is_rejected \
+            tests.test_archive_triage.ArchiveTriageTests.test_source_darwin_stable_extended_allow_acl_is_bound_not_rejected \
+            tests.test_archive_triage.BugTriageDocumentationTests.test_enforcement_darwin_acl_ctypes_abi_constants_and_iteration \
+            tests.test_archive_triage.BugTriageDocumentationTests.test_enforcement_gh_acl_allows_only_noninherited_deny_entries \
+            tests.test_archive_triage.BugTriageDocumentationTests.test_enforcement_gh_acl_rejects_inherited_source_token_read_grant \
+            tests.test_archive_triage.BugTriageDocumentationTests.test_enforcement_gh_acl_drift_discards_command_output \
+            tests.test_archive_triage.BugTriageDocumentationTests.test_enforcement_gh_acl_restrictive_deny_churn_is_benign \
+            tests.test_archive_triage.BugTriageDocumentationTests.test_enforcement_gh_acl_drift_is_revalidated_after_spawn_failure \
+            tests.test_archive_triage.BugTriageDocumentationTests.test_enforcement_fixed_curl_rejects_directory_acl_with_safe_mode

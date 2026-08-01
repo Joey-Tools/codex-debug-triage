@@ -1,0 +1,1093 @@
+name: Cisco Cutover Admission
+
+on:
+  pull_request_target:
+    branches:
+      - master
+    types:
+      - edited
+      - opened
+      - reopened
+      - ready_for_review
+      - synchronize
+
+permissions:
+  contents: read
+
+jobs:
+  cisco-cutover-selector:
+    name: cisco-cutover-selector
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    outputs:
+      applicable: ${{ steps.select.outputs.applicable }}
+      target-base-sha: ${{ steps.select.outputs.target-base-sha }}
+      target-head-sha: ${{ steps.select.outputs.target-head-sha }}
+      target-pr-number: ${{ steps.select.outputs.target-pr-number }}
+    steps:
+      - name: Select the exact retirement pull request
+        id: select
+        shell: bash --noprofile --norc -euo pipefail {0}
+        env:
+          EVENT_REPOSITORY: ${{ github.event.repository.full_name }}
+          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          CISCO_CUTOVER_TARGET_BASE_SHA: ${{ vars.CISCO_CUTOVER_TARGET_BASE_SHA }}
+          CISCO_CUTOVER_TARGET_HEAD_SHA: ${{ vars.CISCO_CUTOVER_TARGET_HEAD_SHA }}
+          CISCO_CUTOVER_TARGET_PR_NUMBER: ${{ vars.CISCO_CUTOVER_TARGET_PR_NUMBER }}
+        run: |
+          python3 - <<'SELECTOR_PY'
+          import json
+          import os
+          import re
+
+          EXPECTED_REPOSITORY = "Joey-Tools/codex-debug-triage"
+          EXPECTED_BASE_REF = "master"
+          SHA1_PATTERN = re.compile(r"[0-9a-f]{40}")
+          PR_NUMBER_PATTERN = re.compile(r"[1-9][0-9]*")
+
+
+          class SelectorError(ValueError):
+              pass
+
+
+          def required_environment(name):
+              value = os.environ.get(name)
+              if value is None or not value.strip():
+                  raise SelectorError(f"required selector input {name} is missing")
+              return value.strip()
+
+
+          def optional_environment(name):
+              value = os.environ.get(name)
+              if value is None or not value.strip():
+                  return None
+              return value.strip()
+
+
+          def require_sha(value, label):
+              if SHA1_PATTERN.fullmatch(value) is None or set(value) == {"0"}:
+                  raise SelectorError(f"{label} must be exact nonzero lowercase SHA-1")
+              return value
+
+
+          def require_pr_number(value, label):
+              if PR_NUMBER_PATTERN.fullmatch(value) is None:
+                  raise SelectorError(f"{label} must be canonical positive decimal")
+              return int(value, 10)
+
+
+          def emit(
+              classification,
+              *,
+              applicable,
+              current_pr,
+              target_pr,
+              target_head,
+              target_base,
+          ):
+              output_path = required_environment("GITHUB_OUTPUT")
+              target_pr_output = "" if target_pr is None else str(target_pr)
+              target_head_output = "" if target_head is None else target_head
+              target_base_output = "" if target_base is None else target_base
+              with open(output_path, "a", encoding="utf-8") as output:
+                  output.write(f"applicable={'true' if applicable else 'false'}\n")
+                  output.write(f"target-base-sha={target_base_output}\n")
+                  output.write(f"target-head-sha={target_head_output}\n")
+                  output.write(f"target-pr-number={target_pr_output}\n")
+              print(
+                  json.dumps(
+                      {
+                          "classification": classification,
+                          "current_pr_number": current_pr,
+                          "target_base_sha": target_base,
+                          "target_head_sha": target_head,
+                          "target_pr_number": target_pr,
+                      },
+                      ensure_ascii=True,
+                      separators=(",", ":"),
+                      sort_keys=True,
+                  )
+              )
+
+
+          try:
+              if os.environ.get("GITHUB_REPOSITORY") != EXPECTED_REPOSITORY:
+                  raise SelectorError("runner repository differs")
+              if required_environment("EVENT_REPOSITORY") != EXPECTED_REPOSITORY:
+                  raise SelectorError("event repository differs")
+              if required_environment("PR_BASE_REF") != EXPECTED_BASE_REF:
+                  raise SelectorError("pull-request base branch differs")
+              current_head_repository = required_environment("PR_HEAD_REPOSITORY")
+              current_pr = require_pr_number(
+                  required_environment("PR_NUMBER"),
+                  "pull-request number",
+              )
+              current_head = require_sha(
+                  required_environment("PR_HEAD_SHA"),
+                  "pull-request head",
+              )
+              current_base = require_sha(
+                  required_environment("PR_BASE_SHA"),
+                  "pull-request base",
+              )
+              target_pr_input = optional_environment(
+                  "CISCO_CUTOVER_TARGET_PR_NUMBER"
+              )
+              target_head_input = optional_environment(
+                  "CISCO_CUTOVER_TARGET_HEAD_SHA"
+              )
+              target_base_input = optional_environment(
+                  "CISCO_CUTOVER_TARGET_BASE_SHA"
+              )
+              if (
+                  target_pr_input is None
+                  and target_head_input is None
+                  and target_base_input is None
+              ):
+                  emit(
+                      "not_applicable",
+                      applicable=False,
+                      current_pr=current_pr,
+                      target_pr=None,
+                      target_head=None,
+                      target_base=None,
+                  )
+                  raise SystemExit(0)
+              if (
+                  target_pr_input is None
+                  or target_head_input is None
+                  or target_base_input is None
+              ):
+                  raise SelectorError(
+                      "cutover target selector variables must be configured together"
+                  )
+              target_pr = require_pr_number(
+                  target_pr_input,
+                  "target pull-request number",
+              )
+              target_head = require_sha(
+                  target_head_input,
+                  "target pull-request head",
+              )
+              target_base = require_sha(
+                  target_base_input,
+                  "target pull-request base",
+              )
+              if current_pr == target_pr:
+                  if current_head_repository != EXPECTED_REPOSITORY:
+                      raise SelectorError("target pull-request head repository differs")
+                  if current_head != target_head:
+                      raise SelectorError("target pull-request head changed")
+                  if current_base != target_base:
+                      raise SelectorError("target pull-request base changed")
+          except SelectorError as error:
+              print(
+                  json.dumps(
+                      {
+                          "classification": "blocked_until_trusted",
+                          "reason": str(error),
+                      },
+                      ensure_ascii=True,
+                      separators=(",", ":"),
+                      sort_keys=True,
+                  )
+              )
+              raise SystemExit(1)
+
+          emit(
+              "target" if current_pr == target_pr else "not_applicable",
+              applicable=current_pr == target_pr,
+              current_pr=current_pr,
+              target_pr=target_pr,
+              target_head=target_head,
+              target_base=target_base,
+          )
+          SELECTOR_PY
+
+  cisco-cutover-admission:
+    name: cisco-cutover-admission
+    needs: cisco-cutover-selector
+    if: needs.cisco-cutover-selector.outputs.applicable == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Validate trusted release and pointer receipt
+        shell: bash --noprofile --norc -euo pipefail {0}
+        env:
+          EVENT_REPOSITORY: ${{ github.event.repository.full_name }}
+          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          SELECTED_TARGET_BASE_SHA: ${{ needs.cisco-cutover-selector.outputs.target-base-sha }}
+          SELECTED_TARGET_HEAD_SHA: ${{ needs.cisco-cutover-selector.outputs.target-head-sha }}
+          SELECTED_TARGET_PR_NUMBER: ${{ needs.cisco-cutover-selector.outputs.target-pr-number }}
+          CISCO_CUTOVER_TARGET_BASE_SHA: ${{ vars.CISCO_CUTOVER_TARGET_BASE_SHA }}
+          CISCO_CUTOVER_RECEIPT_BASE64: ${{ vars.CISCO_CUTOVER_RECEIPT_BASE64 }}
+          CISCO_CUTOVER_EXPECTED_CANONICAL_COMMIT: ${{ vars.CISCO_CUTOVER_EXPECTED_CANONICAL_COMMIT }}
+          CISCO_CUTOVER_EXPECTED_PRIVATE_RELEASE_COMMIT: ${{ vars.CISCO_CUTOVER_EXPECTED_PRIVATE_RELEASE_COMMIT }}
+          CISCO_CUTOVER_EXPECTED_RELEASE_MANIFEST_SHA256: ${{ vars.CISCO_CUTOVER_EXPECTED_RELEASE_MANIFEST_SHA256 }}
+          CISCO_CUTOVER_EXPECTED_RECEIPT_SHA256: ${{ vars.CISCO_CUTOVER_EXPECTED_RECEIPT_SHA256 }}
+          CISCO_CUTOVER_EXPECTED_WORKFLOW_ID: ${{ vars.CISCO_CUTOVER_EXPECTED_WORKFLOW_ID }}
+          CISCO_CUTOVER_EXPECTED_WORKFLOW_SHA: ${{ vars.CISCO_CUTOVER_EXPECTED_WORKFLOW_SHA }}
+          CISCO_CUTOVER_EXPECTED_INSTALLATION_SCOPE_ID: ${{ vars.CISCO_CUTOVER_EXPECTED_INSTALLATION_SCOPE_ID }}
+          CISCO_CUTOVER_EXPECTED_POINTER_GENERATION: ${{ vars.CISCO_CUTOVER_EXPECTED_POINTER_GENERATION }}
+          CISCO_CUTOVER_EXPECTED_POINTER_STATE_SHA256: ${{ vars.CISCO_CUTOVER_EXPECTED_POINTER_STATE_SHA256 }}
+        run: |
+          python3 - <<'ADMISSION_PY'
+          import base64
+          import binascii
+          import hashlib
+          import json
+          import os
+          import re
+          import sys
+          from datetime import datetime, timezone
+
+          EXPECTED_REPOSITORY = "Joey-Tools/codex-debug-triage"
+          EXPECTED_REPOSITORY_ID = 1242512092
+          EXPECTED_PRIVATE_REPOSITORY = "Joey-Tools/codex-private-workflows"
+          EXPECTED_PRIVATE_RELEASE_WORKFLOW_PATH = ".github/workflows/release.yml"
+          EXPECTED_PRIVATE_RELEASE_WORKFLOW_REF = "refs/heads/master"
+          EXPECTED_BASE_REF = "master"
+          EXPECTED_WORKFLOW_PATH = ".github/workflows/cisco-cutover-admission.yml"
+          EXPECTED_WORKFLOW_REF = "refs/heads/master"
+          EXPECTED_WORKFLOW_EVENT = "pull_request_target"
+          EXPECTED_CHECK_NAME = "cisco-cutover-admission"
+          MAX_RECEIPT_BYTES = 35 * 1024
+          MAX_RECEIPT_BASE64_CHARS = 4 * ((MAX_RECEIPT_BYTES + 2) // 3)
+          MAX_JSON_DEPTH = 64
+          MAX_JSON_NODES = 4_096
+          MAX_JSON_CONTAINER_ITEMS = 1_024
+          MAX_JSON_INTEGER_DIGITS = 64
+          MAX_SIGNED_64_INTEGER = (1 << 63) - 1
+          MAX_JSON_STRING_CHARS = 32 * 1024
+          SHA1_PATTERN = re.compile(r"[0-9a-f]{40}")
+          SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
+          POSITIVE_INTEGER_PATTERN = re.compile(r"[1-9][0-9]*")
+          CANONICAL_IDENTIFIER_PATTERN = re.compile(
+              r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}"
+          )
+          RFC3339_UTC_PATTERN = re.compile(
+              r"[0-9]{4}-[0-9]{2}-[0-9]{2}T"
+              r"[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,6})?Z"
+          )
+          EXPECTED_GITHUB_ACTIONS_PROVIDER = {
+              "id": 15368,
+              "slug": "github-actions",
+          }
+          POINTER_STATE_HASH_DOMAIN = "cisco-installed-pointer-state-v1"
+          ADMISSION_PRECONDITIONS_UNAVAILABLE_REASON = (
+              "admission-preconditions-unavailable"
+          )
+          BASE_CHANGE_ENFORCEMENT = {
+              "status": "unavailable",
+              "reason": (
+                  "ruleset-workflow-default-activities-exclude-edited"
+              ),
+              "event": "pull_request_target",
+              "required_activity": "edited",
+              "ruleset_dispatch_activities": [
+                  "opened",
+                  "synchronize",
+                  "reopened",
+              ],
+          }
+          POINTER_PROOF_UNAVAILABLE_REASON = "pointer-proof-unavailable"
+          POINTER_AUTHORITY_REASON = "private-live-authority-not-configured"
+          PLACEHOLDERS = frozenset(
+              {
+                  "change-me",
+                  "changeme",
+                  "missing",
+                  "none",
+                  "placeholder",
+                  "todo",
+                  "unset",
+              }
+          )
+          EXPECTED_ACTIVATION = {
+              "release_kind": "immutable-private-overlay",
+              "atomic": True,
+              "provider": {
+                  "source": "personal_codex/skills/cisco-build-artifacts",
+                  "target": "skills/cisco-build-artifacts",
+              },
+              "routing_policy": {
+                  "source": "personal_codex/AGENTS.md",
+                  "target": "AGENTS.md",
+                  "cisco_build_fetch_and_archive": "skills/cisco-build-artifacts",
+                  "ordinary_local_diagnosis": "base-model-no-skill-route",
+              },
+              "catalog": {
+                  "manifest": "personal_codex/private-sync-manifest.json",
+                  "active_target": "skills/cisco-build-artifacts",
+                  "removed_target": "skills/bug-triage-playbook",
+              },
+              "removed_link": {
+                  "source": "personal_codex/skills/bug-triage-playbook",
+                  "target": "skills/bug-triage-playbook",
+                  "replacement_target": "skills/cisco-build-artifacts",
+                  "replacement_scope": "cisco-build-fetch-and-archive-only",
+              },
+              "public_asset": {
+                  "repository": "Joey-Tools/codex-debug-triage",
+                  "status": "optional-source-only",
+                  "installed_route": False,
+              },
+          }
+          EXPECTED_GATES = [
+              "private-package-validation",
+              "private-overlay-verifier",
+              "immutable-release-published",
+              "installed-current-pointer-verified",
+          ]
+
+
+          class AdmissionError(ValueError):
+              pass
+
+
+          def blocked(reason, details=None):
+              outcome = {
+                  "classification": "blocked_until_trusted",
+                  "reason": reason,
+                  "validation_scope": "static-equivalence-only",
+              }
+              if details is not None:
+                  outcome.update(details)
+              print(
+                  json.dumps(
+                      outcome,
+                      ensure_ascii=True,
+                      separators=(",", ":"),
+                      sort_keys=True,
+                  )
+              )
+              return 1
+
+
+          def admission_blockers():
+              return [
+                  {
+                      "name": "base-change-enforcement",
+                      "priority": 1,
+                      **BASE_CHANGE_ENFORCEMENT,
+                  },
+                  {
+                      "authority_reason": POINTER_AUTHORITY_REASON,
+                      "name": "pointer-proof",
+                      "priority": 2,
+                      "reason": POINTER_PROOF_UNAVAILABLE_REASON,
+                      "status": "unavailable",
+                  },
+              ]
+
+
+          def required_environment(name):
+              value = os.environ.get(name)
+              if value is None or not value.strip():
+                  raise AdmissionError(f"required trusted input {name} is missing")
+              normalized = value.strip().lower()
+              if (
+                  normalized in PLACEHOLDERS
+                  or normalized.startswith("<")
+                  or normalized.startswith("$" + "{{")
+                  or set(normalized) == {"0"}
+              ):
+                  raise AdmissionError(
+                      f"required trusted input {name} is a placeholder"
+                  )
+              return value
+
+
+          def require_sha(value, pattern, label):
+              if type(value) is not str or pattern.fullmatch(value) is None:
+                  raise AdmissionError(f"{label} must be exact lowercase hex")
+              if set(value) == {"0"}:
+                  raise AdmissionError(f"{label} must not be all-zero")
+              return value
+
+
+          def require_positive_integer(value, label):
+              if (
+                  type(value) is not str
+                  or POSITIVE_INTEGER_PATTERN.fullmatch(value) is None
+              ):
+                  raise AdmissionError(f"{label} must be canonical positive decimal")
+              parsed = int(value, 10)
+              if parsed > MAX_SIGNED_64_INTEGER:
+                  raise AdmissionError(f"{label} exceeds signed 64-bit range")
+              return parsed
+
+
+          def require_positive_json_integer(value, label):
+              if (
+                  type(value) is not int
+                  or value <= 0
+                  or value > MAX_SIGNED_64_INTEGER
+              ):
+                  raise AdmissionError(
+                      f"{label} must be an exact positive signed 64-bit integer"
+                  )
+              return value
+
+
+          def require_canonical_identifier(value, label):
+              if (
+                  type(value) is not str
+                  or CANONICAL_IDENTIFIER_PATTERN.fullmatch(value) is None
+              ):
+                  raise AdmissionError(
+                      f"{label} must be a canonical 1-128 character ASCII identifier"
+                  )
+              return value
+
+
+          def require_rfc3339_utc(value, label):
+              if (
+                  type(value) is not str
+                  or RFC3339_UTC_PATTERN.fullmatch(value) is None
+              ):
+                  raise AdmissionError(
+                      f"{label} must be RFC3339 UTC with a Z suffix"
+                  )
+              try:
+                  parsed = datetime.fromisoformat(f"{value[:-1]}+00:00")
+              except ValueError as error:
+                  raise AdmissionError(
+                      f"{label} must be a valid RFC3339 timestamp"
+                  ) from error
+              if parsed.utcoffset() != timezone.utc.utcoffset(parsed):
+                  raise AdmissionError(f"{label} must use UTC")
+              return parsed
+
+
+          def pointer_state_sha256(
+              *,
+              installation_scope_id,
+              name,
+              generation,
+              target,
+              resolved_release_commit,
+              release_manifest_sha256,
+          ):
+              state = {
+                  "generation": generation,
+                  "installation_scope_id": installation_scope_id,
+                  "name": name,
+                  "release_manifest_sha256": release_manifest_sha256,
+                  "resolved_release_commit": resolved_release_commit,
+                  "target": target,
+              }
+              canonical = json.dumps(
+                  state,
+                  ensure_ascii=True,
+                  separators=(",", ":"),
+                  sort_keys=True,
+              ).encode("utf-8")
+              domain = f"{POINTER_STATE_HASH_DOMAIN}\0".encode("ascii")
+              return hashlib.sha256(domain + canonical).hexdigest()
+
+
+          def reject_float(_value):
+              raise AdmissionError("JSON floating-point values are forbidden")
+
+
+          def reject_constant(_value):
+              raise AdmissionError("non-finite JSON values are forbidden")
+
+
+          def parse_integer(value):
+              if len(value.removeprefix("-")) > MAX_JSON_INTEGER_DIGITS:
+                  raise AdmissionError("JSON integer exceeds max digits")
+              return int(value)
+
+
+          def object_without_duplicates(pairs):
+              result = {}
+              for key, value in pairs:
+                  if key in result:
+                      raise AdmissionError(f"duplicate JSON key: {key}")
+                  result[key] = value
+              return result
+
+
+          def check_json_resources(parsed):
+              pending = [(parsed, 1)]
+              nodes = 0
+              while pending:
+                  value, depth = pending.pop()
+                  nodes += 1
+                  if nodes > MAX_JSON_NODES:
+                      raise AdmissionError("receipt exceeds max JSON nodes")
+                  if type(value) is dict:
+                      if depth > MAX_JSON_DEPTH:
+                          raise AdmissionError("receipt exceeds max JSON depth")
+                      if len(value) > MAX_JSON_CONTAINER_ITEMS:
+                          raise AdmissionError("receipt object exceeds max items")
+                      for key, item in value.items():
+                          if type(key) is not str:
+                              raise AdmissionError("receipt key must be text")
+                          if len(key) > MAX_JSON_STRING_CHARS:
+                              raise AdmissionError(
+                                  "receipt key exceeds max characters"
+                              )
+                          pending.append((item, depth + 1))
+                  elif type(value) is list:
+                      if depth > MAX_JSON_DEPTH:
+                          raise AdmissionError("receipt exceeds max JSON depth")
+                      if len(value) > MAX_JSON_CONTAINER_ITEMS:
+                          raise AdmissionError("receipt array exceeds max items")
+                      for item in value:
+                          pending.append((item, depth + 1))
+                  elif type(value) is str:
+                      if len(value) > MAX_JSON_STRING_CHARS:
+                          raise AdmissionError(
+                              "receipt string exceeds max characters"
+                          )
+                  elif type(value) not in (int, bool, type(None)):
+                      raise AdmissionError("receipt has unsupported JSON value")
+
+
+          def parse_receipt(encoded):
+              if len(encoded) > MAX_RECEIPT_BASE64_CHARS:
+                  raise AdmissionError("trusted receipt Base64 exceeds max characters")
+              try:
+                  payload = base64.b64decode(encoded, validate=True)
+              except (binascii.Error, ValueError) as error:
+                  raise AdmissionError(
+                      "trusted receipt Base64 is malformed"
+                  ) from error
+              if not payload:
+                  raise AdmissionError("trusted receipt is empty")
+              if len(payload) > MAX_RECEIPT_BYTES:
+                  raise AdmissionError("trusted receipt exceeds max bytes")
+              try:
+                  decoded = payload.decode("utf-8", errors="strict")
+                  parsed = json.loads(
+                      decoded,
+                      object_pairs_hook=object_without_duplicates,
+                      parse_int=parse_integer,
+                      parse_float=reject_float,
+                      parse_constant=reject_constant,
+                  )
+              except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as error:
+                  raise AdmissionError("trusted receipt is invalid JSON") from error
+              check_json_resources(parsed)
+              if type(parsed) is not dict:
+                  raise AdmissionError("trusted receipt must be a JSON object")
+              return payload, parsed
+
+
+          def exact_keys(value, expected, label):
+              if type(value) is not dict or set(value) != set(expected):
+                  raise AdmissionError(f"{label} fields differ")
+              return value
+
+
+          def exact_equal(actual, expected):
+              if type(actual) is not type(expected):
+                  return False
+              if type(expected) is dict:
+                  return set(actual) == set(expected) and all(
+                      exact_equal(actual[key], expected[key]) for key in expected
+                  )
+              if type(expected) is list:
+                  return len(actual) == len(expected) and all(
+                      exact_equal(left, right)
+                      for left, right in zip(actual, expected)
+                  )
+              return actual == expected
+
+
+          def validate_receipt(receipt, expected, validation_time):
+              receipt = exact_keys(
+                  receipt,
+                  {
+                      "schema_version",
+                      "canonical_repository",
+                      "canonical_commit",
+                      "private_aggregate_repository",
+                      "private_release_commit",
+                      "release_manifest_sha256",
+                      "release_target",
+                      "cutover",
+                      "activation",
+                      "gates",
+                      "installed_pointer",
+                  },
+                  "receipt",
+              )
+              if type(receipt["schema_version"]) is not int:
+                  raise AdmissionError("receipt schema_version must be an integer")
+              if receipt["schema_version"] != 3:
+                  raise AdmissionError("receipt schema_version differs")
+              if receipt["canonical_repository"] != EXPECTED_REPOSITORY:
+                  raise AdmissionError("receipt canonical repository differs")
+              if receipt["canonical_commit"] != expected["canonical_commit"]:
+                  raise AdmissionError("receipt canonical commit differs")
+              if receipt["private_aggregate_repository"] != EXPECTED_PRIVATE_REPOSITORY:
+                  raise AdmissionError("receipt private repository differs")
+              if receipt["private_release_commit"] != expected["private_release"]:
+                  raise AdmissionError("receipt private release differs")
+              if receipt["release_manifest_sha256"] != expected["manifest_sha256"]:
+                  raise AdmissionError("receipt manifest digest differs")
+              release_target = f"releases/{expected['private_release']}"
+              if receipt["release_target"] != release_target:
+                  raise AdmissionError("receipt release target differs")
+              expected_cutover = {
+                  "target_repository": {
+                      "id": EXPECTED_REPOSITORY_ID,
+                      "full_name": EXPECTED_REPOSITORY,
+                      "default_branch": EXPECTED_BASE_REF,
+                  },
+                  "pull_request": {
+                      "number": expected["pull_request_number"],
+                      "head_sha": expected["canonical_commit"],
+                      "base_ref": EXPECTED_BASE_REF,
+                      "base_sha": expected["base_sha"],
+                  },
+                  "required_workflow": {
+                      "id": expected["workflow_id"],
+                      "repository_id": EXPECTED_REPOSITORY_ID,
+                      "repository_full_name": EXPECTED_REPOSITORY,
+                      "path": EXPECTED_WORKFLOW_PATH,
+                      "ref": EXPECTED_WORKFLOW_REF,
+                      "sha": expected["workflow_sha"],
+                      "event": EXPECTED_WORKFLOW_EVENT,
+                      "check_name": EXPECTED_CHECK_NAME,
+                  },
+              }
+              if not exact_equal(receipt["cutover"], expected_cutover):
+                  raise AdmissionError("receipt cutover contract differs")
+              if not exact_equal(receipt["activation"], EXPECTED_ACTIVATION):
+                  raise AdmissionError("receipt activation differs")
+              gates = receipt["gates"]
+              if type(gates) is not list or len(gates) != len(EXPECTED_GATES):
+                  raise AdmissionError("receipt gate set differs")
+              for gate, expected_name in zip(gates, EXPECTED_GATES):
+                  gate = exact_keys(
+                      gate,
+                      {
+                          "name",
+                          "status",
+                          "private_release_commit",
+                          "release_manifest_sha256",
+                      },
+                      "receipt gate",
+                  )
+                  if gate["name"] != expected_name or gate["status"] != "passed":
+                      raise AdmissionError("receipt gate differs")
+                  if gate["private_release_commit"] != expected["private_release"]:
+                      raise AdmissionError("receipt gate release differs")
+                  if (
+                      gate["release_manifest_sha256"]
+                      != expected["manifest_sha256"]
+                  ):
+                      raise AdmissionError("receipt gate manifest differs")
+              pointer = exact_keys(
+                  receipt["installed_pointer"],
+                  {
+                      "name",
+                      "target",
+                      "resolved_release_commit",
+                      "release_manifest_sha256",
+                      "installation_scope_id",
+                      "generation",
+                      "state_sha256",
+                      "observed_at",
+                      "expires_at",
+                      "live_authority",
+                      "merge_lease",
+                  },
+                  "installed pointer",
+              )
+              if pointer["name"] != "current" or pointer["target"] != release_target:
+                  raise AdmissionError("installed pointer target differs")
+              resolved_release_commit = require_sha(
+                  pointer["resolved_release_commit"],
+                  SHA1_PATTERN,
+                  "installed pointer resolved release commit",
+              )
+              if resolved_release_commit != expected["private_release"]:
+                  raise AdmissionError("installed pointer release differs")
+              pointer_manifest_sha256 = require_sha(
+                  pointer["release_manifest_sha256"],
+                  SHA256_PATTERN,
+                  "installed pointer release manifest SHA-256",
+              )
+              if pointer_manifest_sha256 != expected["manifest_sha256"]:
+                  raise AdmissionError("installed pointer manifest differs")
+              installation_scope_id = require_canonical_identifier(
+                  pointer["installation_scope_id"],
+                  "installed pointer installation scope ID",
+              )
+              if installation_scope_id != expected["installation_scope_id"]:
+                  raise AdmissionError("installed pointer installation scope differs")
+              generation = require_positive_json_integer(
+                  pointer["generation"],
+                  "installed pointer generation",
+              )
+              if generation != expected["pointer_generation"]:
+                  raise AdmissionError("installed pointer generation differs")
+              pointer_state_digest = require_sha(
+                  pointer["state_sha256"],
+                  SHA256_PATTERN,
+                  "installed pointer state SHA-256",
+              )
+              if pointer_state_digest != expected["pointer_state_sha256"]:
+                  raise AdmissionError("installed pointer state digest differs")
+              recomputed_state_digest = pointer_state_sha256(
+                  installation_scope_id=installation_scope_id,
+                  name=pointer["name"],
+                  generation=generation,
+                  target=pointer["target"],
+                  resolved_release_commit=resolved_release_commit,
+                  release_manifest_sha256=pointer_manifest_sha256,
+              )
+              if recomputed_state_digest != pointer_state_digest:
+                  raise AdmissionError(
+                      "installed pointer state digest differs from canonical state"
+                  )
+
+              observed_at = require_rfc3339_utc(
+                  pointer["observed_at"],
+                  "installed pointer observed_at",
+              )
+              expires_at = require_rfc3339_utc(
+                  pointer["expires_at"],
+                  "installed pointer expires_at",
+              )
+              if expires_at <= observed_at:
+                  raise AdmissionError(
+                      "installed pointer expires_at must be after observed_at"
+                  )
+              if observed_at > validation_time:
+                  raise AdmissionError("installed pointer observed_at is in the future")
+              if expires_at <= validation_time:
+                  raise AdmissionError("installed pointer proof has expired")
+
+              live_authority = exact_keys(
+                  pointer["live_authority"],
+                  {
+                      "repository_id",
+                      "repository_full_name",
+                      "workflow_id",
+                      "workflow_path",
+                      "workflow_ref",
+                      "workflow_sha",
+                      "run_id",
+                      "run_attempt",
+                      "provider",
+                      "proof_artifact_id",
+                      "proof_artifact_sha256",
+                  },
+                  "installed pointer live authority",
+              )
+              require_positive_json_integer(
+                  live_authority["repository_id"],
+                  "installed pointer authority repository ID",
+              )
+              if (
+                  live_authority["repository_full_name"]
+                  != EXPECTED_PRIVATE_REPOSITORY
+              ):
+                  raise AdmissionError(
+                      "installed pointer authority repository differs"
+                  )
+              require_positive_json_integer(
+                  live_authority["workflow_id"],
+                  "installed pointer authority workflow ID",
+              )
+              if (
+                  live_authority["workflow_path"]
+                  != EXPECTED_PRIVATE_RELEASE_WORKFLOW_PATH
+                  or live_authority["workflow_ref"]
+                  != EXPECTED_PRIVATE_RELEASE_WORKFLOW_REF
+              ):
+                  raise AdmissionError(
+                      "installed pointer authority workflow identity differs"
+                  )
+              require_sha(
+                  live_authority["workflow_sha"],
+                  SHA1_PATTERN,
+                  "installed pointer authority workflow SHA",
+              )
+              require_positive_json_integer(
+                  live_authority["run_id"],
+                  "installed pointer authority run ID",
+              )
+              require_positive_json_integer(
+                  live_authority["run_attempt"],
+                  "installed pointer authority run attempt",
+              )
+              if not exact_equal(
+                  live_authority["provider"],
+                  EXPECTED_GITHUB_ACTIONS_PROVIDER,
+              ):
+                  raise AdmissionError("installed pointer authority provider differs")
+              require_positive_json_integer(
+                  live_authority["proof_artifact_id"],
+                  "installed pointer authority proof artifact ID",
+              )
+              require_sha(
+                  live_authority["proof_artifact_sha256"],
+                  SHA256_PATTERN,
+                  "installed pointer authority proof artifact SHA-256",
+              )
+
+              merge_lease = exact_keys(
+                  pointer["merge_lease"],
+                  {
+                      "lease_id",
+                      "status",
+                      "target_repository_id",
+                      "pull_request_number",
+                      "pull_request_head_sha",
+                      "pull_request_base_sha",
+                      "installation_scope_id",
+                      "pointer_generation",
+                      "acquired_at",
+                      "expires_at",
+                  },
+                  "installed pointer merge lease",
+              )
+              require_canonical_identifier(
+                  merge_lease["lease_id"],
+                  "installed pointer merge lease ID",
+              )
+              if merge_lease["status"] != "active":
+                  raise AdmissionError("installed pointer merge lease is not active")
+              if merge_lease["target_repository_id"] != EXPECTED_REPOSITORY_ID:
+                  raise AdmissionError(
+                      "installed pointer merge lease repository differs"
+                  )
+              if (
+                  type(merge_lease["pull_request_number"]) is not int
+                  or merge_lease["pull_request_number"]
+                  != expected["pull_request_number"]
+              ):
+                  raise AdmissionError(
+                      "installed pointer merge lease pull-request differs"
+                  )
+              if (
+                  merge_lease["pull_request_head_sha"]
+                  != expected["canonical_commit"]
+              ):
+                  raise AdmissionError(
+                      "installed pointer merge lease head differs"
+                  )
+              lease_base_sha = require_sha(
+                  merge_lease["pull_request_base_sha"],
+                  SHA1_PATTERN,
+                  "installed pointer merge lease base SHA",
+              )
+              if lease_base_sha != expected["base_sha"]:
+                  raise AdmissionError(
+                      "installed pointer merge lease base differs"
+                  )
+              if merge_lease["installation_scope_id"] != installation_scope_id:
+                  raise AdmissionError(
+                      "installed pointer merge lease scope differs"
+                  )
+              if (
+                  type(merge_lease["pointer_generation"]) is not int
+                  or merge_lease["pointer_generation"] != generation
+              ):
+                  raise AdmissionError(
+                      "installed pointer merge lease generation differs"
+                  )
+              acquired_at = require_rfc3339_utc(
+                  merge_lease["acquired_at"],
+                  "installed pointer merge lease acquired_at",
+              )
+              lease_expires_at = require_rfc3339_utc(
+                  merge_lease["expires_at"],
+                  "installed pointer merge lease expires_at",
+              )
+              if lease_expires_at <= acquired_at:
+                  raise AdmissionError(
+                      "installed pointer merge lease expires_at must be "
+                      "after acquired_at"
+                  )
+              if acquired_at > observed_at:
+                  raise AdmissionError(
+                      "installed pointer merge lease was acquired after "
+                      "pointer observation"
+                  )
+              if lease_expires_at <= validation_time:
+                  raise AdmissionError("installed pointer merge lease has expired")
+              return pointer
+
+
+          try:
+              if os.environ.get("GITHUB_REPOSITORY") != EXPECTED_REPOSITORY:
+                  raise AdmissionError("runner repository differs")
+              if required_environment("EVENT_REPOSITORY") != EXPECTED_REPOSITORY:
+                  raise AdmissionError("event repository differs")
+              if required_environment("PR_HEAD_REPOSITORY") != EXPECTED_REPOSITORY:
+                  raise AdmissionError("pull-request head repository differs")
+              if required_environment("PR_BASE_REF") != EXPECTED_BASE_REF:
+                  raise AdmissionError("pull-request base branch differs")
+              base_sha = require_sha(
+                  required_environment("PR_BASE_SHA"),
+                  SHA1_PATTERN,
+                  "pull-request base SHA",
+              )
+              head_sha = require_sha(
+                  required_environment("PR_HEAD_SHA"),
+                  SHA1_PATTERN,
+                  "pull-request head SHA",
+              )
+              pull_request_number = require_positive_integer(
+                  required_environment("PR_NUMBER"),
+                  "pull-request number",
+              )
+              selected_target_head = require_sha(
+                  required_environment("SELECTED_TARGET_HEAD_SHA"),
+                  SHA1_PATTERN,
+                  "selected target head",
+              )
+              selected_target_base = require_sha(
+                  required_environment("SELECTED_TARGET_BASE_SHA"),
+                  SHA1_PATTERN,
+                  "selected target base",
+              )
+              selected_target_pr = require_positive_integer(
+                  required_environment("SELECTED_TARGET_PR_NUMBER"),
+                  "selected target pull-request number",
+              )
+              expected = {
+                  "base_sha": require_sha(
+                      required_environment("CISCO_CUTOVER_TARGET_BASE_SHA"),
+                      SHA1_PATTERN,
+                      "expected pull-request base SHA",
+                  ),
+                  "canonical_commit": require_sha(
+                      required_environment(
+                          "CISCO_CUTOVER_EXPECTED_CANONICAL_COMMIT"
+                      ),
+                      SHA1_PATTERN,
+                      "expected canonical commit",
+                  ),
+                  "private_release": require_sha(
+                      required_environment(
+                          "CISCO_CUTOVER_EXPECTED_PRIVATE_RELEASE_COMMIT"
+                      ),
+                      SHA1_PATTERN,
+                      "expected private release commit",
+                  ),
+                  "manifest_sha256": require_sha(
+                      required_environment(
+                          "CISCO_CUTOVER_EXPECTED_RELEASE_MANIFEST_SHA256"
+                      ),
+                      SHA256_PATTERN,
+                      "expected release manifest SHA-256",
+                  ),
+                  "receipt_sha256": require_sha(
+                      required_environment(
+                          "CISCO_CUTOVER_EXPECTED_RECEIPT_SHA256"
+                      ),
+                      SHA256_PATTERN,
+                      "expected receipt SHA-256",
+                  ),
+                  "workflow_id": require_positive_integer(
+                      required_environment("CISCO_CUTOVER_EXPECTED_WORKFLOW_ID"),
+                      "expected workflow ID",
+                  ),
+                  "workflow_sha": require_sha(
+                      required_environment("CISCO_CUTOVER_EXPECTED_WORKFLOW_SHA"),
+                      SHA1_PATTERN,
+                      "expected workflow SHA",
+                  ),
+                  "installation_scope_id": require_canonical_identifier(
+                      required_environment(
+                          "CISCO_CUTOVER_EXPECTED_INSTALLATION_SCOPE_ID"
+                      ),
+                      "expected installation scope ID",
+                  ),
+                  "pointer_generation": require_positive_integer(
+                      required_environment(
+                          "CISCO_CUTOVER_EXPECTED_POINTER_GENERATION"
+                      ),
+                      "expected pointer generation",
+                  ),
+                  "pointer_state_sha256": require_sha(
+                      required_environment(
+                          "CISCO_CUTOVER_EXPECTED_POINTER_STATE_SHA256"
+                      ),
+                      SHA256_PATTERN,
+                      "expected pointer state SHA-256",
+                  ),
+                  "pull_request_number": pull_request_number,
+              }
+              if (
+                  selected_target_pr != pull_request_number
+                  or selected_target_head != head_sha
+                  or selected_target_base != base_sha
+              ):
+                  raise AdmissionError("selector output differs from target event")
+              if expected["base_sha"] != base_sha:
+                  raise AdmissionError(
+                      "trusted base expectation differs from PR base"
+                  )
+              if expected["canonical_commit"] != head_sha:
+                  raise AdmissionError(
+                      "trusted canonical expectation differs from PR head"
+                  )
+              payload, receipt = parse_receipt(
+                  required_environment("CISCO_CUTOVER_RECEIPT_BASE64")
+              )
+              actual_receipt_sha256 = hashlib.sha256(payload).hexdigest()
+              if actual_receipt_sha256 != expected["receipt_sha256"]:
+                  raise AdmissionError("trusted receipt digest differs")
+              pointer = validate_receipt(
+                  receipt,
+                  expected,
+                  datetime.now(timezone.utc),
+              )
+          except AdmissionError as error:
+              raise SystemExit(blocked(str(error)))
+
+          raise SystemExit(
+              blocked(
+                  ADMISSION_PRECONDITIONS_UNAVAILABLE_REASON,
+                  {
+                      "blockers": admission_blockers(),
+                      "canonical_commit": expected["canonical_commit"],
+                      "expected_base_sha": expected["base_sha"],
+                      "installation_scope_id": pointer["installation_scope_id"],
+                      "provider_observed_base_sha": base_sha,
+                      "pointer_authority_reason": POINTER_AUTHORITY_REASON,
+                      "pointer_authority_status": "unavailable",
+                      "pointer_generation": pointer["generation"],
+                      "pointer_state_sha256": pointer["state_sha256"],
+                      "pointer_target": pointer["target"],
+                      "private_release_commit": expected["private_release"],
+                      "pull_request_number": expected["pull_request_number"],
+                      "receipt_sha256": actual_receipt_sha256,
+                      "static_equivalence": "validated",
+                      "workflow_id": expected["workflow_id"],
+                      "workflow_sha": expected["workflow_sha"],
+                  },
+              )
+          )
+          ADMISSION_PY
+
+  cisco-cutover-neutral:
+    name: cisco-cutover-neutral
+    needs: cisco-cutover-selector
+    if: needs.cisco-cutover-selector.outputs.applicable == 'false'
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    steps:
+      - name: Record non-target applicability
+        shell: bash --noprofile --norc -euo pipefail {0}
+        run: |
+          printf '%s\n' '{"classification":"not_applicable","target_evidence_consumed":false}'
