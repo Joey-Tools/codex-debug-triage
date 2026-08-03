@@ -1821,16 +1821,22 @@ class JenkinsArtifactProbeTests(unittest.TestCase):
             self.assertFalse(output.exists())
 
     def test_skill_is_optional_and_scoped_to_artifact_transport(self) -> None:
-        skill = (REPO_ROOT / "skills/bug-triage-playbook/SKILL.md").read_text(
-            encoding="utf-8"
-        )
+        skill_root = REPO_ROOT / "skills/bug-triage-playbook"
+        skill = (skill_root / "SKILL.md").read_text(encoding="utf-8")
         self.assertIn("optional", skill.lower())
         self.assertIn("artifact transport", skill.lower())
         self.assertNotIn("Build a small hypothesis set", skill)
 
+        distributed_markdown = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in sorted(skill_root.rglob("*.md"))
+        )
+        self.assertFalse((skill_root / "references/triage-report.md").exists())
+        self.assertNotIn("# Bug Triage Report", distributed_markdown)
+        self.assertNotIn("## Hypotheses", distributed_markdown)
+
         recipe = (
-            REPO_ROOT
-            / "skills/bug-triage-playbook/references/jenkins-artifact-recipes.md"
+            skill_root / "references/jenkins-artifact-recipes.md"
         ).read_text(encoding="utf-8")
         self.assertNotIn("printenv JENKINS_ARTIFACT", recipe)
 
