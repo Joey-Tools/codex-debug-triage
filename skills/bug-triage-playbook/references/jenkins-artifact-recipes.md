@@ -81,7 +81,7 @@ python3 "$helper" zip-show "$artifact_dir/logs.zip" \
   --deadline-seconds 20
 ```
 
-Regex selection is available with `--regex`; multiple matches require `--all` and still obey `--max-selected-members`. Selected members are fully drained within their cap so CRC and truncation failures are not hidden by `--head`. `zip-list` validates metadata without decompressing payloads, so a successful list is not a payload-CRC claim.
+Regex selection is available with `--regex`; multiple matches require `--all` and still obey `--max-selected-members`. Before rendering, each selected member's exact declared compressed span is independently streamed: stored and DEFLATE output must match the declared length and CRC, and DEFLATE must reach its exact end without trailing or unconsumed compressed data. This verification is not shortened by `--head`. `zip-list` validates metadata without decompressing payloads, so a successful list is not a payload-integrity claim.
 
 ## Extract One Exact Member
 
@@ -93,7 +93,7 @@ python3 "$helper" zip-extract "$artifact_dir/logs.zip" \
   --deadline-seconds 20
 ```
 
-Extraction accepts one exact regular-file member and never uses `extractall`. Publication has the same absent-destination, existing-parent, same-parent, mode-`0600`, atomic no-clobber contract as `fetch-url`.
+Extraction accepts one exact regular-file member and never uses `extractall`. It verifies the same exact compressed-span, output-length, CRC, and DEFLATE-end properties before publishing. Publication has the same absent-destination, existing-parent, same-parent, mode-`0600`, atomic no-clobber contract as `fetch-url`.
 
 ## Finish
 

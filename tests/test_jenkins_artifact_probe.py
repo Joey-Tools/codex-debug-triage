@@ -7,6 +7,7 @@ import importlib.util
 import io
 import os
 import pathlib
+import random
 import re
 import signal
 import stat
@@ -251,6 +252,70 @@ class JenkinsArtifactProbeTests(unittest.TestCase):
             with zipfile.ZipFile(path, "w", compression=compression) as archive:
                 for name, payload in entries:
                     archive.writestr(name, payload)
+
+    def _rewrite_deflate_as_declared_prefix(
+        self,
+        path: pathlib.Path,
+        *,
+        member: str,
+        declared_prefix: bytes,
+        hidden_suffix: bytes,
+    ) -> None:
+        self._write_zip(
+            path,
+            [(member, declared_prefix + hidden_suffix)],
+            compression=zipfile.ZIP_DEFLATED,
+        )
+        raw = bytearray(path.read_bytes())
+        local = raw.find(b"PK\x03\x04")
+        central = raw.find(b"PK\x01\x02")
+        self.assertGreaterEqual(local, 0)
+        self.assertGreaterEqual(central, 0)
+        declared_crc = zlib.crc32(declared_prefix) & 0xFFFFFFFF
+        raw[local + 14 : local + 18] = declared_crc.to_bytes(4, "little")
+        raw[local + 22 : local + 26] = len(declared_prefix).to_bytes(4, "little")
+        raw[central + 16 : central + 20] = declared_crc.to_bytes(4, "little")
+        raw[central + 24 : central + 28] = len(declared_prefix).to_bytes(
+            4, "little"
+        )
+        path.write_bytes(raw)
+
+    def _append_deflate_stream_inside_declared_compressed_span(
+        self,
+        path: pathlib.Path,
+        *,
+        member: str,
+        payload: bytes,
+        trailing_payload: bytes,
+    ) -> None:
+        self._write_zip(
+            path,
+            [(member, payload)],
+            compression=zipfile.ZIP_DEFLATED,
+        )
+        raw = bytearray(path.read_bytes())
+        local = raw.find(b"PK\x03\x04")
+        central = raw.find(b"PK\x01\x02")
+        self.assertGreaterEqual(local, 0)
+        self.assertGreaterEqual(central, 0)
+        name_length = int.from_bytes(raw[local + 26 : local + 28], "little")
+        extra_length = int.from_bytes(raw[local + 28 : local + 30], "little")
+        compressed_size = int.from_bytes(raw[local + 18 : local + 22], "little")
+        payload_end = local + 30 + name_length + extra_length + compressed_size
+        compressor = zlib.compressobj(wbits=-15)
+        trailing = compressor.compress(trailing_payload) + compressor.flush()
+        raw[payload_end:payload_end] = trailing
+        central += len(trailing)
+        new_compressed_size = compressed_size + len(trailing)
+        raw[local + 18 : local + 22] = new_compressed_size.to_bytes(4, "little")
+        raw[central + 20 : central + 24] = new_compressed_size.to_bytes(4, "little")
+        eocd = raw.rfind(b"PK\x05\x06")
+        self.assertGreaterEqual(eocd, 0)
+        central_offset = int.from_bytes(raw[eocd + 16 : eocd + 20], "little")
+        raw[eocd + 16 : eocd + 20] = (
+            central_offset + len(trailing)
+        ).to_bytes(4, "little")
+        path.write_bytes(raw)
 
     @contextlib.contextmanager
     def _remote(self, response: FakeHTTPResponse):
@@ -1492,8 +1557,14 @@ class JenkinsArtifactProbeTests(unittest.TestCase):
             valid = root / "descriptor.zip"
             valid.write_bytes(raw)
             limits = MODULE._zip_limits(self._zip_args(valid))
-            with MODULE._open_validated_zip(str(valid), limits):
-                pass
+            with MODULE._open_validated_zip(
+                str(valid), limits
+            ) as (archive, inventory):
+                MODULE._verify_member_payload(
+                    archive,
+                    inventory["payload"],
+                    limits.max_member_uncompressed_bytes,
+                )
 
             invalid_descriptor = root / "bad-descriptor.zip"
             mutated = bytearray(raw)
@@ -1524,33 +1595,46 @@ class JenkinsArtifactProbeTests(unittest.TestCase):
                 with MODULE._open_validated_zip(str(invalid_flags), limits):
                     pass
 
-    def test_zip_show_propagates_the_cli_byte_budget_to_member_reads(self) -> None:
+    def test_zip_commands_reject_declared_size_over_cli_limit_before_payload_reads(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory(dir="/tmp") as directory:
-            archive = pathlib.Path(directory) / "artifact.zip"
+            root = pathlib.Path(directory)
+            archive = root / "artifact.zip"
+            output = root / "payload"
             self._write_zip(
                 archive,
                 [("logs/console.txt", b"long member payload")],
                 compression=zipfile.ZIP_STORED,
             )
-            read_sizes: List[int] = []
-            original_read = zipfile.ZipExtFile.read
-
-            def recording_read(
-                member: zipfile.ZipExtFile, size: int = -1
-            ) -> bytes:
-                read_sizes.append(size)
-                return original_read(member, size)
-
             with mock.patch.object(
-                zipfile.ZipExtFile, "read", recording_read
-            ), redirect_stderr(io.StringIO()), redirect_stdout(io.StringIO()):
-                result = MODULE.cmd_zip_show(
+                MODULE,
+                "_iter_member_compressed_chunks",
+                side_effect=AssertionError("payload span must not be read"),
+            ) as payload_reads, redirect_stderr(
+                io.StringIO()
+            ), redirect_stdout(
+                io.StringIO()
+            ):
+                show_result = MODULE.cmd_zip_show(
                     self._zip_show_args(archive, max_bytes=1)
                 )
-            self.assertEqual(result, 1)
-            self.assertTrue(read_sizes)
-            self.assertNotIn(-1, read_sizes)
-            self.assertLessEqual(max(read_sizes), 2)
+                values = vars(self._zip_args(archive)).copy()
+                values.update(
+                    {
+                        "member": "logs/console.txt",
+                        "output": str(output),
+                        "max_bytes": 1,
+                    }
+                )
+                extract_result = MODULE.cmd_zip_extract(
+                    argparse.Namespace(**values)
+                )
+            self.assertEqual(show_result, 1)
+            self.assertEqual(extract_result, 1)
+            payload_reads.assert_not_called()
+            self.assertFalse(output.exists())
+            self.assertEqual(list(root.glob(".*.artifact-*.tmp")), [])
 
     def test_zip_show_fully_reads_member_so_crc_failure_is_not_hidden_by_head(self) -> None:
         with tempfile.TemporaryDirectory(dir="/tmp") as directory:
@@ -1598,6 +1682,121 @@ class JenkinsArtifactProbeTests(unittest.TestCase):
                 result = MODULE.cmd_zip_show(self._zip_show_args(archive))
             self.assertEqual(result, 1)
             self.assertIn("malformed DEFLATE", errors.getvalue())
+
+    def test_zip_show_and_extract_reject_deflate_output_past_declared_length(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            root = pathlib.Path(directory)
+            archive = root / "overlong.zip"
+            output = root / "console.txt"
+            self._rewrite_deflate_as_declared_prefix(
+                archive,
+                member="logs/console.txt",
+                declared_prefix=b"safe prefix\n",
+                hidden_suffix=b"hidden output that must not be ignored\n",
+            )
+
+            show_errors = io.StringIO()
+            with redirect_stderr(show_errors), redirect_stdout(io.StringIO()):
+                show_result = MODULE.cmd_zip_show(self._zip_show_args(archive))
+            self.assertEqual(show_result, 1)
+            self.assertIn("declared length", show_errors.getvalue())
+
+            values = vars(self._zip_args(archive)).copy()
+            values.update(
+                {
+                    "member": "logs/console.txt",
+                    "output": str(output),
+                    "max_bytes": 1024,
+                }
+            )
+            extract_errors = io.StringIO()
+            with redirect_stderr(extract_errors), redirect_stdout(io.StringIO()):
+                extract_result = MODULE.cmd_zip_extract(
+                    argparse.Namespace(**values)
+                )
+            self.assertEqual(extract_result, 1)
+            self.assertIn("declared length", extract_errors.getvalue())
+            self.assertFalse(output.exists())
+            self.assertEqual(list(root.glob(".*.artifact-*.tmp")), [])
+
+    def test_zip_show_rejects_a_second_stream_inside_the_compressed_span(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            root = pathlib.Path(directory)
+            archive = root / "trailing-stream.zip"
+            output = root / "console.txt"
+            self._append_deflate_stream_inside_declared_compressed_span(
+                archive,
+                member="logs/console.txt",
+                payload=b"visible payload\n",
+                trailing_payload=b"unclaimed second stream\n",
+            )
+            errors = io.StringIO()
+            with redirect_stderr(errors), redirect_stdout(io.StringIO()):
+                result = MODULE.cmd_zip_show(self._zip_show_args(archive))
+            self.assertEqual(result, 1)
+            self.assertIn("trailing compressed data", errors.getvalue())
+
+            values = vars(self._zip_args(archive)).copy()
+            values.update(
+                {
+                    "member": "logs/console.txt",
+                    "output": str(output),
+                    "max_bytes": 1024,
+                }
+            )
+            errors = io.StringIO()
+            with redirect_stderr(errors), redirect_stdout(io.StringIO()):
+                result = MODULE.cmd_zip_extract(argparse.Namespace(**values))
+            self.assertEqual(result, 1)
+            self.assertIn("trailing compressed data", errors.getvalue())
+            self.assertFalse(output.exists())
+            self.assertEqual(list(root.glob(".*.artifact-*.tmp")), [])
+
+    def test_raw_payload_verifier_accepts_stored_and_deflated_members(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            root = pathlib.Path(directory)
+            for compression in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED):
+                with self.subTest(compression=compression):
+                    archive = root / "valid-{}.zip".format(compression)
+                    self._write_zip(
+                        archive,
+                        [("logs/console.txt", b"valid payload\n")],
+                        compression=compression,
+                    )
+                    limits = MODULE._zip_limits(self._zip_args(archive))
+                    with MODULE._open_validated_zip(
+                        str(archive), limits
+                    ) as (opened, inventory):
+                        MODULE._verify_member_payload(
+                            opened,
+                            inventory["logs/console.txt"],
+                            limits.max_member_uncompressed_bytes,
+                        )
+
+    def test_raw_payload_verifier_drains_buffered_deflate_output(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            archive = pathlib.Path(directory) / "buffered-output.zip"
+            payload = random.Random(16384).randbytes(16384) + b"A" * (
+                MODULE.CHUNK_BYTES + 1 - 16384
+            )
+            self._write_zip(
+                archive,
+                [("logs/console.txt", payload)],
+                compression=zipfile.ZIP_DEFLATED,
+            )
+            limits = MODULE._zip_limits(self._zip_args(archive))
+            with MODULE._open_validated_zip(
+                str(archive), limits
+            ) as (opened, inventory):
+                MODULE._verify_member_payload(
+                    opened,
+                    inventory["logs/console.txt"],
+                    len(payload),
+                )
 
     def test_zip_list_validates_metadata_without_claiming_payload_crc(self) -> None:
         with tempfile.TemporaryDirectory(dir="/tmp") as directory:

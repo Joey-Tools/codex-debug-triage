@@ -1437,11 +1437,149 @@ def _find_members(
     ]
 
 
+def _iter_member_compressed_chunks(
+    archive: zipfile.ZipFile,
+    info: zipfile.ZipInfo,
+) -> Iterator[bytes]:
+    source = archive.fp
+    if source is None:
+        raise ArtifactError("zip archive is not open")
+    source.seek(info.header_offset)
+    local_header = source.read(30)
+    if len(local_header) != 30 or local_header[:4] != b"PK\x03\x04":
+        raise zipfile.BadZipFile("invalid zip local-file header")
+    (
+        _,
+        _,
+        local_flags,
+        local_method,
+        _,
+        _,
+        local_crc,
+        local_compressed_size,
+        local_uncompressed_size,
+        local_name_length,
+        local_extra_length,
+    ) = struct.unpack("<4s5H3L2H", local_header)
+    if local_flags != info.flag_bits or local_method != info.compress_type:
+        raise ArtifactError("zip local and central header flags or methods disagree")
+    if not (local_flags & 0x08) and (
+        local_crc != info.CRC
+        or local_compressed_size != info.compress_size
+        or local_uncompressed_size != info.file_size
+    ):
+        raise ArtifactError("zip local and central member metadata disagree")
+    if local_flags & 0x08 and (
+        local_crc not in (0, info.CRC)
+        or local_compressed_size not in (0, info.compress_size)
+        or local_uncompressed_size not in (0, info.file_size)
+    ):
+        raise ArtifactError("zip local data-descriptor metadata is inconsistent")
+
+    source.seek(local_name_length + local_extra_length, os.SEEK_CUR)
+    remaining = info.compress_size
+    while remaining:
+        chunk = source.read(min(CHUNK_BYTES, remaining))
+        if not chunk:
+            raise zipfile.BadZipFile("truncated zip member payload")
+        if len(chunk) > remaining:
+            raise ArtifactError("zip member payload read exceeded its declared span")
+        remaining -= len(chunk)
+        yield chunk
+
+
+def _update_member_integrity(
+    output: bytes,
+    *,
+    info: zipfile.ZipInfo,
+    total: int,
+    crc: int,
+) -> Tuple[int, int]:
+    total += len(output)
+    if total > info.file_size:
+        raise ArtifactError("zip member expands beyond its declared length")
+    return total, zlib.crc32(output, crc) & 0xFFFFFFFF
+
+
+def _verify_member_payload(
+    archive: zipfile.ZipFile,
+    info: zipfile.ZipInfo,
+    limit: int,
+) -> None:
+    if info.file_size > limit:
+        raise LimitExceeded("byte limit {} exceeded".format(limit))
+    total = 0
+    crc = 0
+    if info.compress_type == zipfile.ZIP_STORED:
+        for chunk in _iter_member_compressed_chunks(archive, info):
+            total, crc = _update_member_integrity(
+                chunk, info=info, total=total, crc=crc
+            )
+    elif info.compress_type == zipfile.ZIP_DEFLATED:
+        decompressor = zlib.decompressobj(-15)
+        for compressed_chunk in _iter_member_compressed_chunks(archive, info):
+            if decompressor.eof:
+                raise ArtifactError(
+                    "zip DEFLATE payload contains trailing compressed data"
+                )
+            pending = compressed_chunk
+            while pending:
+                allowance = min(CHUNK_BYTES, info.file_size - total + 1)
+                try:
+                    output = decompressor.decompress(pending, allowance)
+                except zlib.error as error:
+                    raise ArtifactError("malformed DEFLATE member payload") from error
+                total, crc = _update_member_integrity(
+                    output, info=info, total=total, crc=crc
+                )
+                if decompressor.unused_data:
+                    raise ArtifactError(
+                        "zip DEFLATE payload contains trailing compressed data"
+                    )
+                next_pending = decompressor.unconsumed_tail
+                if next_pending and len(next_pending) == len(pending) and not output:
+                    raise ArtifactError("malformed DEFLATE member payload")
+                pending = next_pending
+        while not decompressor.eof:
+            allowance = min(CHUNK_BYTES, info.file_size - total + 1)
+            try:
+                output = decompressor.decompress(b"", allowance)
+            except zlib.error as error:
+                raise ArtifactError("malformed DEFLATE member payload") from error
+            if not output:
+                break
+            total, crc = _update_member_integrity(
+                output, info=info, total=total, crc=crc
+            )
+            if decompressor.unused_data or decompressor.unconsumed_tail:
+                raise ArtifactError(
+                    "zip DEFLATE payload contains trailing compressed data"
+                )
+        if decompressor.unused_data or decompressor.unconsumed_tail:
+            raise ArtifactError(
+                "zip DEFLATE payload contains trailing compressed data"
+            )
+        if not decompressor.eof:
+            raise ArtifactError("malformed or truncated DEFLATE member payload")
+    else:
+        raise ArtifactError("zip compression method is not allowlisted")
+
+    if total != info.file_size:
+        raise ArtifactError(
+            "zip member length {} does not match declared length {}".format(
+                total, info.file_size
+            )
+        )
+    if crc != info.CRC:
+        raise zipfile.BadZipFile("Bad CRC-32 for file {!r}".format(info.filename))
+
+
 def _stream_member(
     archive: zipfile.ZipFile,
     info: zipfile.ZipInfo,
     limit: int,
 ) -> Iterator[bytes]:
+    _verify_member_payload(archive, info, limit)
     with archive.open(info, "r") as member:
         yield from _iter_limited_chunks(
             member, limit, expected_length=info.file_size
@@ -1697,6 +1835,7 @@ def cmd_zip_show(args: argparse.Namespace) -> int:
             for index, info in enumerate(selected):
                 if info.is_dir():
                     raise ArtifactError("cannot show a directory member")
+                _verify_member_payload(archive, info, text_limits.max_bytes)
                 if index:
                     collector.add("")
                 collector.add("== {} ==".format(info.filename))
