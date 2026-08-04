@@ -2261,81 +2261,178 @@ def _cleanup_receipt(receipt: Optional[TempReceipt]) -> str:
         os.close(parent_fd)
 
 
+@dataclass
+class _WorkerProcess:
+    pid: int = -1
+    read_fd: int = -1
+    write_fd: int = -1
+    status: int = 0
+    reaped: bool = False
+    setup_mask: Optional[Iterable[int]] = None
+    setup_mask_active: bool = False
+
+
+def _blockable_signals() -> frozenset:
+    blocked = set(signal.valid_signals())
+    for name in ("SIGKILL", "SIGSTOP"):
+        unmaskable = getattr(signal, name, None)
+        if unmaskable is not None:
+            blocked.discard(unmaskable)
+    return frozenset(blocked)
+
+
+def _restore_setup_signals(worker: _WorkerProcess) -> None:
+    if not worker.setup_mask_active or worker.setup_mask is None:
+        return
+    previous = worker.setup_mask
+    worker.setup_mask_active = False
+    signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+
+
+def _run_worker_child(args: argparse.Namespace, worker: _WorkerProcess) -> None:
+    return_code = 1
+    try:
+        os.close(worker.read_fd)
+        worker.read_fd = -1
+        _restore_setup_signals(worker)
+        setattr(args, "_receipt_fd", worker.write_fd)
+        return_code = int(args.func(args))
+    except BaseException as error:
+        print(
+            "error=unhandled worker failure ({})".format(type(error).__name__),
+            file=sys.stderr,
+        )
+    finally:
+        with contextlib.suppress(Exception):
+            sys.stdout.flush()
+            sys.stderr.flush()
+        with contextlib.suppress(OSError):
+            os.close(worker.write_fd)
+    os._exit(max(0, min(return_code, 255)))
+
+
+def _start_worker(
+    args: argparse.Namespace,
+    worker: _WorkerProcess,
+    blocked_signals: frozenset,
+) -> None:
+    worker.setup_mask = signal.pthread_sigmask(signal.SIG_BLOCK, blocked_signals)
+    worker.setup_mask_active = True
+    worker.read_fd, worker.write_fd = os.pipe()
+    os.set_blocking(worker.read_fd, False)
+    worker.pid = os.fork()
+    if worker.pid == 0:
+        _run_worker_child(args, worker)
+    os.close(worker.write_fd)
+    worker.write_fd = -1
+    _restore_setup_signals(worker)
+
+
+def _waitpid_tracked(
+    worker: _WorkerProcess, options: int, blocked_signals: frozenset
+) -> int:
+    previous = signal.pthread_sigmask(signal.SIG_BLOCK, blocked_signals)
+    try:
+        try:
+            waited_pid, status = os.waitpid(worker.pid, options)
+        except ChildProcessError:
+            worker.reaped = True
+            raise
+        if waited_pid == worker.pid:
+            worker.status = status
+            worker.reaped = True
+        return waited_pid
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+
+
+def _kill_and_reap_worker(
+    worker: _WorkerProcess, blocked_signals: frozenset
+) -> None:
+    previous = signal.pthread_sigmask(signal.SIG_BLOCK, blocked_signals)
+    try:
+        if worker.pid <= 0 or worker.reaped:
+            return
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(worker.pid, signal.SIGKILL)
+        try:
+            waited_pid, status = os.waitpid(worker.pid, 0)
+        except ChildProcessError:
+            worker.reaped = True
+            return
+        if waited_pid != worker.pid:
+            raise RuntimeError("waitpid returned an unexpected worker PID")
+        worker.status = status
+        worker.reaped = True
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+
+
 def _run_with_hard_deadline(args: argparse.Namespace) -> int:
-    if not hasattr(os, "fork"):
+    if not hasattr(os, "fork") or not hasattr(signal, "pthread_sigmask"):
         print("error=platform lacks required worker-process deadline support", file=sys.stderr)
         return 2
     started = time.monotonic()
     deadline = started + args.deadline_seconds
-    read_fd, write_fd = os.pipe()
-    os.set_blocking(read_fd, False)
-    child_pid = os.fork()
-    if child_pid == 0:
-        os.close(read_fd)
-        setattr(args, "_receipt_fd", write_fd)
-        try:
-            return_code = int(args.func(args))
-        except BaseException as error:
-            print(
-                "error=unhandled worker failure ({})".format(
-                    type(error).__name__
-                ),
-                file=sys.stderr,
-            )
-            return_code = 1
-        finally:
-            with contextlib.suppress(Exception):
-                sys.stdout.flush()
-                sys.stderr.flush()
-            os.close(write_fd)
-        os._exit(max(0, min(return_code, 255)))
-
-    os.close(write_fd)
+    blocked_signals = _blockable_signals()
+    worker = _WorkerProcess()
     receipt_bytes = bytearray()
-    status = 0
     timed_out = False
     parent_error: Optional[BaseException] = None
     try:
+        _start_worker(args, worker, blocked_signals)
         while True:
             if time.monotonic() >= deadline:
                 timed_out = True
-                waited_pid, status = os.waitpid(child_pid, os.WNOHANG)
-                if waited_pid != child_pid:
-                    os.kill(child_pid, signal.SIGKILL)
-                    _, status = os.waitpid(child_pid, 0)
+                _waitpid_tracked(worker, os.WNOHANG, blocked_signals)
+                if not worker.reaped:
+                    _kill_and_reap_worker(worker, blocked_signals)
                 break
             with contextlib.suppress(BlockingIOError):
-                chunk = os.read(read_fd, 4096 - len(receipt_bytes))
+                chunk = os.read(worker.read_fd, 4096 - len(receipt_bytes))
                 if chunk:
                     receipt_bytes.extend(chunk)
-            waited_pid, status = os.waitpid(child_pid, os.WNOHANG)
+            _waitpid_tracked(worker, os.WNOHANG, blocked_signals)
             observed = time.monotonic()
             if observed >= deadline:
                 timed_out = True
-                if waited_pid != child_pid:
-                    os.kill(child_pid, signal.SIGKILL)
-                    _, status = os.waitpid(child_pid, 0)
+                if not worker.reaped:
+                    _kill_and_reap_worker(worker, blocked_signals)
                 break
-            if waited_pid == child_pid:
+            if worker.reaped:
                 break
             remaining = deadline - observed
             time.sleep(min(0.01, remaining))
     except BaseException as error:
         parent_error = error
-        with contextlib.suppress(ProcessLookupError):
-            os.kill(child_pid, signal.SIGKILL)
-        with contextlib.suppress(ChildProcessError):
-            _, status = os.waitpid(child_pid, 0)
+        if worker.pid > 0 and not worker.reaped:
+            with contextlib.suppress(BaseException):
+                _kill_and_reap_worker(worker, blocked_signals)
     finally:
-        while len(receipt_bytes) < 4096:
+        if worker.setup_mask_active:
             try:
-                chunk = os.read(read_fd, 4096 - len(receipt_bytes))
-            except BlockingIOError:
-                break
-            if not chunk:
-                break
-            receipt_bytes.extend(chunk)
-        os.close(read_fd)
+                _restore_setup_signals(worker)
+            except BaseException as error:
+                if parent_error is None:
+                    parent_error = error
+                if worker.pid > 0 and not worker.reaped:
+                    with contextlib.suppress(BaseException):
+                        _kill_and_reap_worker(worker, blocked_signals)
+        if worker.write_fd >= 0:
+            with contextlib.suppress(OSError):
+                os.close(worker.write_fd)
+            worker.write_fd = -1
+        if worker.read_fd >= 0:
+            while len(receipt_bytes) < 4096:
+                try:
+                    chunk = os.read(worker.read_fd, 4096 - len(receipt_bytes))
+                except BlockingIOError:
+                    break
+                if not chunk:
+                    break
+                receipt_bytes.extend(chunk)
+            os.close(worker.read_fd)
+            worker.read_fd = -1
 
     receipt = _parse_receipt(bytes(receipt_bytes))
     if parent_error is not None:
@@ -2351,8 +2448,8 @@ def _run_with_hard_deadline(args: argparse.Namespace) -> int:
         print("error=wall deadline exceeded", file=sys.stderr)
         print("cleanup={}".format(cleanup), file=sys.stderr)
         return 124
-    if os.WIFEXITED(status):
-        return_code = os.WEXITSTATUS(status)
+    if os.WIFEXITED(worker.status):
+        return_code = os.WEXITSTATUS(worker.status)
         if return_code != 0 and (
             receipt is not None or hasattr(args, "output")
         ):
@@ -2364,7 +2461,12 @@ def _run_with_hard_deadline(args: argparse.Namespace) -> int:
     cleanup = _cleanup_receipt(receipt)
     if receipt is None and hasattr(args, "output"):
         cleanup = "inconclusive"
-    print("error=worker terminated by signal {}".format(os.WTERMSIG(status)), file=sys.stderr)
+    print(
+        "error=worker terminated by signal {}".format(
+            os.WTERMSIG(worker.status)
+        ),
+        file=sys.stderr,
+    )
     print("cleanup={}".format(cleanup), file=sys.stderr)
     return 1
 

@@ -1083,6 +1083,71 @@ class JenkinsArtifactProbeTests(unittest.TestCase):
         self.assertEqual(result, 124)
         kill.assert_not_called()
 
+    def test_parent_interrupt_during_post_fork_setup_kills_and_reaps_worker(
+        self,
+    ) -> None:
+        args = argparse.Namespace(
+            func=_sleep_worker,
+            deadline_seconds=0.5,
+            sleep_seconds=0.0,
+        )
+        signal_mask_calls = 0
+
+        def interrupt_first_restore(_: int, __: object) -> frozenset:
+            nonlocal signal_mask_calls
+            signal_mask_calls += 1
+            if signal_mask_calls == 2:
+                raise KeyboardInterrupt
+            return frozenset()
+
+        with mock.patch.object(MODULE.os, "fork", return_value=12345):
+            with mock.patch.object(
+                MODULE.signal,
+                "pthread_sigmask",
+                side_effect=interrupt_first_restore,
+            ):
+                with mock.patch.object(
+                    MODULE.os, "waitpid", return_value=(12345, 0)
+                ) as waitpid:
+                    with mock.patch.object(MODULE.os, "kill") as kill:
+                        with redirect_stderr(io.StringIO()):
+                            with self.assertRaises(KeyboardInterrupt):
+                                MODULE._run_with_hard_deadline(args)
+        kill.assert_called_once_with(12345, signal.SIGKILL)
+        waitpid.assert_called_once_with(12345, 0)
+
+    def test_interrupt_after_waitpid_reap_does_not_signal_reused_pid(self) -> None:
+        args = argparse.Namespace(
+            func=_sleep_worker,
+            deadline_seconds=0.5,
+            sleep_seconds=0.0,
+        )
+        signal_mask_calls = 0
+
+        def interrupt_reap_restore(_: int, __: object) -> frozenset:
+            nonlocal signal_mask_calls
+            signal_mask_calls += 1
+            if signal_mask_calls == 4:
+                raise KeyboardInterrupt
+            return frozenset()
+
+        with mock.patch.object(MODULE.time, "monotonic", side_effect=(10.0, 10.1)):
+            with mock.patch.object(MODULE.os, "fork", return_value=12345):
+                with mock.patch.object(
+                    MODULE.signal,
+                    "pthread_sigmask",
+                    side_effect=interrupt_reap_restore,
+                ):
+                    with mock.patch.object(
+                        MODULE.os, "waitpid", return_value=(12345, 0)
+                    ) as waitpid:
+                        with mock.patch.object(MODULE.os, "kill") as kill:
+                            with redirect_stderr(io.StringIO()):
+                                with self.assertRaises(KeyboardInterrupt):
+                                    MODULE._run_with_hard_deadline(args)
+        kill.assert_not_called()
+        waitpid.assert_called_once_with(12345, os.WNOHANG)
+
     def test_signal_failure_cleans_receipted_temp_and_published_output(self) -> None:
         with tempfile.TemporaryDirectory(dir="/tmp") as directory:
             parent = pathlib.Path(directory)
