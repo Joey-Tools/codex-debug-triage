@@ -1,4 +1,4 @@
 interface:
-  display_name: "Bug Triage Playbook"
-  short_description: "Investigate logs, regressions, and root-cause hypotheses."
-  default_prompt: "Use $bug-triage-playbook to structure root-cause analysis from logs, failures, or regressions."
+  display_name: "Bounded Artifact Transport"
+  short_description: "Load and route bounded Jenkins-style artifact transport."
+  default_prompt: "Use $bug-triage-playbook only to route an exact remote artifact URL or local ZIP through the bounded transport helper, then return the artifact evidence to the task's primary diagnostic workflow."

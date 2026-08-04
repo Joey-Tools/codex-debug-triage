@@ -1,193 +1,107 @@
-# Jenkins And Archive Recipes
+# Bounded Jenkins-Style Artifact Recipes
 
-Use these recipes when the repeated work is:
-
-- verify auth and approval before touching the real artifact
-- probe or fetch a Jenkins console, API payload, or archive without a shell wrapper
-- list likely log members or local files before printing matches
-- extract one member or inspect one local file and filter to the key lines
-
-Prefer direct argv helper forms for approval-sensitive remote steps so prefix rules can match stable command families. Use the installed personal-skill path under the current user's `$HOME`, for example `$HOME/.codex/skills/bug-triage-playbook/scripts/jenkins_artifact_probe.py`, as the recurring target; the repo mirror under `personal_codex/` is for authoring and sync, not the default runtime command example.
-
-Before fetching large local artifacts, allocate a task-scoped temp directory and clean it up when the task ends unless the user explicitly wants to keep the files:
+These recipes use the optional public helper as the canonical transport boundary. The public host and job names are synthetic. Run the installed helper directly; avoid wrapping authenticated calls in a broad shell command.
 
 ```bash
-tmp_dir="$(mktemp -d /tmp/jenkins-artifact.XXXXXX)"
-trap 'rm -rf "$tmp_dir"' EXIT
+helper="$HOME/.codex/skills/bug-triage-playbook/scripts/jenkins_artifact_probe.py"
+artifact_dir="$(mktemp -d /tmp/artifact-probe.XXXXXX)"
 ```
 
-## 1. Preflight The Gate
+The output parent must already exist, its path chain must not contain non-sticky group/other-writable directories, and each persistent destination must be absent. These checks cover traditional owner/mode/sticky semantics, not extended ACLs; choose a chain with no ACL grant to another principal. The standard sticky root-owned `/tmp` plus a private `mktemp` directory without such ACL grants satisfy this policy. Clean up the task-scoped directory when the task ends.
 
-Check whether the expected auth env vars are present before attempting a remote fetch:
+## Probe Access
+
+Let the helper check whether the fixed auth variables are present. Do not run `printenv`, `env`, or another value-producing command for this preflight; the helper reports the missing variable names without exposing values.
 
 ```bash
-printenv JENKINS_ARTIFACT_USER JENKINS_ARTIFACT_TOKEN
-```
-
-Default remote probe when approval reuse matters:
-
-```bash
-python3 "$HOME/.codex/skills/bug-triage-playbook/scripts/jenkins_artifact_probe.py" probe-url \
-  'https://jenkins.example.com/jenkins/wme/job/P3A0-WME-TA-LINUX-Daily/123/consoleText' \
-  --auth-profile default
-```
-
-Interpret the first failure before retrying:
-
-- `status=403` plus `auth=absent`: the expected env vars are still missing or you are not on the approved helper path yet.
-- `status=401` plus `auth=present`: the helper reached the server, but the chosen `--auth-profile` is wrong for that endpoint. Change profile before falling back to raw `curl`.
-- When one profile works for a Jenkins job family, reuse it for nearby `consoleText`, `api/json`, and artifact URLs unless the evidence says otherwise.
-
-When this is the first escalated helper preflight in the session, request a recurring prefix such as:
-
-```text
-["python3", "<expanded-home>/.codex/skills/bug-triage-playbook/scripts/jenkins_artifact_probe.py", "probe-url"]
-```
-
-Fallback raw `curl` only when the helper cannot express the HTTP detail you need:
-
-```bash
-curl -fLI \
-  -u "$JENKINS_ARTIFACT_USER:$JENKINS_ARTIFACT_TOKEN" \
-  'https://jenkins.example.com/jenkins/wme/job/P3A0-WME-TA-LINUX-Daily/123/consoleText'
-```
-
-If this step fails, stop and report the precise blocker: missing env vars, approval, network, or remote auth.
-
-The helper intentionally rejects:
-
-- non-`https` URLs
-- hosts outside `jenkins.example.com`
-- arbitrary auth env names
-- `fetch-url` output paths outside the current workspace or `/tmp`
-
-## 2. Fetch The Requested Artifact
-
-Show a text endpoint directly when you only need a modest text response or a bounded head/tail:
-
-```bash
-python3 "$HOME/.codex/skills/bug-triage-playbook/scripts/jenkins_artifact_probe.py" show-url \
-  'https://jenkins.example.com/jenkins/wme/job/P3A0-WME-TA-LINUX-Daily/123/consoleText' \
+python3 "$helper" probe-url \
+  'https://jenkins.example.com/job/example/42/api/json' \
   --auth-profile default \
-  --tail 220
+  --deadline-seconds 20
 ```
 
-Keep shell-sensitive URLs quoted as one argument. Jenkins artifact viewer URLs such as `.../artifact/env.txt/*view*/` will be glob-expanded by `zsh` if you leave the `*view*` segment unquoted in a shell wrapper.
+Interpret `auth=absent` and `auth=present` as transport state, not as proof that a credential is valid. HTTP, policy, and deadline errors remain distinct.
+Authenticated requests are limited to the fixed HTTPS host on port 443; an explicit non-default port is rejected before credentials are added.
 
-Show a small JSON payload directly:
+## Show Bounded Text
 
 ```bash
-python3 "$HOME/.codex/skills/bug-triage-playbook/scripts/jenkins_artifact_probe.py" show-url \
-  'https://jenkins.example.com/jenkins/wme/job/P3A0-WME-TA-LINUX-Daily/123/api/json' \
-  --auth-profile default
-```
-
-Fetch a console log to disk when the artifact is large or you need multiple local passes:
-
-```bash
-python3 "$HOME/.codex/skills/bug-triage-playbook/scripts/jenkins_artifact_probe.py" fetch-url \
-  'https://jenkins.example.com/jenkins/wme/job/P3A0-WME-TA-LINUX-Daily/123/consoleText' \
-  --output "$tmp_dir/run.consoleText" \
-  --auth-profile default
-```
-
-Fetch a zip artifact:
-
-```bash
-python3 "$HOME/.codex/skills/bug-triage-playbook/scripts/jenkins_artifact_probe.py" fetch-url \
-  'https://jenkins.example.com/path/to/artifact.zip' \
-  --output "$tmp_dir/run.zip" \
-  --auth-profile default
-```
-
-When this is the first escalated helper fetch in the session, request a recurring prefix such as:
-
-```text
-["python3", "<expanded-home>/.codex/skills/bug-triage-playbook/scripts/jenkins_artifact_probe.py", "fetch-url"]
-```
-
-Use the same pattern for `show-url` when you want direct stdout output:
-
-```text
-["python3", "<expanded-home>/.codex/skills/bug-triage-playbook/scripts/jenkins_artifact_probe.py", "show-url"]
-```
-
-Avoid embedding the whole flow inside `bash -lc` unless shell syntax is essential. Split remote helper fetches from local `tail`, `rg`, `python3`, or `jq` inspection.
-If you need multiple local passes over a `*view*` URL or another shell-sensitive endpoint, prefer `fetch-url` first and then inspect the saved local file.
-
-## 3. Budget Local Artifact Reads
-
-Once the remote artifact or related archive has been fetched locally, do not switch to broad line-producing searches over the whole artifact tree. Start with cheap orientation:
-
-```bash
-find "$tmp_dir" -type f -print | sed -n '1,80p'
-wc -l "$tmp_dir/run.consoleText"
-rg -l -i 'ASSERT|ERROR|FAIL|Exception|Traceback|timeout' "$tmp_dir" | head -n 40
-rg --count -i 'ASSERT|ERROR|FAIL|Exception|Traceback|timeout' "$tmp_dir" | head -n 40
-```
-
-Then print only one exact source at a time:
-
-```bash
-rg -n -i 'ASSERT|ERROR|FAIL|Exception|Traceback|timeout' "$tmp_dir/run.consoleText" | head -n 80
-sed -n '420,470p' "$tmp_dir/run.consoleText"
-```
-
-Do not run raw `rg -n` across `.codex-tmp`, unpacked archives, `raw/` log trees, or broad source/documentation directories. Patterns such as `rg -n 'needle' .codex-tmp/av1-*` or `rg -n 'job|jenkins|create' .codex-tmp ...` can print tens of thousands of retained lines. Use `rg -l` / `rg --count` first, then read one exact file, member, symbol, or line window.
-
-For large JSON, release metadata, or HTML/manual pages, avoid printing the full response. Prefer a helper `show-url` with `--head`, `--tail`, or `--grep`, or fetch to disk and extract selected fields with `jq` / a short parser before deciding whether a larger read is justified.
-
-## 4. List Candidate Members
-
-List all members:
-
-```bash
-python3 "$HOME/.codex/skills/bug-triage-playbook/scripts/jenkins_artifact_probe.py" zip-list "$tmp_dir/run.zip"
-```
-
-Narrow to likely files:
-
-```bash
-python3 "$HOME/.codex/skills/bug-triage-playbook/scripts/jenkins_artifact_probe.py" zip-list \
-  "$tmp_dir/run.zip" \
-  --match 'console|mqe|error|fail|log'
-```
-
-## 5. Extract And Filter The Key Lines
-
-Show a known member:
-
-```bash
-python3 "$HOME/.codex/skills/bug-triage-playbook/scripts/jenkins_artifact_probe.py" zip-show \
-  "$tmp_dir/run.zip" \
-  'logs/console.txt' \
-  --head 120
-```
-
-Search a member selected by regex, with context:
-
-```bash
-python3 "$HOME/.codex/skills/bug-triage-playbook/scripts/jenkins_artifact_probe.py" zip-show \
-  "$tmp_dir/run.zip" \
-  'fail8_share.*mqe.*\\.log' \
-  --regex \
-  --grep 'ASSERT|ERROR|FAIL|Exception|Traceback|timeout' \
+python3 "$helper" show-url \
+  'https://jenkins.example.com/job/example/42/consoleText' \
+  --auth-profile default \
+  --grep 'ERROR|FAIL|Exception|timeout' \
   --ignore-case \
-  --context 2
+  --context 2 \
+  --line-numbers \
+  --max-bytes 8388608 \
+  --max-emit-lines 80 \
+  --deadline-seconds 30
 ```
 
-If the artifact is already a plain text file, keep filtering direct and narrow:
+`--grep`, `--head`, and `--tail` are mutually exclusive selection modes. `--head` stops the remote text scan after the requested prefix, while `--tail` and `--grep` must scan the bounded input. All modes are also bounded by the emitted-line and emitted-byte ceilings. A command-line limit can only tighten its compiled hard ceiling.
+
+Text-oriented stdout is budgeted UTF-8 and escapes non-printable characters, so it is safe diagnostic rendering rather than a byte-for-byte copy. Use `fetch-url` or `zip-extract` when exact bytes are required.
+
+## Fetch Without Overwrite
 
 ```bash
-rg -n -i 'ASSERT|ERROR|FAIL|Exception|Traceback|timeout' "$tmp_dir/run.consoleText" | head -n 80
+python3 "$helper" fetch-url \
+  'https://jenkins.example.com/job/example/42/artifact/logs.zip' \
+  --auth-profile default \
+  --output "$artifact_dir/logs.zip" \
+  --max-bytes 134217728 \
+  --deadline-seconds 60
 ```
 
-## 6. Report The Smallest Decisive Evidence
+The helper checks destination absence before opening the remote response. It publishes a completed same-parent mode-`0600` file atomically and never overwrites an existing path. A reported worker failure or enforced deadline leaves no final partial file; an inconclusive timeout cleanup is reported explicitly. Abrupt parent termination that cannot execute receipt cleanup is outside this guarantee and can leave a private temporary file or a fully published final file.
 
-Do not paste the whole console or whole extracted file by default.
-Prefer:
+Authenticated redirects are accepted only on the same effective HTTPS origin. Cross-host, cross-port, downgrade, inline-credential, loop, and excessive-hop redirects are rejected before another request is sent.
 
-- the exact URL or artifact path inspected
-- the member name inside the archive
-- five to ten key lines with line numbers
-- the smallest next step that separates the top hypotheses
+## Validate And List A ZIP
+
+```bash
+python3 "$helper" zip-list "$artifact_dir/logs.zip" \
+  --match 'console|error|fail|\.log$' \
+  --ignore-case \
+  --limit 80 \
+  --deadline-seconds 20
+```
+
+Listing validates the bounded central directory before allocating the complete inventory. Hard ceilings cover archive and central-directory bytes, member count, member-name bytes, per-member and aggregate compressed/uncompressed bytes, compression ratio, and selected members. Only stored and bounded-output DEFLATE members are accepted; unsafe paths, portable duplicate names, symlinks, special files, encryption, unsupported feature versions, and other compression methods are rejected with controlled artifact diagnostics.
+
+## Show One Or A Bounded Set Of Members
+
+```bash
+python3 "$helper" zip-show "$artifact_dir/logs.zip" \
+  'logs/console.txt' \
+  --grep 'ERROR|FAIL|Exception|timeout' \
+  --ignore-case \
+  --context 2 \
+  --line-numbers \
+  --max-emit-lines 80 \
+  --deadline-seconds 20
+```
+
+Regex selection is available with `--regex`; multiple matches require `--all` and still obey `--max-selected-members`. Before rendering, each selected member's exact declared compressed span is independently streamed: stored and DEFLATE output must match the declared length and CRC, and DEFLATE must reach its exact end without trailing or unconsumed compressed data. This verification is not shortened by `--head`. `zip-list` validates metadata without decompressing payloads, so a successful list is not a payload-integrity claim.
+
+## Extract One Exact Member
+
+```bash
+python3 "$helper" zip-extract "$artifact_dir/logs.zip" \
+  'logs/console.txt' \
+  --output "$artifact_dir/console.txt" \
+  --max-bytes 33554432 \
+  --deadline-seconds 20
+```
+
+Extraction accepts one exact regular-file member and never uses `extractall`. It verifies the same exact compressed-span, output-length, CRC, and DEFLATE-end properties before publishing. Publication has the same absent-destination, existing-parent, same-parent, mode-`0600`, atomic no-clobber contract as `fetch-url`.
+
+## Finish
+
+Report only the sanitized remote label or exact local path, member, five to ten decisive lines, and any explicit blocker. Remove the task-scoped directory when its artifacts are no longer needed:
+
+Cleanup is destructive. Prefer recoverable cleanup tooling when it is available. Before using direct removal, confirm that the variable still names the exact task-scoped `/tmp/artifact-probe.*` directory and not a broader path:
+
+```bash
+rm -rf "$artifact_dir"
+```
