@@ -1706,9 +1706,12 @@ def cmd_show_url(args: argparse.Namespace) -> int:
             socket_timeout=_socket_timeout(args),
             max_redirects=_max_redirects(args),
         ) as response:
-            declared_length = _check_content_length(
-                response.headers, limits.max_bytes
-            )
+            if args.head:
+                declared_length = _response_content_length(response.headers)
+            else:
+                declared_length = _check_content_length(
+                    response.headers, limits.max_bytes
+                )
             _select_text_lines(
                 _iter_bounded_text_lines(
                     response,
@@ -2270,6 +2273,8 @@ class _WorkerProcess:
     reaped: bool = False
     setup_mask: Optional[Iterable[int]] = None
     setup_mask_active: bool = False
+    sigchld_handler: object = None
+    sigchld_handler_active: bool = False
 
 
 def _blockable_signals() -> frozenset:
@@ -2289,11 +2294,19 @@ def _restore_setup_signals(worker: _WorkerProcess) -> None:
     signal.pthread_sigmask(signal.SIG_SETMASK, previous)
 
 
+def _restore_sigchld_handler(worker: _WorkerProcess) -> None:
+    if not worker.sigchld_handler_active:
+        return
+    signal.signal(signal.SIGCHLD, worker.sigchld_handler)
+    worker.sigchld_handler_active = False
+
+
 def _run_worker_child(args: argparse.Namespace, worker: _WorkerProcess) -> None:
     return_code = 1
     try:
         os.close(worker.read_fd)
         worker.read_fd = -1
+        _restore_sigchld_handler(worker)
         _restore_setup_signals(worker)
         setattr(args, "_receipt_fd", worker.write_fd)
         return_code = int(args.func(args))
@@ -2318,6 +2331,9 @@ def _start_worker(
 ) -> None:
     worker.setup_mask = signal.pthread_sigmask(signal.SIG_BLOCK, blocked_signals)
     worker.setup_mask_active = True
+    worker.sigchld_handler = signal.getsignal(signal.SIGCHLD)
+    signal.signal(signal.SIGCHLD, signal.SIG_DFL)
+    worker.sigchld_handler_active = True
     worker.read_fd, worker.write_fd = os.pipe()
     os.set_blocking(worker.read_fd, False)
     worker.pid = os.fork()
@@ -2337,10 +2353,12 @@ def _waitpid_tracked(
             waited_pid, status = os.waitpid(worker.pid, options)
         except ChildProcessError:
             worker.reaped = True
+            _restore_sigchld_handler(worker)
             raise
         if waited_pid == worker.pid:
             worker.status = status
             worker.reaped = True
+            _restore_sigchld_handler(worker)
         return waited_pid
     finally:
         signal.pthread_sigmask(signal.SIG_SETMASK, previous)
@@ -2352,6 +2370,7 @@ def _kill_and_reap_worker(
     previous = signal.pthread_sigmask(signal.SIG_BLOCK, blocked_signals)
     try:
         if worker.pid <= 0 or worker.reaped:
+            _restore_sigchld_handler(worker)
             return
         with contextlib.suppress(ProcessLookupError):
             os.kill(worker.pid, signal.SIGKILL)
@@ -2359,11 +2378,13 @@ def _kill_and_reap_worker(
             waited_pid, status = os.waitpid(worker.pid, 0)
         except ChildProcessError:
             worker.reaped = True
+            _restore_sigchld_handler(worker)
             return
         if waited_pid != worker.pid:
             raise RuntimeError("waitpid returned an unexpected worker PID")
         worker.status = status
         worker.reaped = True
+        _restore_sigchld_handler(worker)
     finally:
         signal.pthread_sigmask(signal.SIG_SETMASK, previous)
 
@@ -2409,6 +2430,14 @@ def _run_with_hard_deadline(args: argparse.Namespace) -> int:
             with contextlib.suppress(BaseException):
                 _kill_and_reap_worker(worker, blocked_signals)
     finally:
+        if worker.sigchld_handler_active and (
+            worker.pid <= 0 or worker.reaped
+        ):
+            try:
+                _restore_sigchld_handler(worker)
+            except BaseException as error:
+                if parent_error is None:
+                    parent_error = error
         if worker.setup_mask_active:
             try:
                 _restore_setup_signals(worker)

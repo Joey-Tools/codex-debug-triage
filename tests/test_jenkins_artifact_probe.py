@@ -73,6 +73,10 @@ def _sleep_worker(args: argparse.Namespace) -> int:
     return 0
 
 
+def _failure_worker(_: argparse.Namespace) -> int:
+    return 1
+
+
 def _blocking_read_worker(args: argparse.Namespace) -> int:
     os.read(args.blocking_fd, 1)
     return 0
@@ -680,6 +684,19 @@ class JenkinsArtifactProbeTests(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertEqual(output.getvalue().splitlines(), ["one"])
 
+    def test_show_url_head_allows_declared_body_larger_than_scan_limit(self) -> None:
+        response = FakeHTTPResponse(
+            b"one\ntwo\n", headers={"Content-Length": "999"}
+        )
+        output = io.StringIO()
+        with mock.patch.object(
+            MODULE, "_open_remote", return_value=self._remote(response)
+        ), redirect_stdout(output):
+            result = MODULE.cmd_show_url(self._show_args(head=1, max_bytes=8))
+        self.assertEqual(result, 0)
+        self.assertEqual(output.getvalue().splitlines(), ["one"])
+        self.assertEqual(response.read_sizes, [9])
+
     def test_show_url_rejects_content_length_before_body_read(self) -> None:
         response = FakeHTTPResponse(b"small", headers={"Content-Length": "999"})
         errors = io.StringIO()
@@ -1147,6 +1164,31 @@ class JenkinsArtifactProbeTests(unittest.TestCase):
                                     MODULE._run_with_hard_deadline(args)
         kill.assert_not_called()
         waitpid.assert_called_once_with(12345, os.WNOHANG)
+
+    @unittest.skipUnless(
+        hasattr(os, "fork")
+        and hasattr(signal, "pthread_sigmask")
+        and hasattr(signal, "SIGCHLD"),
+        "requires POSIX child-signal handling",
+    )
+    def test_inherited_sigchld_ignore_preserves_worker_exit_status(self) -> None:
+        previous = signal.signal(signal.SIGCHLD, signal.SIG_IGN)
+        try:
+            for worker, expected in ((_sleep_worker, 0), (_failure_worker, 1)):
+                with self.subTest(worker=worker.__name__):
+                    args = argparse.Namespace(
+                        func=worker,
+                        deadline_seconds=0.5,
+                        sleep_seconds=0.0,
+                    )
+                    with redirect_stderr(io.StringIO()):
+                        result = MODULE._run_with_hard_deadline(args)
+                    self.assertEqual(result, expected)
+                    self.assertEqual(
+                        signal.getsignal(signal.SIGCHLD), signal.SIG_IGN
+                    )
+        finally:
+            signal.signal(signal.SIGCHLD, previous)
 
     def test_signal_failure_cleans_receipted_temp_and_published_output(self) -> None:
         with tempfile.TemporaryDirectory(dir="/tmp") as directory:
