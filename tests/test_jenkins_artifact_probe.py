@@ -512,7 +512,7 @@ class JenkinsArtifactProbeTests(unittest.TestCase):
                 ):
                     pass
 
-    def test_chunk_reader_uses_limit_plus_one_without_unbounded_read(self) -> None:
+    def test_chunk_reader_uses_bounded_reads_and_detects_overflow(self) -> None:
         stream = FakeHTTPResponse(b"abcd")
         self.assertEqual(b"".join(MODULE._iter_limited_chunks(stream, 4)), b"abcd")
         self.assertTrue(stream.read_sizes)
@@ -686,16 +686,16 @@ class JenkinsArtifactProbeTests(unittest.TestCase):
 
     def test_show_url_head_allows_declared_body_larger_than_scan_limit(self) -> None:
         response = FakeHTTPResponse(
-            b"one\ntwo\n", headers={"Content-Length": "999"}
+            b"one\ntwo\nextra", headers={"Content-Length": "999"}
         )
         output = io.StringIO()
         with mock.patch.object(
             MODULE, "_open_remote", return_value=self._remote(response)
         ), redirect_stdout(output):
-            result = MODULE.cmd_show_url(self._show_args(head=1, max_bytes=8))
+            result = MODULE.cmd_show_url(self._show_args(head=1, max_bytes=4))
         self.assertEqual(result, 0)
         self.assertEqual(output.getvalue().splitlines(), ["one"])
-        self.assertEqual(response.read_sizes, [9])
+        self.assertEqual(response.read_sizes, [4])
 
     def test_show_url_rejects_content_length_before_body_read(self) -> None:
         response = FakeHTTPResponse(b"small", headers={"Content-Length": "999"})

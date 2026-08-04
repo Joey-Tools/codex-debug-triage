@@ -396,9 +396,17 @@ def _iter_limited_chunks(
 ) -> Iterator[bytes]:
     total = 0
     while True:
-        allowance = limit - total + 1
+        allowance = limit - total
         if allowance <= 0:
-            raise LimitExceeded("byte limit {} exceeded".format(limit))
+            if stream.read(1):
+                raise LimitExceeded("byte limit {} exceeded".format(limit))
+            if expected_length is not None and total != expected_length:
+                raise ArtifactError(
+                    "body length {} does not match declared length {}".format(
+                        total, expected_length
+                    )
+                )
+            return
         chunk = stream.read(min(CHUNK_BYTES, allowance))
         if not chunk:
             if expected_length is not None and total != expected_length:
