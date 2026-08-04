@@ -21,6 +21,7 @@ python3 "$helper" probe-url \
 ```
 
 Interpret `auth=absent` and `auth=present` as transport state, not as proof that a credential is valid. HTTP, policy, and deadline errors remain distinct.
+Authenticated requests are limited to the fixed HTTPS host on port 443; an explicit non-default port is rejected before credentials are added.
 
 ## Show Bounded Text
 
@@ -37,7 +38,7 @@ python3 "$helper" show-url \
   --deadline-seconds 30
 ```
 
-`--head` and `--tail` are also bounded by the emitted-line and emitted-byte ceilings. A command-line limit can only tighten its compiled hard ceiling.
+`--head` stops the remote text scan after the requested prefix, while `--tail` must scan the bounded input. Both are also bounded by the emitted-line and emitted-byte ceilings. A command-line limit can only tighten its compiled hard ceiling.
 
 Text-oriented stdout is budgeted UTF-8 and escapes non-printable characters, so it is safe diagnostic rendering rather than a byte-for-byte copy. Use `fetch-url` or `zip-extract` when exact bytes are required.
 
@@ -66,7 +67,7 @@ python3 "$helper" zip-list "$artifact_dir/logs.zip" \
   --deadline-seconds 20
 ```
 
-Listing validates the bounded central directory before allocating the complete inventory. Hard ceilings cover archive and central-directory bytes, member count, member-name bytes, per-member and aggregate compressed/uncompressed bytes, compression ratio, and selected members. Only stored and bounded-output DEFLATE members are accepted; unsafe paths, portable duplicate names, symlinks, special files, encryption, and other compression methods are rejected.
+Listing validates the bounded central directory before allocating the complete inventory. Hard ceilings cover archive and central-directory bytes, member count, member-name bytes, per-member and aggregate compressed/uncompressed bytes, compression ratio, and selected members. Only stored and bounded-output DEFLATE members are accepted; unsafe paths, portable duplicate names, symlinks, special files, encryption, unsupported feature versions, and other compression methods are rejected with controlled artifact diagnostics.
 
 ## Show One Or A Bounded Set Of Members
 

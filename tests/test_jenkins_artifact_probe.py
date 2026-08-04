@@ -382,6 +382,16 @@ class JenkinsArtifactProbeTests(unittest.TestCase):
             with self.subTest(url=url), self.assertRaises(ValueError):
                 MODULE._ensure_allowed_url(url)
 
+    def test_url_policy_rejects_non_default_port_before_auth(self) -> None:
+        with mock.patch.object(MODULE, "_add_basic_auth") as add_basic_auth:
+            with self.assertRaisesRegex(ValueError, "port"):
+                MODULE._build_remote_request(
+                    "https://jenkins.example.com:8443/artifact",
+                    method="GET",
+                    auth_profile="default",
+                )
+        add_basic_auth.assert_not_called()
+
     def test_same_origin_redirect_preserves_authorization(self) -> None:
         request = urllib.request.Request("https://jenkins.example.com/start")
         request.add_header("Authorization", "Basic test")
@@ -657,6 +667,18 @@ class JenkinsArtifactProbeTests(unittest.TestCase):
             )
         self.assertEqual(result, 0)
         self.assertEqual(output.getvalue().splitlines(), ["2:two", "3:ERROR", "4:four"])
+
+    def test_show_url_head_stops_before_later_scan_limits(self) -> None:
+        response = FakeHTTPResponse(b"one\ntwo\n")
+        output = io.StringIO()
+        with mock.patch.object(
+            MODULE, "_open_remote", return_value=self._remote(response)
+        ), redirect_stdout(output):
+            result = MODULE.cmd_show_url(
+                self._show_args(head=1, max_scan_lines=1)
+            )
+        self.assertEqual(result, 0)
+        self.assertEqual(output.getvalue().splitlines(), ["one"])
 
     def test_show_url_rejects_content_length_before_body_read(self) -> None:
         response = FakeHTTPResponse(b"small", headers={"Content-Length": "999"})
@@ -1353,6 +1375,32 @@ class JenkinsArtifactProbeTests(unittest.TestCase):
                 ):
                     with MODULE._open_validated_zip(str(archive), limits):
                         pass
+
+    def test_zip_open_converts_unsupported_version_to_artifact_error(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            archive = pathlib.Path(directory) / "unsupported-version.zip"
+            self._write_zip(
+                archive,
+                [("payload", b"content")],
+                compression=zipfile.ZIP_STORED,
+            )
+            raw = bytearray(archive.read_bytes())
+            local = raw.find(b"PK\x03\x04")
+            central = raw.find(b"PK\x01\x02")
+            self.assertGreaterEqual(local, 0)
+            self.assertGreaterEqual(central, 0)
+            unsupported = (zipfile.MAX_EXTRACT_VERSION + 1).to_bytes(2, "little")
+            raw[local + 4 : local + 6] = unsupported
+            raw[central + 6 : central + 8] = unsupported
+            archive.write_bytes(raw)
+
+            with self.assertRaisesRegex(
+                MODULE.ArtifactError, "unsupported ZIP feature version"
+            ):
+                with MODULE._open_validated_zip(
+                    str(archive), MODULE._zip_limits(self._zip_args(archive))
+                ):
+                    pass
 
     def test_zip_inventory_rejects_stored_size_disagreement(self) -> None:
         info = zipfile.ZipInfo("payload")

@@ -155,7 +155,8 @@ def _ensure_allowed_url(url: str) -> urllib.parse.ParseResult:
         raise ValueError("host not allowed: {}".format(parsed.hostname))
     if parsed.username is not None or parsed.password is not None:
         raise ValueError("inline URL credentials are not allowed")
-    _effective_origin(parsed)
+    if _effective_origin(parsed)[2] != 443:
+        raise ValueError("only the default HTTPS port 443 is allowed")
     return parsed
 
 
@@ -633,10 +634,10 @@ def _select_text_lines(
 
     emitted = 0
     for line_number, line in lines:
-        if head and emitted >= head:
-            continue
         collector.add(_format_line(line_number, line, line_numbers))
         emitted += 1
+        if head and emitted >= head:
+            break
 
 
 def _under_path(path: str, root: str) -> bool:
@@ -1385,7 +1386,11 @@ def _open_validated_zip(
             limits.max_members,
             limits.max_central_directory_bytes,
         )
-        with zipfile.ZipFile(bounded_snapshot) as archive:
+        try:
+            archive = zipfile.ZipFile(bounded_snapshot)
+        except NotImplementedError as error:
+            raise ArtifactError("unsupported ZIP feature version") from error
+        with archive:
             inventory = _validate_zip_inventory(archive, limits)
             yield archive, inventory
     except BaseException as error:
