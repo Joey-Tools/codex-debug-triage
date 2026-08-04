@@ -10,7 +10,8 @@ permissions:
   contents: read
 
 jobs:
-  test:
+  test-matrix:
+    name: test (${{ matrix.python-version }})
     runs-on: ubuntu-latest
     timeout-minutes: 10
     strategy:
@@ -29,3 +30,15 @@ jobs:
           tests/test_jenkins_artifact_probe.py
       - name: Run offline tests
         run: python3 -m unittest tests.test_jenkins_artifact_probe
+
+  test:
+    name: test
+    needs: test-matrix
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    steps:
+      - name: Verify matrix result
+        env:
+          MATRIX_RESULT: ${{ needs.test-matrix.result }}
+        run: test "$MATRIX_RESULT" = "success"
