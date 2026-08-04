@@ -1226,6 +1226,32 @@ class JenkinsArtifactProbeTests(unittest.TestCase):
                 ]
             )
 
+    def test_head_and_tail_are_mutually_exclusive_for_text_commands(self) -> None:
+        parser = MODULE.build_parser()
+        for argv in (
+            [
+                "show-url",
+                "https://jenkins.example.com/consoleText",
+                "--head",
+                "1",
+                "--tail",
+                "1",
+            ],
+            [
+                "zip-show",
+                "/tmp/archive.zip",
+                "payload",
+                "--head",
+                "1",
+                "--tail",
+                "1",
+            ],
+        ):
+            with self.subTest(argv=argv), redirect_stderr(
+                io.StringIO()
+            ), self.assertRaises(SystemExit):
+                parser.parse_args(argv)
+
     def test_parser_escapes_control_characters_from_raw_argv_errors(self) -> None:
         errors = io.StringIO()
         with redirect_stderr(errors), self.assertRaises(SystemExit):

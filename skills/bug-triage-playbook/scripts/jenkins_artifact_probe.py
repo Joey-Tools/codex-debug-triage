@@ -2011,12 +2011,13 @@ def _add_text_selection(parser: argparse.ArgumentParser) -> None:
         type=_bounded_int("context", HARD_CONTEXT_LINES, allow_zero=True),
         default=0,
     )
-    parser.add_argument(
+    head_or_tail = parser.add_mutually_exclusive_group()
+    head_or_tail.add_argument(
         "--head",
         type=_bounded_int("head", HARD_EMIT_LINES, allow_zero=True),
         default=0,
     )
-    parser.add_argument(
+    head_or_tail.add_argument(
         "--tail",
         type=_bounded_int("tail", HARD_EMIT_LINES, allow_zero=True),
         default=0,
