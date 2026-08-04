@@ -673,6 +673,32 @@ class JenkinsArtifactProbeTests(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertEqual(output.getvalue().splitlines(), ["2:two", "3:ERROR", "4:four"])
 
+    def test_show_url_tail_applies_emit_bytes_to_final_window(self) -> None:
+        response = FakeHTTPResponse(b"discard-this-line\nok\n")
+        output = io.StringIO()
+        with mock.patch.object(
+            MODULE, "_open_remote", return_value=self._remote(response)
+        ), redirect_stdout(output):
+            result = MODULE.cmd_show_url(
+                self._show_args(tail=1, max_emit_bytes=3)
+            )
+        self.assertEqual(result, 0)
+        self.assertEqual(output.getvalue(), "ok\n")
+
+    def test_show_url_tail_rejects_oversized_final_window(self) -> None:
+        response = FakeHTTPResponse(b"ok\nfinal-too-long\n")
+        output = io.StringIO()
+        errors = io.StringIO()
+        with mock.patch.object(
+            MODULE, "_open_remote", return_value=self._remote(response)
+        ), redirect_stdout(output), redirect_stderr(errors):
+            result = MODULE.cmd_show_url(
+                self._show_args(tail=1, max_emit_bytes=3)
+            )
+        self.assertEqual(result, 1)
+        self.assertEqual(output.getvalue(), "")
+        self.assertIn("emitted byte limit", errors.getvalue())
+
     def test_show_url_head_stops_before_later_scan_limits(self) -> None:
         response = FakeHTTPResponse(b"one\ntwo\n")
         output = io.StringIO()
@@ -1511,6 +1537,11 @@ class JenkinsArtifactProbeTests(unittest.TestCase):
                 io.StringIO()
             ), self.assertRaises(SystemExit):
                 parser.parse_args(argv)
+
+    def test_zip_list_rejects_explicit_zero_limit(self) -> None:
+        parser = MODULE.build_parser()
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            parser.parse_args(["zip-list", "/tmp/archive.zip", "--limit", "0"])
 
     def test_parser_escapes_control_characters_from_raw_argv_errors(self) -> None:
         errors = io.StringIO()

@@ -620,22 +620,11 @@ def _select_text_lines(
 
     if tail:
         selected: Deque[Tuple[int, str]] = collections.deque(maxlen=tail)
-        selected_bytes = 0
         for item in lines:
-            rendered = _format_line(item[0], item[1], line_numbers)
-            rendered_bytes = len(rendered.encode("utf-8", errors="replace")) + 1
-            if len(selected) == tail:
-                old = selected[0]
-                old_rendered = _format_line(old[0], old[1], line_numbers)
-                selected_bytes -= len(old_rendered.encode("utf-8", errors="replace")) + 1
             selected.append(item)
-            selected_bytes += rendered_bytes
-            if selected_bytes > collector._max_bytes:
-                raise LimitExceeded(
-                    "tail buffer exceeds emitted byte limit {}".format(
-                        collector._max_bytes
-                    )
-                )
+        # The deque length and per-line scan ceiling independently bound memory.
+        # Apply output ceilings only to the final window so discarded lines do
+        # not consume the caller's emitted-byte budget.
         for line_number, line in selected:
             collector.add(_format_line(line_number, line, line_numbers))
         return
@@ -2191,7 +2180,7 @@ def build_parser() -> argparse.ArgumentParser:
     zip_list.add_argument("--ignore-case", action="store_true")
     zip_list.add_argument(
         "--limit",
-        type=_bounded_int("list limit", HARD_EMIT_LINES, allow_zero=True),
+        type=_bounded_int("list limit", HARD_EMIT_LINES),
         default=0,
     )
     zip_list.add_argument(
