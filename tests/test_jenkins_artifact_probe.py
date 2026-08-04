@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import base64
 import contextlib
+import errno
 import importlib.util
 import io
 import os
@@ -788,6 +789,26 @@ class JenkinsArtifactProbeTests(unittest.TestCase):
             self.assertFalse(output.exists())
             self.assertEqual(list(parent.glob(".*.artifact-*.tmp")), [])
 
+    def test_fetch_reports_publish_fsync_failure_as_local_io(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            parent = pathlib.Path(directory)
+            output = parent / "artifact"
+            response = FakeHTTPResponse(b"payload")
+            errors = io.StringIO()
+            with mock.patch.object(
+                MODULE, "_open_remote", return_value=self._remote(response)
+            ), mock.patch.object(
+                MODULE.os,
+                "fsync",
+                side_effect=OSError(errno.ENOSPC, "No space left on device"),
+            ), redirect_stderr(errors):
+                result = MODULE.cmd_fetch_url(self._fetch_args(output))
+            self.assertEqual(result, 1)
+            self.assertIn("local I/O failure", errors.getvalue())
+            self.assertNotIn("remote I/O failure", errors.getvalue())
+            self.assertFalse(output.exists())
+            self.assertEqual(list(parent.glob(".*.artifact-*.tmp")), [])
+
     def test_output_parent_must_preexist_and_nested_symlinks_are_rejected(self) -> None:
         with tempfile.TemporaryDirectory(dir="/tmp") as directory:
             root = pathlib.Path(directory)
@@ -1148,7 +1169,9 @@ class JenkinsArtifactProbeTests(unittest.TestCase):
                 raise KeyboardInterrupt
             return frozenset()
 
-        with mock.patch.object(MODULE.time, "monotonic", side_effect=(10.0, 10.1)):
+        with mock.patch.object(
+            MODULE.time, "monotonic", side_effect=(10.0, 10.1, 10.1)
+        ):
             with mock.patch.object(MODULE.os, "fork", return_value=12345):
                 with mock.patch.object(
                     MODULE.signal,
@@ -1284,6 +1307,79 @@ class JenkinsArtifactProbeTests(unittest.TestCase):
             self.assertFalse(output.exists())
             self.assertEqual(list(parent.glob(".*.artifact-*.tmp")), [])
 
+    def test_post_reap_drain_interrupt_cleans_published_output(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            parent = pathlib.Path(directory)
+            output = parent / "artifact"
+            milestone = parent / "published.milestone"
+            args = argparse.Namespace(
+                func=_published_stall_worker,
+                deadline_seconds=2.0,
+                sleep_seconds=0.0,
+                output=str(output),
+                milestone=str(milestone),
+            )
+            state = {"reaped": False, "interrupted": False}
+            real_waitpid_tracked = MODULE._waitpid_tracked
+            real_read = MODULE.os.read
+
+            def track_reap(
+                worker: object, options: int, blocked_signals: frozenset
+            ) -> int:
+                result = real_waitpid_tracked(worker, options, blocked_signals)
+                state["reaped"] = bool(worker.reaped)
+                return result
+
+            def interrupt_first_post_reap_read(fd: int, size: int) -> bytes:
+                if state["reaped"] and not state["interrupted"]:
+                    state["interrupted"] = True
+                    raise KeyboardInterrupt
+                return real_read(fd, size)
+
+            errors = io.StringIO()
+            with mock.patch.object(
+                MODULE, "_waitpid_tracked", side_effect=track_reap
+            ), mock.patch.object(
+                MODULE.os, "read", side_effect=interrupt_first_post_reap_read
+            ), redirect_stderr(errors), self.assertRaises(KeyboardInterrupt):
+                MODULE._run_with_hard_deadline(args)
+            self.assertTrue(state["interrupted"])
+            self.assertIn("cleanup=complete", errors.getvalue())
+            self.assertFalse(output.exists())
+            self.assertEqual(list(parent.glob(".*.artifact-*.tmp")), [])
+
+    def test_post_reap_receipt_parse_interrupt_cleans_published_output(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            parent = pathlib.Path(directory)
+            output = parent / "artifact"
+            milestone = parent / "published.milestone"
+            args = argparse.Namespace(
+                func=_published_stall_worker,
+                deadline_seconds=2.0,
+                sleep_seconds=0.0,
+                output=str(output),
+                milestone=str(milestone),
+            )
+            real_parse_receipt = MODULE._parse_receipt
+            parse_calls = 0
+
+            def interrupt_first_parse(raw: bytes) -> Optional[object]:
+                nonlocal parse_calls
+                parse_calls += 1
+                if parse_calls == 1:
+                    raise KeyboardInterrupt
+                return real_parse_receipt(raw)
+
+            errors = io.StringIO()
+            with mock.patch.object(
+                MODULE, "_parse_receipt", side_effect=interrupt_first_parse
+            ), redirect_stderr(errors), self.assertRaises(KeyboardInterrupt):
+                MODULE._run_with_hard_deadline(args)
+            self.assertEqual(parse_calls, 2)
+            self.assertIn("cleanup=complete", errors.getvalue())
+            self.assertFalse(output.exists())
+            self.assertEqual(list(parent.glob(".*.artifact-*.tmp")), [])
+
     def test_cli_limit_flags_can_only_tighten_hard_ceilings(self) -> None:
         parser = MODULE.build_parser()
         with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
@@ -1387,6 +1483,29 @@ class JenkinsArtifactProbeTests(unittest.TestCase):
                 "--tail",
                 "1",
             ],
+        ):
+            with self.subTest(argv=argv), redirect_stderr(
+                io.StringIO()
+            ), self.assertRaises(SystemExit):
+                parser.parse_args(argv)
+
+    def test_text_selection_rejects_explicit_zero_head_and_tail(self) -> None:
+        parser = MODULE.build_parser()
+        for argv in (
+            [
+                "show-url",
+                "https://jenkins.example.com/consoleText",
+                "--head",
+                "0",
+            ],
+            [
+                "show-url",
+                "https://jenkins.example.com/consoleText",
+                "--tail",
+                "0",
+            ],
+            ["zip-show", "/tmp/archive.zip", "payload", "--head", "0"],
+            ["zip-show", "/tmp/archive.zip", "payload", "--tail", "0"],
         ):
             with self.subTest(argv=argv), redirect_stderr(
                 io.StringIO()
@@ -1560,6 +1679,36 @@ class JenkinsArtifactProbeTests(unittest.TestCase):
             raw[local + 4 : local + 6] = unsupported
             raw[central + 6 : central + 8] = unsupported
             archive.write_bytes(raw)
+
+            with self.assertRaisesRegex(
+                MODULE.ArtifactError, "unsupported ZIP feature version"
+            ):
+                with MODULE._open_validated_zip(
+                    str(archive), MODULE._zip_limits(self._zip_args(archive))
+                ):
+                    pass
+
+    def test_zip_open_rejects_unsupported_local_version(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            archive = pathlib.Path(directory) / "unsupported-local-version.zip"
+            self._write_zip(
+                archive,
+                [("payload", b"content")],
+                compression=zipfile.ZIP_STORED,
+            )
+            raw = bytearray(archive.read_bytes())
+            local = raw.find(b"PK\x03\x04")
+            central = raw.find(b"PK\x01\x02")
+            self.assertGreaterEqual(local, 0)
+            self.assertGreaterEqual(central, 0)
+            central_version = bytes(raw[central + 6 : central + 8])
+            raw[local + 4 : local + 6] = (
+                zipfile.MAX_EXTRACT_VERSION + 1
+            ).to_bytes(2, "little")
+            archive.write_bytes(raw)
+            self.assertEqual(
+                archive.read_bytes()[central + 6 : central + 8], central_version
+            )
 
             with self.assertRaisesRegex(
                 MODULE.ArtifactError, "unsupported ZIP feature version"

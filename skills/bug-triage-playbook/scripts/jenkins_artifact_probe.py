@@ -1223,7 +1223,7 @@ def _preflight_zip_directory(
             raise zipfile.BadZipFile("invalid zip local-file header")
         (
             _,
-            _,
+            local_extract_version,
             local_flags,
             local_method,
             _,
@@ -1234,6 +1234,8 @@ def _preflight_zip_directory(
             local_name_length,
             local_extra_length,
         ) = struct.unpack("<4s5H3L2H", local_header)
+        if local_extract_version > zipfile.MAX_EXTRACT_VERSION:
+            raise ArtifactError("unsupported ZIP feature version")
         if (
             local_compressed_size == 0xFFFFFFFF
             or local_uncompressed_size == 0xFFFFFFFF
@@ -1613,7 +1615,13 @@ def _report_usage_error(subject: str, error: Exception) -> int:
     return 2
 
 
-def _report_operation_error(subject: str, auth_state: Optional[str], error: Exception) -> int:
+def _report_operation_error(
+    subject: str,
+    auth_state: Optional[str],
+    error: Exception,
+    *,
+    io_scope: Optional[str] = None,
+) -> int:
     print("subject={}".format(_diagnostic_text(subject)), file=sys.stderr)
     if auth_state is not None:
         print("auth={}".format(auth_state), file=sys.stderr)
@@ -1630,7 +1638,13 @@ def _report_operation_error(subject: str, auth_state: Optional[str], error: Exce
         detail = "remote protocol failure ({})".format(type(error).__name__)
     elif isinstance(error, zlib.error):
         detail = "malformed DEFLATE member payload"
-    elif auth_state is not None and isinstance(error, OSError):
+    elif isinstance(error, OSError) and io_scope == "local":
+        detail = "local I/O failure ({}, errno={})".format(
+            type(error).__name__, error.errno
+        )
+    elif isinstance(error, OSError) and (
+        io_scope == "remote" or auth_state is not None
+    ):
         detail = "remote I/O failure ({}, errno={})".format(
             type(error).__name__, error.errno
         )
@@ -1659,6 +1673,7 @@ def _add_preview_lines(
 
 
 def cmd_probe_url(args: argparse.Namespace) -> int:
+    io_scope = "remote"
     try:
         request, auth_state = _build_remote_request(
             args.url, method=args.method, auth_profile=args.auth_profile
@@ -1686,6 +1701,7 @@ def cmd_probe_url(args: argparse.Namespace) -> int:
             if body:
                 collector.add("--- body preview ---")
                 _add_preview_lines(collector, body, args.encoding)
+        io_scope = "local"
         collector.emit()
         return 0
     except (
@@ -1696,10 +1712,13 @@ def cmd_probe_url(args: argparse.Namespace) -> int:
         urllib.error.URLError,
         ValueError,
     ) as error:
-        return _report_operation_error(_safe_remote_label(args.url), auth_state, error)
+        return _report_operation_error(
+            _safe_remote_label(args.url), auth_state, error, io_scope=io_scope
+        )
 
 
 def cmd_show_url(args: argparse.Namespace) -> int:
+    io_scope = "remote"
     try:
         request, auth_state = _build_remote_request(
             args.url, method="GET", auth_profile=args.auth_profile
@@ -1735,6 +1754,7 @@ def cmd_show_url(args: argparse.Namespace) -> int:
                 line_numbers=args.line_numbers,
                 collector=collector,
             )
+        io_scope = "local"
         collector.emit()
         return 0
     except (
@@ -1746,10 +1766,13 @@ def cmd_show_url(args: argparse.Namespace) -> int:
         urllib.error.URLError,
         ValueError,
     ) as error:
-        return _report_operation_error(_safe_remote_label(args.url), auth_state, error)
+        return _report_operation_error(
+            _safe_remote_label(args.url), auth_state, error, io_scope=io_scope
+        )
 
 
 def cmd_fetch_url(args: argparse.Namespace) -> int:
+    auth_state: Optional[str] = None
     try:
         request, auth_state = _build_remote_request(
             args.url, method="GET", auth_profile=args.auth_profile
@@ -1757,12 +1780,18 @@ def cmd_fetch_url(args: argparse.Namespace) -> int:
         publisher = AtomicPublisher.prepare(
             args.output, getattr(args, "_receipt_fd", None)
         )
-    except (ArtifactError, OSError, ValueError) as error:
+    except OSError as error:
+        return _report_operation_error(
+            _safe_remote_label(args.url), auth_state, error, io_scope="local"
+        )
+    except (ArtifactError, ValueError) as error:
         return _report_usage_error(_safe_remote_label(args.url), error)
     max_bytes = getattr(args, "max_bytes", HARD_REMOTE_BYTES)
+    io_scope = "local"
     try:
         with publisher:
             total = 0
+            io_scope = "remote"
             with _open_remote(
                 request,
                 socket_timeout=_socket_timeout(args),
@@ -1771,15 +1800,28 @@ def cmd_fetch_url(args: argparse.Namespace) -> int:
                 declared_length = _check_content_length(
                     response.headers, max_bytes
                 )
+                io_scope = "local"
                 with publisher.file() as output:
-                    for chunk in _iter_limited_chunks(
-                        response,
-                        max_bytes,
-                        expected_length=declared_length,
-                    ):
+                    chunks = iter(
+                        _iter_limited_chunks(
+                            response,
+                            max_bytes,
+                            expected_length=declared_length,
+                        )
+                    )
+                    while True:
+                        io_scope = "remote"
+                        try:
+                            chunk = next(chunks)
+                        except StopIteration:
+                            break
+                        io_scope = "local"
                         output.write(chunk)
                         total += len(chunk)
+                    io_scope = "local"
                     output.flush()
+                io_scope = "remote"
+            io_scope = "local"
             publisher.publish(total)
         collector = OutputCollector(HARD_EMIT_LINES, HARD_EMIT_BYTES)
         collector.add("url={}".format(_safe_remote_label(args.url)))
@@ -1796,7 +1838,9 @@ def cmd_fetch_url(args: argparse.Namespace) -> int:
         urllib.error.URLError,
         ValueError,
     ) as error:
-        return _report_operation_error(_safe_remote_label(args.url), auth_state, error)
+        return _report_operation_error(
+            _safe_remote_label(args.url), auth_state, error, io_scope=io_scope
+        )
 
 
 def cmd_zip_list(args: argparse.Namespace) -> int:
@@ -2025,12 +2069,12 @@ def _add_text_selection(parser: argparse.ArgumentParser) -> None:
     )
     selection.add_argument(
         "--head",
-        type=_bounded_int("head", HARD_EMIT_LINES, allow_zero=True),
+        type=_bounded_int("head", HARD_EMIT_LINES),
         default=0,
     )
     selection.add_argument(
         "--tail",
-        type=_bounded_int("tail", HARD_EMIT_LINES, allow_zero=True),
+        type=_bounded_int("tail", HARD_EMIT_LINES),
         default=0,
     )
     parser.add_argument("--encoding", choices=ALLOWED_ENCODINGS, default="utf-8")
@@ -2283,6 +2327,8 @@ class _WorkerProcess:
     setup_mask_active: bool = False
     sigchld_handler: object = None
     sigchld_handler_active: bool = False
+    finalize_mask: Optional[Iterable[int]] = None
+    finalize_mask_active: bool = False
 
 
 def _blockable_signals() -> frozenset:
@@ -2299,6 +2345,26 @@ def _restore_setup_signals(worker: _WorkerProcess) -> None:
         return
     previous = worker.setup_mask
     worker.setup_mask_active = False
+    if worker.finalize_mask_active:
+        worker.finalize_mask = previous
+        return
+    signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+
+
+def _retain_finalize_signals(
+    worker: _WorkerProcess, previous: Iterable[int]
+) -> None:
+    if worker.finalize_mask_active:
+        return
+    worker.finalize_mask = previous
+    worker.finalize_mask_active = True
+
+
+def _restore_finalize_signals(worker: _WorkerProcess) -> None:
+    if not worker.finalize_mask_active or worker.finalize_mask is None:
+        return
+    previous = worker.finalize_mask
+    worker.finalize_mask_active = False
     signal.pthread_sigmask(signal.SIG_SETMASK, previous)
 
 
@@ -2356,26 +2422,33 @@ def _waitpid_tracked(
     worker: _WorkerProcess, options: int, blocked_signals: frozenset
 ) -> int:
     previous = signal.pthread_sigmask(signal.SIG_BLOCK, blocked_signals)
+    retain_mask = False
     try:
         try:
             waited_pid, status = os.waitpid(worker.pid, options)
         except ChildProcessError:
             worker.reaped = True
+            _retain_finalize_signals(worker, previous)
+            retain_mask = True
             _restore_sigchld_handler(worker)
             raise
         if waited_pid == worker.pid:
             worker.status = status
             worker.reaped = True
+            _retain_finalize_signals(worker, previous)
+            retain_mask = True
             _restore_sigchld_handler(worker)
         return waited_pid
     finally:
-        signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+        if not retain_mask:
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous)
 
 
 def _kill_and_reap_worker(
     worker: _WorkerProcess, blocked_signals: frozenset
 ) -> None:
     previous = signal.pthread_sigmask(signal.SIG_BLOCK, blocked_signals)
+    retain_mask = False
     try:
         if worker.pid <= 0 or worker.reaped:
             _restore_sigchld_handler(worker)
@@ -2386,15 +2459,52 @@ def _kill_and_reap_worker(
             waited_pid, status = os.waitpid(worker.pid, 0)
         except ChildProcessError:
             worker.reaped = True
+            _retain_finalize_signals(worker, previous)
+            retain_mask = True
             _restore_sigchld_handler(worker)
             return
         if waited_pid != worker.pid:
             raise RuntimeError("waitpid returned an unexpected worker PID")
         worker.status = status
         worker.reaped = True
+        _retain_finalize_signals(worker, previous)
+        retain_mask = True
         _restore_sigchld_handler(worker)
     finally:
-        signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+        if not retain_mask:
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+
+
+def _drain_worker_receipt(
+    worker: _WorkerProcess, receipt_bytes: bytearray
+) -> None:
+    if worker.write_fd >= 0:
+        write_fd = worker.write_fd
+        worker.write_fd = -1
+        with contextlib.suppress(OSError):
+            os.close(write_fd)
+    if worker.read_fd < 0:
+        return
+    while len(receipt_bytes) < 4096:
+        try:
+            chunk = os.read(worker.read_fd, 4096 - len(receipt_bytes))
+        except BlockingIOError:
+            break
+        if not chunk:
+            break
+        receipt_bytes.extend(chunk)
+    read_fd = worker.read_fd
+    worker.read_fd = -1
+    os.close(read_fd)
+
+
+def _cleanup_worker_output(
+    args: argparse.Namespace, receipt: Optional[TempReceipt]
+) -> str:
+    cleanup = _cleanup_receipt(receipt)
+    if receipt is None and hasattr(args, "output"):
+        return "inconclusive"
+    return cleanup
 
 
 def _run_with_hard_deadline(args: argparse.Namespace) -> int:
@@ -2437,75 +2547,88 @@ def _run_with_hard_deadline(args: argparse.Namespace) -> int:
         if worker.pid > 0 and not worker.reaped:
             with contextlib.suppress(BaseException):
                 _kill_and_reap_worker(worker, blocked_signals)
-    finally:
+
+    receipt: Optional[TempReceipt] = None
+    try:
         if worker.sigchld_handler_active and (
             worker.pid <= 0 or worker.reaped
         ):
-            try:
-                _restore_sigchld_handler(worker)
-            except BaseException as error:
-                if parent_error is None:
-                    parent_error = error
+            _restore_sigchld_handler(worker)
         if worker.setup_mask_active:
-            try:
-                _restore_setup_signals(worker)
-            except BaseException as error:
-                if parent_error is None:
-                    parent_error = error
-                if worker.pid > 0 and not worker.reaped:
-                    with contextlib.suppress(BaseException):
-                        _kill_and_reap_worker(worker, blocked_signals)
-        if worker.write_fd >= 0:
-            with contextlib.suppress(OSError):
-                os.close(worker.write_fd)
-            worker.write_fd = -1
-        if worker.read_fd >= 0:
-            while len(receipt_bytes) < 4096:
-                try:
-                    chunk = os.read(worker.read_fd, 4096 - len(receipt_bytes))
-                except BlockingIOError:
-                    break
-                if not chunk:
-                    break
-                receipt_bytes.extend(chunk)
-            os.close(worker.read_fd)
-            worker.read_fd = -1
-
-    receipt = _parse_receipt(bytes(receipt_bytes))
-    if parent_error is not None:
-        cleanup = _cleanup_receipt(receipt)
-        if receipt is None and hasattr(args, "output"):
-            cleanup = "inconclusive"
-        print("cleanup={}".format(cleanup), file=sys.stderr)
-        raise parent_error
-    if timed_out:
-        cleanup = _cleanup_receipt(receipt)
-        if receipt is None and hasattr(args, "output"):
-            cleanup = "inconclusive"
-        print("error=wall deadline exceeded", file=sys.stderr)
-        print("cleanup={}".format(cleanup), file=sys.stderr)
-        return 124
-    if os.WIFEXITED(worker.status):
-        return_code = os.WEXITSTATUS(worker.status)
-        if return_code != 0 and (
-            receipt is not None or hasattr(args, "output")
+            _restore_setup_signals(worker)
+        _drain_worker_receipt(worker, receipt_bytes)
+        receipt = _parse_receipt(bytes(receipt_bytes))
+    except BaseException as error:
+        if parent_error is None:
+            parent_error = error
+        if worker.pid > 0 and not worker.reaped:
+            with contextlib.suppress(BaseException):
+                _kill_and_reap_worker(worker, blocked_signals)
+        if worker.sigchld_handler_active and (
+            worker.pid <= 0 or worker.reaped
         ):
-            cleanup = _cleanup_receipt(receipt)
-            if receipt is None:
-                cleanup = "inconclusive"
+            with contextlib.suppress(BaseException):
+                _restore_sigchld_handler(worker)
+        if worker.setup_mask_active:
+            with contextlib.suppress(BaseException):
+                _restore_setup_signals(worker)
+        with contextlib.suppress(BaseException):
+            _drain_worker_receipt(worker, receipt_bytes)
+        try:
+            receipt = _parse_receipt(bytes(receipt_bytes))
+        except BaseException:
+            receipt = None
+
+    result_code: Optional[int] = None
+    raise_error = parent_error
+    cleanup_reported = False
+    try:
+        if raise_error is not None:
+            cleanup = _cleanup_worker_output(args, receipt)
             print("cleanup={}".format(cleanup), file=sys.stderr)
-        return return_code
-    cleanup = _cleanup_receipt(receipt)
-    if receipt is None and hasattr(args, "output"):
-        cleanup = "inconclusive"
-    print(
-        "error=worker terminated by signal {}".format(
-            os.WTERMSIG(worker.status)
-        ),
-        file=sys.stderr,
-    )
-    print("cleanup={}".format(cleanup), file=sys.stderr)
-    return 1
+            cleanup_reported = True
+        elif timed_out:
+            cleanup = _cleanup_worker_output(args, receipt)
+            print("error=wall deadline exceeded", file=sys.stderr)
+            print("cleanup={}".format(cleanup), file=sys.stderr)
+            cleanup_reported = True
+            result_code = 124
+        elif os.WIFEXITED(worker.status):
+            result_code = os.WEXITSTATUS(worker.status)
+            if result_code != 0 and (
+                receipt is not None or hasattr(args, "output")
+            ):
+                cleanup = _cleanup_worker_output(args, receipt)
+                print("cleanup={}".format(cleanup), file=sys.stderr)
+                cleanup_reported = True
+        else:
+            cleanup = _cleanup_worker_output(args, receipt)
+            print(
+                "error=worker terminated by signal {}".format(
+                    os.WTERMSIG(worker.status)
+                ),
+                file=sys.stderr,
+            )
+            print("cleanup={}".format(cleanup), file=sys.stderr)
+            cleanup_reported = True
+            result_code = 1
+    except BaseException as error:
+        if raise_error is None:
+            raise_error = error
+
+    try:
+        _restore_finalize_signals(worker)
+    except BaseException as error:
+        if raise_error is None:
+            raise_error = error
+    if raise_error is not None:
+        if not cleanup_reported:
+            cleanup = _cleanup_worker_output(args, receipt)
+            print("cleanup={}".format(cleanup), file=sys.stderr)
+        raise raise_error
+    if result_code is None:
+        raise RuntimeError("worker result was not resolved")
+    return result_code
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
