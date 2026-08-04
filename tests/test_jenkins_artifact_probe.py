@@ -1718,6 +1718,70 @@ class JenkinsArtifactProbeTests(unittest.TestCase):
                 ):
                     pass
 
+    def test_zip_open_rejects_unsupported_central_version(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            archive = pathlib.Path(directory) / "unsupported-central-version.zip"
+            self._write_zip(
+                archive,
+                [("payload", b"content")],
+                compression=zipfile.ZIP_STORED,
+            )
+            raw = bytearray(archive.read_bytes())
+            local = raw.find(b"PK\x03\x04")
+            central = raw.find(b"PK\x01\x02")
+            self.assertGreaterEqual(local, 0)
+            self.assertGreaterEqual(central, 0)
+            local_version = bytes(raw[local + 4 : local + 6])
+            raw[central + 6 : central + 8] = (
+                zipfile.MAX_EXTRACT_VERSION + 1
+            ).to_bytes(2, "little")
+            archive.write_bytes(raw)
+            self.assertEqual(
+                archive.read_bytes()[local + 4 : local + 6], local_version
+            )
+
+            with self.assertRaisesRegex(
+                MODULE.ArtifactError, "unsupported ZIP feature version"
+            ):
+                with MODULE._open_validated_zip(
+                    str(archive), MODULE._zip_limits(self._zip_args(archive))
+                ):
+                    pass
+
+    def test_zip_open_rejects_local_and_central_version_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/tmp") as directory:
+            archive = pathlib.Path(directory) / "mismatched-versions.zip"
+            self._write_zip(
+                archive,
+                [("payload", b"content")],
+                compression=zipfile.ZIP_STORED,
+            )
+            raw = bytearray(archive.read_bytes())
+            local = raw.find(b"PK\x03\x04")
+            central = raw.find(b"PK\x01\x02")
+            self.assertGreaterEqual(local, 0)
+            self.assertGreaterEqual(central, 0)
+            central_version = int.from_bytes(
+                raw[central + 6 : central + 8], "little"
+            )
+            different_supported_version = (
+                central_version + 1
+                if central_version < zipfile.MAX_EXTRACT_VERSION
+                else central_version - 1
+            )
+            raw[local + 4 : local + 6] = different_supported_version.to_bytes(
+                2, "little"
+            )
+            archive.write_bytes(raw)
+
+            with self.assertRaisesRegex(
+                MODULE.ArtifactError, "extract versions disagree"
+            ):
+                with MODULE._open_validated_zip(
+                    str(archive), MODULE._zip_limits(self._zip_args(archive))
+                ):
+                    pass
+
     def test_zip_inventory_rejects_stored_size_disagreement(self) -> None:
         info = zipfile.ZipInfo("payload")
         info.compress_type = zipfile.ZIP_STORED

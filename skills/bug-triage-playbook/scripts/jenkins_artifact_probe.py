@@ -1181,6 +1181,7 @@ def _preflight_zip_directory(
         header = file_object.read(fixed_header_size)
         if len(header) != fixed_header_size or header[:4] != b"PK\x01\x02":
             raise zipfile.BadZipFile("invalid zip central-directory record")
+        central_extract_version = struct.unpack_from("<H", header, 6)[0]
         central_flags, central_method = struct.unpack_from("<HH", header, 8)
         central_crc, compressed_size, uncompressed_size = struct.unpack_from(
             "<LLL", header, 16
@@ -1194,6 +1195,8 @@ def _preflight_zip_directory(
             or local_offset == 0xFFFFFFFF
         ):
             raise ArtifactError("ZIP64 archives are not supported by this bounded helper")
+        if central_extract_version > zipfile.MAX_EXTRACT_VERSION:
+            raise ArtifactError("unsupported ZIP feature version")
         if disk_start != 0:
             raise ArtifactError("multi-disk zip members are not supported")
         if central_method not in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED):
@@ -1236,6 +1239,10 @@ def _preflight_zip_directory(
         ) = struct.unpack("<4s5H3L2H", local_header)
         if local_extract_version > zipfile.MAX_EXTRACT_VERSION:
             raise ArtifactError("unsupported ZIP feature version")
+        if local_extract_version != central_extract_version:
+            raise ArtifactError(
+                "zip local and central extract versions disagree"
+            )
         if (
             local_compressed_size == 0xFFFFFFFF
             or local_uncompressed_size == 0xFFFFFFFF
