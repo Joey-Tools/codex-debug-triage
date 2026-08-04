@@ -1226,7 +1226,7 @@ class JenkinsArtifactProbeTests(unittest.TestCase):
                 ]
             )
 
-    def test_head_and_tail_are_mutually_exclusive_for_text_commands(self) -> None:
+    def test_text_selection_modes_are_mutually_exclusive(self) -> None:
         parser = MODULE.build_parser()
         for argv in (
             [
@@ -1238,11 +1238,45 @@ class JenkinsArtifactProbeTests(unittest.TestCase):
                 "1",
             ],
             [
+                "show-url",
+                "https://jenkins.example.com/consoleText",
+                "--grep",
+                "ERROR",
+                "--head",
+                "1",
+            ],
+            [
+                "show-url",
+                "https://jenkins.example.com/consoleText",
+                "--grep",
+                "ERROR",
+                "--tail",
+                "1",
+            ],
+            [
                 "zip-show",
                 "/tmp/archive.zip",
                 "payload",
                 "--head",
                 "1",
+                "--tail",
+                "1",
+            ],
+            [
+                "zip-show",
+                "/tmp/archive.zip",
+                "payload",
+                "--grep",
+                "ERROR",
+                "--head",
+                "1",
+            ],
+            [
+                "zip-show",
+                "/tmp/archive.zip",
+                "payload",
+                "--grep",
+                "ERROR",
                 "--tail",
                 "1",
             ],

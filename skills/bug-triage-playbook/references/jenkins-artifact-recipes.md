@@ -38,7 +38,7 @@ python3 "$helper" show-url \
   --deadline-seconds 30
 ```
 
-`--head` and `--tail` are mutually exclusive. `--head` stops the remote text scan after the requested prefix, while `--tail` must scan the bounded input. Both are also bounded by the emitted-line and emitted-byte ceilings. A command-line limit can only tighten its compiled hard ceiling.
+`--grep`, `--head`, and `--tail` are mutually exclusive selection modes. `--head` stops the remote text scan after the requested prefix, while `--tail` and `--grep` must scan the bounded input. All modes are also bounded by the emitted-line and emitted-byte ceilings. A command-line limit can only tighten its compiled hard ceiling.
 
 Text-oriented stdout is budgeted UTF-8 and escapes non-printable characters, so it is safe diagnostic rendering rather than a byte-for-byte copy. Use `fetch-url` or `zip-extract` when exact bytes are required.
 

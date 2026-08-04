@@ -2004,20 +2004,20 @@ def _add_text_limits(parser: argparse.ArgumentParser, default_bytes: int) -> Non
 
 
 def _add_text_selection(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--grep")
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument("--grep")
     parser.add_argument("--ignore-case", action="store_true")
     parser.add_argument(
         "--context",
         type=_bounded_int("context", HARD_CONTEXT_LINES, allow_zero=True),
         default=0,
     )
-    head_or_tail = parser.add_mutually_exclusive_group()
-    head_or_tail.add_argument(
+    selection.add_argument(
         "--head",
         type=_bounded_int("head", HARD_EMIT_LINES, allow_zero=True),
         default=0,
     )
-    head_or_tail.add_argument(
+    selection.add_argument(
         "--tail",
         type=_bounded_int("tail", HARD_EMIT_LINES, allow_zero=True),
         default=0,
