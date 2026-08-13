@@ -48,7 +48,8 @@ permissions:"""
 CHECKOUT_BINDING = """- uses: actions/checkout@v4
         with:
           repository: ${{ inputs.repository }}
-          ref: ${{ inputs.ref }}"""
+          ref: ${{ inputs.ref }}
+          persist-credentials: false"""
 
 
 def checkout_steps(workflow: str) -> List[str]:
@@ -2574,6 +2575,7 @@ class JenkinsArtifactProbeTests(unittest.TestCase):
             workflow.count("repository: ${{ inputs.repository }}"), len(checkout)
         )
         self.assertEqual(workflow.count("ref: ${{ inputs.ref }}"), len(checkout))
+        self.assertEqual(workflow.count("persist-credentials: false"), len(checkout))
         self.assertIn("permissions:\n  contents: read\n", workflow)
         self.assertEqual(job_ids, ["test-matrix", "test"])
         self.assertIn('python-version: ["3.9", "3.x"]', workflow)
