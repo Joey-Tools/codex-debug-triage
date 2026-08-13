@@ -16,9 +16,12 @@ jobs:
       matrix:
         python-version: ["3.9", "3.x"]
     steps:
+      - name: Reject unexpected repository
+        if: ${{ github.repository != 'Joey-Tools/codex-debug-triage' }}
+        run: exit 1
       - uses: actions/checkout@v4
         with:
-          repository: ${{ github.repository }}
+          repository: Joey-Tools/codex-debug-triage
           ref: ${{ github.sha }}
           persist-credentials: false
       - uses: actions/setup-python@v5

@@ -38,18 +38,22 @@ REQUIRED_CALL_TRIGGER = """on:
   workflow_call:
 
 permissions:"""
+CHECKOUT_REPOSITORY = "Joey-Tools/codex-debug-triage"
+REPOSITORY_GUARD = """- name: Reject unexpected repository
+        if: ${{ github.repository != 'Joey-Tools/codex-debug-triage' }}
+        run: exit 1"""
 CHECKOUT_BINDING = """- uses: actions/checkout@v4
         with:
-          repository: ${{ github.repository }}
+          repository: Joey-Tools/codex-debug-triage
           ref: ${{ github.sha }}
           persist-credentials: false"""
 
 
-def checkout_steps(workflow: str) -> List[str]:
+def workflow_steps(workflow: str) -> List[str]:
     lines = workflow.splitlines()
     steps: List[str] = []
     for index, line in enumerate(lines):
-        if not line.lstrip().startswith("- uses: actions/checkout@"):
+        if not line.startswith("      - "):
             continue
         indent = len(line) - len(line.lstrip())
         end = index + 1
@@ -64,6 +68,14 @@ def checkout_steps(workflow: str) -> List[str]:
             end += 1
         steps.append("\n".join(lines[index:end]))
     return steps
+
+
+def checkout_steps(workflow: str) -> List[str]:
+    return [
+        step
+        for step in workflow_steps(workflow)
+        if step.lstrip().startswith("- uses: actions/checkout@")
+    ]
 
 
 class FakeHTTPResponse(io.BytesIO):
@@ -2562,12 +2574,54 @@ class JenkinsArtifactProbeTests(unittest.TestCase):
 
         self.assertIn(REQUIRED_CALL_TRIGGER, workflow)
         self.assertNotIn("workflow_call:\n    inputs:", workflow)
+        steps = workflow_steps(workflow)
+        checkout_indexes = [
+            index
+            for index, step in enumerate(steps)
+            if step.lstrip().startswith("- uses: actions/checkout@")
+        ]
         checkout = checkout_steps(workflow)
         self.assertGreater(len(checkout), 0)
         self.assertTrue(all(CHECKOUT_BINDING in step for step in checkout))
+        for step in checkout:
+            self.assertEqual(
+                [
+                    line.strip()
+                    for line in step.splitlines()
+                    if line.strip().startswith("repository:")
+                ],
+                [f"repository: {CHECKOUT_REPOSITORY}"],
+            )
+            self.assertEqual(
+                [
+                    line.strip()
+                    for line in step.splitlines()
+                    if line.strip().startswith("ref:")
+                ],
+                ["ref: ${{ github.sha }}"],
+            )
+            self.assertEqual(
+                [
+                    line.strip()
+                    for line in step.splitlines()
+                    if line.strip().startswith("persist-credentials:")
+                ],
+                ["persist-credentials: false"],
+            )
+        guard_indexes = [
+            index
+            for index, step in enumerate(steps)
+            if step.lstrip().startswith("- name: Reject unexpected repository")
+        ]
+        self.assertEqual(guard_indexes, [index - 1 for index in checkout_indexes])
         self.assertEqual(
-            workflow.count("repository: ${{ github.repository }}"), len(checkout)
+            [steps[index].strip() for index in guard_indexes],
+            [REPOSITORY_GUARD] * len(checkout),
         )
+        self.assertEqual(
+            workflow.count(f"repository: {CHECKOUT_REPOSITORY}"), len(checkout)
+        )
+        self.assertNotIn("repository: ${{ github.repository }}", workflow)
         self.assertEqual(workflow.count("ref: ${{ github.sha }}"), len(checkout))
         self.assertEqual(workflow.count("persist-credentials: false"), len(checkout))
         self.assertIn("permissions:\n  contents: read\n", workflow)
