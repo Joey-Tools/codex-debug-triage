@@ -2510,6 +2510,47 @@ class JenkinsArtifactProbeTests(unittest.TestCase):
             "python3 -m unittest tests.test_jenkins_artifact_probe", workflow
         )
 
+    def test_required_ci_wraps_the_matrix_and_aggregate(self) -> None:
+        workflow = (REPO_ROOT / ".github/workflows/required-ci.yml").read_text(
+            encoding="utf-8"
+        )
+        job_ids = []
+        in_jobs = False
+        for line in workflow.splitlines():
+            if line == "jobs:":
+                in_jobs = True
+                continue
+            if in_jobs and line and not line.startswith(" "):
+                break
+            if (
+                in_jobs
+                and line.startswith("  ")
+                and not line.startswith("    ")
+                and line.endswith(":")
+            ):
+                job_ids.append(line[2:-1])
+
+        self.assertIn("on:\n  workflow_call:\n", workflow)
+        self.assertIn("permissions:\n  contents: read\n", workflow)
+        self.assertEqual(job_ids, ["test-matrix", "test"])
+        self.assertIn('python-version: ["3.9", "3.x"]', workflow)
+        self.assertIn("needs: test-matrix", workflow)
+        self.assertIn("if: ${{ always() }}", workflow)
+        self.assertIn(
+            "python3 -m unittest tests.test_jenkins_artifact_probe", workflow
+        )
+        self.assertIn('run: test "$MATRIX_RESULT" = "success"', workflow)
+        for forbidden in (
+            "pull_request:",
+            "pull_request_target:",
+            "push:",
+            "secrets.",
+            "contents: write",
+            "id-token: write",
+            "statuses: write",
+        ):
+            self.assertNotIn(forbidden, workflow)
+
 
 if __name__ == "__main__":
     unittest.main()
