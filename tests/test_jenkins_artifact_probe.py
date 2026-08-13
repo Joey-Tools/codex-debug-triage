@@ -34,6 +34,42 @@ assert SPEC.loader is not None
 MODULE = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = MODULE
 SPEC.loader.exec_module(MODULE)
+REQUIRED_CALL_INPUTS = """on:
+  workflow_call:
+    inputs:
+      repository:
+        required: true
+        type: string
+      ref:
+        required: true
+        type: string
+
+permissions:"""
+CHECKOUT_BINDING = """- uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.ref }}"""
+
+
+def checkout_steps(workflow: str) -> List[str]:
+    lines = workflow.splitlines()
+    steps: List[str] = []
+    for index, line in enumerate(lines):
+        if not line.lstrip().startswith("- uses: actions/checkout@"):
+            continue
+        indent = len(line) - len(line.lstrip())
+        end = index + 1
+        while end < len(lines):
+            candidate = lines[end]
+            candidate_indent = len(candidate) - len(candidate.lstrip())
+            if candidate.strip() and (
+                candidate_indent < indent
+                or (candidate_indent == indent and candidate.lstrip().startswith("- "))
+            ):
+                break
+            end += 1
+        steps.append("\n".join(lines[index:end]))
+    return steps
 
 
 class FakeHTTPResponse(io.BytesIO):
@@ -2530,7 +2566,14 @@ class JenkinsArtifactProbeTests(unittest.TestCase):
             ):
                 job_ids.append(line[2:-1])
 
-        self.assertIn("on:\n  workflow_call:\n", workflow)
+        self.assertIn(REQUIRED_CALL_INPUTS, workflow)
+        checkout = checkout_steps(workflow)
+        self.assertGreater(len(checkout), 0)
+        self.assertTrue(all(CHECKOUT_BINDING in step for step in checkout))
+        self.assertEqual(
+            workflow.count("repository: ${{ inputs.repository }}"), len(checkout)
+        )
+        self.assertEqual(workflow.count("ref: ${{ inputs.ref }}"), len(checkout))
         self.assertIn("permissions:\n  contents: read\n", workflow)
         self.assertEqual(job_ids, ["test-matrix", "test"])
         self.assertIn('python-version: ["3.9", "3.x"]', workflow)
