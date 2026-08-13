@@ -34,21 +34,14 @@ assert SPEC.loader is not None
 MODULE = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = MODULE
 SPEC.loader.exec_module(MODULE)
-REQUIRED_CALL_INPUTS = """on:
+REQUIRED_CALL_TRIGGER = """on:
   workflow_call:
-    inputs:
-      repository:
-        required: true
-        type: string
-      ref:
-        required: true
-        type: string
 
 permissions:"""
 CHECKOUT_BINDING = """- uses: actions/checkout@v4
         with:
-          repository: ${{ inputs.repository }}
-          ref: ${{ inputs.ref }}
+          repository: ${{ github.repository }}
+          ref: ${{ github.sha }}
           persist-credentials: false"""
 
 
@@ -2567,14 +2560,15 @@ class JenkinsArtifactProbeTests(unittest.TestCase):
             ):
                 job_ids.append(line[2:-1])
 
-        self.assertIn(REQUIRED_CALL_INPUTS, workflow)
+        self.assertIn(REQUIRED_CALL_TRIGGER, workflow)
+        self.assertNotIn("workflow_call:\n    inputs:", workflow)
         checkout = checkout_steps(workflow)
         self.assertGreater(len(checkout), 0)
         self.assertTrue(all(CHECKOUT_BINDING in step for step in checkout))
         self.assertEqual(
-            workflow.count("repository: ${{ inputs.repository }}"), len(checkout)
+            workflow.count("repository: ${{ github.repository }}"), len(checkout)
         )
-        self.assertEqual(workflow.count("ref: ${{ inputs.ref }}"), len(checkout))
+        self.assertEqual(workflow.count("ref: ${{ github.sha }}"), len(checkout))
         self.assertEqual(workflow.count("persist-credentials: false"), len(checkout))
         self.assertIn("permissions:\n  contents: read\n", workflow)
         self.assertEqual(job_ids, ["test-matrix", "test"])
