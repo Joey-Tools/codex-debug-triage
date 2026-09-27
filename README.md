@@ -16,3 +16,5 @@ python3 -m py_compile \
   tests/test_jenkins_artifact_probe.py
 python3 -m unittest tests.test_jenkins_artifact_probe
 ```
+
+<!-- Temporary post-cutover v2 gate canary; close this pull request unmerged after the cohort audit. -->
