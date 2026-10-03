@@ -28,8 +28,9 @@ jobs:
           python3 -m py_compile
           skills/bug-triage-playbook/scripts/jenkins_artifact_probe.py
           tests/test_jenkins_artifact_probe.py
+          tests/test_review_gate_controller.py
       - name: Run offline tests
-        run: python3 -m unittest tests.test_jenkins_artifact_probe
+        run: python3 -m unittest tests.test_jenkins_artifact_probe tests.test_review_gate_controller
 
   test:
     name: test
