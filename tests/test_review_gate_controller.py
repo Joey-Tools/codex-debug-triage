@@ -22,8 +22,10 @@ class ReviewGateControllerTests(unittest.TestCase):
             "!github.event.workflow_run.pull_requests[1]",
             "CODEX_REVIEW_GATE_AUTO_REQUEST: ${{ vars.CODEX_REVIEW_GATE_AUTO_REQUEST }}",
             "github.event.workflow_run.head_sha",
-            "github.event_name == 'workflow_run' && 'begin-review'",
-            "request_review: ${{ github.event_name == 'workflow_run' ||",
+            "github.event.workflow_run.pull_requests[0].number || '0'",
+            "operation: ${{ github.event_name == 'workflow_run' && vars.CODEX_REVIEW_GATE_AUTO_REQUEST == 'true' && github.event.workflow_run.run_attempt == 1 && github.event.workflow_run.conclusion == 'failure' && github.event.workflow_run.pull_requests[0].number && !github.event.workflow_run.pull_requests[1] && 'begin-review'",
+            "&& 'begin-review' || github.event_name == 'workflow_run' && 'report-completion'",
+            "request_review: ${{ github.event_name == 'workflow_run' && vars.CODEX_REVIEW_GATE_AUTO_REQUEST == 'true' && github.event.workflow_run.run_attempt == 1 && github.event.workflow_run.conclusion == 'failure' && github.event.workflow_run.pull_requests[0].number && !github.event.workflow_run.pull_requests[1] || github.event_name == 'workflow_dispatch' && inputs.request_review || false }}",
         ):
             with self.subTest(contract=contract):
                 self.assertIn(contract, workflow)
