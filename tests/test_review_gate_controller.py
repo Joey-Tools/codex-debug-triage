@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
 import unittest
 
 
@@ -29,6 +30,55 @@ class ReviewGateControllerTests(unittest.TestCase):
         ):
             with self.subTest(contract=contract):
                 self.assertIn(contract, workflow)
+
+    def test_completion_admission_accepts_only_exact_or_pull_request_merge_path(self) -> None:
+        workflow = CONTROLLER.read_text(encoding="utf-8")
+        guard = workflow.split("    if: >-\n", 1)[1].split("    runs-on:", 1)[0]
+        exact_paths = re.findall(r"github\.event\.workflow_run\.path == '([^']+)'", guard)
+        path_prefixes = re.findall(
+            r"startsWith\(github\.event\.workflow_run\.path, '([^']+)'\)", guard
+        )
+
+        self.assertEqual(exact_paths, [".github/workflows/codex-review-gate.yml"])
+        self.assertEqual(
+            path_prefixes,
+            [".github/workflows/codex-review-gate.yml@refs/pull/"],
+        )
+        self.assertIn("endsWith(github.event.workflow_run.path, '/merge')", guard)
+        self.assertIn("github.event.workflow_run.event == 'pull_request'", guard)
+        self.assertNotIn("github.event.workflow_run.run_attempt", guard)
+        self.assertNotIn("github.event.workflow_run.conclusion", guard)
+
+        def admitted(path: str) -> bool:
+            return path in exact_paths or any(
+                path.startswith(prefix) and path.endswith("/merge")
+                for prefix in path_prefixes
+            )
+
+        self.assertTrue(admitted(".github/workflows/codex-review-gate.yml"))
+        self.assertTrue(
+            admitted(".github/workflows/codex-review-gate.yml@refs/pull/123/merge")
+        )
+        self.assertFalse(admitted(".github/workflows/codex-review-gate.yml.backup"))
+        self.assertFalse(
+            admitted(".github/workflows/codex-review-gate.yml@refs/heads/main")
+        )
+        self.assertFalse(
+            admitted(".github/workflows/codex-review-gate.yml@refs/pull/123/head")
+        )
+
+    def test_unassociated_runs_get_distinct_concurrency_fallback(self) -> None:
+        workflow = CONTROLLER.read_text(encoding="utf-8")
+        concurrency_group = next(
+            line.strip() for line in workflow.splitlines() if line.startswith("  group: ")
+        )
+
+        self.assertIn(
+            "github.event.workflow_run.pull_requests[0].number || "
+            "github.event.issue.number || inputs.pr_number || "
+            "github.event.workflow_run.id || github.run_id",
+            concurrency_group,
+        )
 
 
 if __name__ == "__main__":
