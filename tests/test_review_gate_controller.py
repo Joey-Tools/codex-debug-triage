@@ -22,6 +22,7 @@ class ReviewGateControllerTests(unittest.TestCase):
             "github.event.workflow_run.pull_requests[0].number",
             "!github.event.workflow_run.pull_requests[1]",
             "CODEX_REVIEW_GATE_AUTO_REQUEST: ${{ vars.CODEX_REVIEW_GATE_AUTO_REQUEST }}",
+            "review_request_token: ${{ secrets.CODEX_REVIEW_GATE_REQUEST_TOKEN }}",
             "github.event.workflow_run.head_sha",
             "github.event.workflow_run.pull_requests[0].number || '0'",
             "operation: ${{ github.event_name == 'workflow_run' && vars.CODEX_REVIEW_GATE_AUTO_REQUEST == 'true' && github.event.workflow_run.run_attempt == 1 && github.event.workflow_run.conclusion == 'failure' && github.event.workflow_run.pull_requests[0].number && !github.event.workflow_run.pull_requests[1] && 'begin-review'",
