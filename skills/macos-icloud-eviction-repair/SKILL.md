@@ -9,11 +9,12 @@ Recover eviction while preserving verified file content. A successful workaround
 
 ## Establish the current state
 
-Start with metadata for an exact, user-scoped file list. Record logical size, allocated blocks, device/inode, ownership, permissions, birth/modification times, flags, provider identifier, upload/download state, pinning, conflicts, and provider errors. Resolve the current user's identity and paths; do not reuse historical PIDs, identifiers, inodes, or helper allowlists.
+Start with metadata for an exact, user-scoped file list. Record logical size, allocated blocks, device/inode, ownership, permissions, ACLs, resource forks, extended attributes, birth/modification times, flags, provider identifier, upload/download state, pinning, conflicts, and provider errors. Resolve the current user's identity and paths; do not reuse historical PIDs, identifiers, inodes, or helper allowlists.
 
 - Use `fileproviderctl evaluate <path>` when available, with a deadline and byte cap. Its output and private diagnostics can vary by macOS version. Missing fields are inconclusive.
 - Measure allocation separately from logical size; `st_blocks` uses 512-byte units. A large logical file can already be dataless.
 - Uploaded, idle, unpinned, unshared, conflict-free state is a prerequisite for the reconstruction protocol. A reported upload error or unknown cloud state blocks it.
+- The byte-copy protocol covers only files whose access policy and metadata can be preserved by its stated checks. Reject extended ACLs, resource forks, Finder tags, and other non-provider or unclassified metadata before replacement unless a separately validated preservation procedure covers them. Mode bits do not reproduce an ACL.
 - Inspect error domains and nested errors. Do not equate exit code zero with a successful native eviction; inspect the returned error and resulting provider state.
 - Reading a cold file can download its entire content. Start with metadata; treat cloud reads, eviction, moves, and reconstruction as real operations within the user's authorization.
 
@@ -26,11 +27,11 @@ Use the supported `NSFileManager` ubiquitous-item eviction API and verify the re
 3. If ordinary eviction still fails on a healthy uploaded object, read [the reconstruction protocol](references/reconstruction-protocol.md) before making a replacement. Explain that a new cloud identity can affect old links/history, and that deleting the old object is a separate irreversible operation. Reuse existing session authorization when it already covers those actions.
 4. Work on one small representative file first. Scale only after a new object has survived a cold cloud read, complete SHA-256 verification, and a second eviction. Recheck space throughout; provider staging can exceed the visible copies.
 
-The protocol requires a retained original, an independently verified raw backup, a genuinely fresh cloud object, coordinated promotion, and a full cold cloud roundtrip before cleanup. Rewriting bytes while retaining the old cloud identity did not resolve the recorded incident. This skill contains a procedure, not a general-purpose destructive batch executor; any task-specific helper must implement and validate these checkpoints for its current scope.
+The protocol requires a retained original, a verified raw backup in a private non-provider local directory, a genuinely fresh cloud object, coordinated promotion, and a full cold cloud roundtrip. Deleting the last verified backup additionally requires effective write exclusion throughout the final hash, eviction, and cleanup; a clean `lsof` or stable size/mtime is insufficient. If that exclusion cannot be established, retain a verified independent local backup and report cleanup incomplete. Rewriting bytes while retaining the old cloud identity did not resolve the recorded incident. This skill contains a procedure, not a general-purpose destructive batch executor; any task-specific helper must implement and validate these checkpoints for its current scope.
 
 ## Handle materialization and retries
 
-Keep object identity, content verification, and access policy separate. Normal hydration can change flags, ctime, or the local inode; it does not prove content corruption or authorize accepting a replacement silently.
+Keep object identity, content verification, and access policy separate. A hash proves the bytes read, not future stability against a writer that restores metadata. `NSFileCoordinator` coordinates cooperating clients; it does not exclude arbitrary POSIX or remote writes. Normal hydration can change flags, ctime, or the local inode; it does not prove content corruption or authorize accepting a replacement silently.
 
 - For `itemContentVersionMismatch` or a timed-out read, retain the original and raw backup. Re-evaluate the current object. Admit a changed inode only after explicit revalidation of the expected cloud identity, device, owner/group, mode, size, and preserved dates; still repeat the full SHA-256 cloud read.
 - A completed read can precede the provider's resident/idle state. Allow a bounded settling interval before treating it as a failed validation.
