@@ -1,0 +1,4 @@
+interface:
+  display_name: "macOS iCloud Eviction Repair"
+  short_description: "Diagnose iCloud eviction and verify safe recovery"
+  default_prompt: "Use $macos-icloud-eviction-repair to investigate these iCloud files and prepare a verified recovery within my authorized scope."

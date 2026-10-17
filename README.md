@@ -6,6 +6,12 @@ The helper enforces same-origin authenticated redirects, a parent/worker monoton
 
 See [`skills/bug-triage-playbook/SKILL.md`](skills/bug-triage-playbook/SKILL.md) and [`jenkins-artifact-recipes.md`](skills/bug-triage-playbook/references/jenkins-artifact-recipes.md) for scope and usage.
 
+## macOS iCloud eviction recovery
+
+The independent [`macos-icloud-eviction-repair`](skills/macos-icloud-eviction-repair/SKILL.md) skill covers uploaded iCloud Drive files that still refuse eviction, bounded diagnosis, and content-verified cloud-object reconstruction. Its references preserve an anonymized incident and the recovery checkpoints; it does not extend the artifact transport helper or ship an automatic deletion tool.
+
+The same skill is discoverable in this checkout through `.agents/skills/macos-icloud-eviction-repair`, a relative symlink to the canonical `skills/` source. Content changes belong in `skills/macos-icloud-eviction-repair/`.
+
 ## Test
 
 The test suite is fully offline and runs on Python 3.9 and the latest Python available in CI.
