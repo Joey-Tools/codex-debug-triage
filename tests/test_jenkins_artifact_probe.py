@@ -2503,6 +2503,10 @@ class JenkinsArtifactProbeTests(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertIn('python-version: ["3.9", "3.x"]', workflow)
+        self.assertIn(
+            "runs-on: ${{ matrix.python-version == '3.9' && 'ubuntu-24.04' || 'ubuntu-latest' }}",
+            workflow,
+        )
         self.assertIn("timeout-minutes: 10", workflow)
         self.assertIn("uses: actions/setup-python@v5", workflow)
         self.assertIn("python-version: ${{ matrix.python-version }}", workflow)
